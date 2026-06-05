@@ -18,6 +18,7 @@ SetupStage _s(
   SetupStageInput input = SetupStageInput.mixed,
   SetupVocab vocab = SetupVocab.curated,
   List<String> suggestions = const [],
+  bool required = true,
 }) => SetupStage(
   key: key,
   title: title,
@@ -25,6 +26,7 @@ SetupStage _s(
   input: input,
   vocab: vocab,
   suggestions: suggestions,
+  required: required,
 );
 
 // ─────────────────────────────────────────── Software (legacy-compatible) ───
@@ -85,6 +87,8 @@ final SetupFlowDefinition applicationDevelopmentFlow = SetupFlowDefinition(
       input: SetupStageInput.choices,
       suggestions: kFrameworks,
     ),
+    // Optional: not every project needs its own datastore or external service,
+    // so these don't block finalize (see SetupStage.required).
     _s(
       'databases',
       TagCategoryX(TagCategory.databases).label,
@@ -92,6 +96,7 @@ final SetupFlowDefinition applicationDevelopmentFlow = SetupFlowDefinition(
           '(e.g. orders/users → PostgreSQL; caching → Redis). Free entry — tag '
           'whatever fits. Propose `databases` tags.',
       suggestions: kDatabases,
+      required: false,
     ),
     _s(
       'libraries',
@@ -106,6 +111,7 @@ final SetupFlowDefinition applicationDevelopmentFlow = SetupFlowDefinition(
       'External services/integrations the product depends on (payments, auth, '
           'SMS/email, maps, storage, push). Free entry. Propose `services` tags.',
       suggestions: kServices,
+      required: false,
     ),
   ],
   finalizeGuidance:

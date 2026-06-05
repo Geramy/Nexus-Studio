@@ -10,6 +10,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/providers/database_provider.dart';
 import '../../core/providers/lean_context_provider.dart';
+import '../../infrastructure/database/nexus_database.dart';
 import '../../infrastructure/registry/verification_service.dart';
 import '../../infrastructure/workspace/workspace_provider.dart';
 import '../../services/audio/audio_recorder_service.dart';
@@ -172,6 +173,10 @@ class SetupChatController extends ChangeNotifier {
     _resolved = resolved;
     final db = _ref.read(nexusDatabaseProvider);
     final planStore = await _ref.read(planStoreProvider(projectId).future);
+    // Resolve the configurable setup flow FIRST so the executor can enforce its
+    // required stages: the host's `finalize_setup` is gated on every required
+    // section having a tag (no finalizing a half-filled profile).
+    final flow = await _resolveFlow(db);
     final executor = SetupToolExecutor(
       db: db,
       projectPk: projectId,
@@ -179,18 +184,8 @@ class SetupChatController extends ChangeNotifier {
       planStore: planStore,
       askQuestion: _askQuestion,
       onPlansChanged: _bumpWorkspace,
+      requiredCategories: _requiredCategories(flow),
     );
-    // Resolve the configurable setup flow for this project's type + sub-category
-    // (DB-stored, falling back to the built-in catalog).
-    final proj = await db.watchProject(projectId).first;
-    final flowType = proj?.projectType ?? 'application-development';
-    final flowSub = proj?.subCategory;
-    final flowJson = await db.resolveSetupFlowJson(flowType, flowSub);
-    final flow = flowJson != null
-        ? SetupFlowDefinition.fromJson(
-            jsonDecode(flowJson) as Map<String, dynamic>,
-          )
-        : resolveBuiltinSetupFlow(flowType, flowSub);
     _session = SetupSession(
       client: resolved.backend,
       model: resolved.model,
@@ -203,6 +198,48 @@ class SetupChatController extends ChangeNotifier {
     // If we resumed into refinement (or already finalized), start in refine.
     if (refining) _session!.enterRefinePhase();
     return _session;
+  }
+
+  /// Resolve the configurable setup flow for this project's type + sub-category
+  /// (DB-stored, falling back to the built-in catalog).
+  Future<SetupFlowDefinition> _resolveFlow(NexusDatabase db) async {
+    final proj = await db.watchProject(projectId).first;
+    final flowType = proj?.projectType ?? 'application-development';
+    final flowSub = proj?.subCategory;
+    final flowJson = await db.resolveSetupFlowJson(flowType, flowSub);
+    if (flowJson != null) {
+      try {
+        return SetupFlowDefinition.fromJson(
+          jsonDecode(flowJson) as Map<String, dynamic>,
+        );
+      } catch (_) {
+        // Malformed stored flow — fall back to the built-in for this type.
+      }
+    }
+    return resolveBuiltinSetupFlow(flowType, flowSub);
+  }
+
+  /// Stage key → label for the flow's required stages (drives the finalize gate).
+  Map<String, String> _requiredCategories(SetupFlowDefinition flow) => {
+    for (final s in flow.stages)
+      if (s.required) s.key: s.title,
+  };
+
+  /// Required setup sections (and unanswered industry sub-axes like Genre) still
+  /// missing a tag, as human labels. Empty ⇒ ready to generate the plan. The
+  /// "Generate plan & continue" button calls this to block an early/incomplete
+  /// finalize, matching the gate the AI's `finalize_setup` already enforces.
+  Future<List<String>> setupCompletenessGaps() async {
+    final db = _ref.read(nexusDatabaseProvider);
+    final flow = await _resolveFlow(db);
+    final executor = SetupToolExecutor(
+      db: db,
+      projectPk: projectId,
+      verification: _ref.read(verificationServiceProvider),
+      planStore: null,
+      requiredCategories: _requiredCategories(flow),
+    );
+    return executor.missingRequiredLabels();
   }
 
   /// Re-walks the project's /PLANS tree so the explorer + open Plan tab reflect
@@ -354,11 +391,13 @@ class SetupChatController extends ChangeNotifier {
     try {
       final db = _ref.read(nexusDatabaseProvider);
       final planStore = await _ref.read(planStoreProvider(projectId).future);
+      final flow = await _resolveFlow(db);
       final executor = SetupToolExecutor(
         db: db,
         projectPk: projectId,
         verification: _ref.read(verificationServiceProvider),
         planStore: planStore,
+        requiredCategories: _requiredCategories(flow),
       );
       final result = await executor.execute('finalize_setup', const {});
       _bumpWorkspace();

@@ -40,6 +40,13 @@ class SetupStage {
   /// values; for curated they seed the picker; for open it's empty (free entry).
   final List<String> suggestions;
 
+  /// Whether this stage MUST have at least one tag before setup can be finalized
+  /// (the plan generated / hand-off to user stories). Defaults to true — most
+  /// stages are mandatory; mark optional ones (e.g. databases/services for a
+  /// project that has none) `required: false`. Sub-axes a chosen industry
+  /// introduces (e.g. Gaming → Genre) are enforced separately at finalize time.
+  final bool required;
+
   const SetupStage({
     required this.key,
     required this.title,
@@ -47,6 +54,7 @@ class SetupStage {
     this.input = SetupStageInput.mixed,
     this.vocab = SetupVocab.curated,
     this.suggestions = const [],
+    this.required = true,
   });
 
   Map<String, dynamic> toJson() => {
@@ -56,6 +64,7 @@ class SetupStage {
     'input': input.name,
     'vocab': vocab.name,
     'suggestions': suggestions,
+    'required': required,
   };
 
   factory SetupStage.fromJson(Map<String, dynamic> j) => SetupStage(
@@ -67,6 +76,8 @@ class SetupStage {
     suggestions: ((j['suggestions'] as List?) ?? const [])
         .map((e) => e.toString())
         .toList(),
+    // Back-compat: stages persisted before this flag existed are mandatory.
+    required: (j['required'] as bool?) ?? true,
   );
 }
 

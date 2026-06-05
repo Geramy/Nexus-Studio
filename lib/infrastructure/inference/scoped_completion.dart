@@ -56,6 +56,59 @@ List<Map<String, dynamic>> parseJsonObjectArray(String raw) {
     if (decoded is List) {
       return decoded.whereType<Map>().map((m) => m.cast<String, dynamic>()).toList();
     }
+    // A model sometimes returns a single bare object instead of an array.
+    if (decoded is Map) return [decoded.cast<String, dynamic>()];
   } catch (_) {}
   return const [];
+}
+
+/// More forgiving than [parseJsonObjectArray]: when strict array decoding fails
+/// (the usual case with smaller local models — trailing commas, prose around the
+/// JSON, one object per line, a half-truncated array), scan the text for each
+/// balanced top-level `{ ... }` block and decode it on its own. Returns whatever
+/// well-formed objects it can recover, in order. Used where producing SOMETHING
+/// beats a hard failure (e.g. drafting user stories from a description).
+List<Map<String, dynamic>> parseLooseJsonObjects(String raw) {
+  // Fast path: a clean array (or single object) parses directly.
+  final strict = parseJsonObjectArray(raw);
+  if (strict.isNotEmpty) return strict;
+
+  final out = <Map<String, dynamic>>[];
+  final s = raw;
+  var depth = 0;
+  var start = -1;
+  var inStr = false;
+  var escaped = false;
+  for (var i = 0; i < s.length; i++) {
+    final ch = s[i];
+    if (inStr) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch == r'\') {
+        escaped = true;
+      } else if (ch == '"') {
+        inStr = false;
+      }
+      continue;
+    }
+    if (ch == '"') {
+      inStr = true;
+    } else if (ch == '{') {
+      if (depth == 0) start = i;
+      depth++;
+    } else if (ch == '}') {
+      depth--;
+      if (depth == 0 && start != -1) {
+        final block = s.substring(start, i + 1);
+        try {
+          final decoded = jsonDecode(block);
+          if (decoded is Map) out.add(decoded.cast<String, dynamic>());
+        } catch (_) {
+          // Skip a malformed block; keep scanning for the next one.
+        }
+        start = -1;
+      }
+    }
+  }
+  return out;
 }

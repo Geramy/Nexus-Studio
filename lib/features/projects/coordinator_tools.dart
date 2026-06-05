@@ -1746,38 +1746,57 @@ class CoordinatorToolExecutor {
   Future<String> _draftStoriesFromText(Map<String, dynamic> args) async {
     final text = (args['text'] as String? ?? '').trim();
     if (text.isEmpty) return 'draft_stories_from_text failed: text is required.';
-    final backend = inference;
-    final mdl = model;
-    if (backend == null || mdl == null || mdl.isEmpty) {
-      return 'draft_stories_from_text is unavailable (no inference model here). '
-          'Add the stories with add_user_story instead.';
-    }
     final parentId = _asInt(args['parent_story_id']);
     if (parentId != null && await db.getUserStoryById(parentId) == null) {
       return 'draft_stories_from_text failed: parent story #$parentId not found.';
     }
 
-    const system =
-        'You split a product/feature description into concrete USER STORIES, '
-        'rephrase each into clean wording, AND nest them into a tree. Return ONLY '
-        'a JSON array (no prose, no code fences). Each item: {"title": a short '
-        'title, "description": the story as "As a <role>, I want <goal>, so that '
-        '<benefit>" rephrased from the input, "note": one concise extra '
-        'detail/constraint/flow step from the input, "parent": the EXACT title of '
-        'another item in this list that this one is a sub-step or sub-feature of '
-        '(its parent in the tree), or null if it sits at the top level}. CHAIN the '
-        'steps of a flow: each step\'s parent is the step it follows from, so a '
-        'linear flow becomes a parent→child→grandchild chain, not a flat row. List '
-        'every parent BEFORE its children. Produce 3–8 items. Keep it faithful to '
-        'the input — do not invent features.';
-    final raw = await scopedComplete(
-      backend: backend,
-      model: mdl,
-      system: system,
-      user: text,
-      maxTokens: 900,
-    );
-    final items = parseJsonObjectArray(raw);
+    // 1) Preferred path: ask the model to split + rephrase + nest into a tree.
+    //    Small/local models often wrap the JSON in prose or emit one object per
+    //    line, so parse LENIENTLY and retry once with a stricter nudge before
+    //    giving up on the AI path.
+    final backend = inference;
+    final mdl = model;
+    var items = const <Map<String, dynamic>>[];
+    var usedAi = false;
+    if (backend != null && mdl != null && mdl.isNotEmpty) {
+      const system =
+          'You split a product/feature description into concrete USER STORIES, '
+          'rephrase each into clean wording, AND nest them into a tree. Return ONLY '
+          'a JSON array (no prose, no code fences). Each item: {"title": a short '
+          'title, "description": the story as "As a <role>, I want <goal>, so that '
+          '<benefit>" rephrased from the input, "note": one concise extra '
+          'detail/constraint/flow step from the input, "parent": the EXACT title of '
+          'another item in this list that this one is a sub-step or sub-feature of '
+          '(its parent in the tree), or null if it sits at the top level}. CHAIN the '
+          'steps of a flow: each step\'s parent is the step it follows from, so a '
+          'linear flow becomes a parent→child→grandchild chain, not a flat row. List '
+          'every parent BEFORE its children. Produce 3–8 items. Keep it faithful to '
+          'the input — do not invent features.';
+      for (var attempt = 0; attempt < 2 && items.isEmpty; attempt++) {
+        final user = attempt == 0
+            ? text
+            : '$text\n\nReturn ONLY a JSON array of objects — no prose, no code '
+                  'fences, no trailing text.';
+        try {
+          final raw = await scopedComplete(
+            backend: backend,
+            model: mdl,
+            system: system,
+            user: user,
+            maxTokens: 900,
+          );
+          items = parseLooseJsonObjects(raw);
+        } catch (_) {
+          // Backend hiccup — fall through to the deterministic split below.
+        }
+      }
+      usedAi = items.isNotEmpty;
+    }
+
+    // 2) Fallback: never dead-end. Split the user's OWN words into stories so
+    //    something is always captured (the coordinator can refine/rename after).
+    if (items.isEmpty) items = _storyItemsFromRawText(text);
     if (items.isEmpty) {
       return 'Could not draft stories from that text — try add_user_story.';
     }
@@ -1820,10 +1839,46 @@ class CoordinatorToolExecutor {
       made++;
     }
     return 'Drafted $made user stor${made == 1 ? 'y' : 'ies'} '
-        '(rephrased + nested into a tree)'
+        '${usedAi ? '(rephrased + nested into a tree)' : '(split straight from '
+              'your text — titles are literal, so tidy/rephrase + nest them with '
+              'update_user_story and move_user_story)'}'
         '${parentId != null ? ' under #$parentId' : ''}. '
         'Check the shape with list_user_stories; fix any nesting with '
         'move_user_story if needed.';
+  }
+
+  /// Deterministic fallback for [_draftStoriesFromText] when no model is
+  /// available or it won't return usable JSON: turn the user's raw description
+  /// into a flat list of story items by splitting on bullets/lines, then on
+  /// sentence boundaries. Keeps it faithful (their own words) and bounded so the
+  /// draft never dead-ends. Items use the same shape the AI path returns
+  /// ({title, description, note, parent}), all top-level (parent: null).
+  List<Map<String, dynamic>> _storyItemsFromRawText(String text) {
+    final bulletRe = RegExp(r'^\s*(?:[-*•·]|\d+[.)])\s+');
+    // Prefer explicit lines/bullets; if it's one blob, split on sentence enders.
+    var segments = text
+        .split(RegExp(r'[\r\n]+'))
+        .map((l) => l.replaceFirst(bulletRe, '').trim())
+        .where((l) => l.isNotEmpty)
+        .toList();
+    if (segments.length < 2) {
+      segments = text
+          .split(RegExp(r'(?<=[.!?;])\s+'))
+          .map((s) => s.trim())
+          .where((s) => s.isNotEmpty)
+          .toList();
+    }
+    final items = <Map<String, dynamic>>[];
+    for (final seg in segments) {
+      // Skip noise — a story needs at least a few words of intent.
+      if (seg.split(RegExp(r'\s+')).length < 3 || seg.length < 12) continue;
+      final words = seg.split(RegExp(r'\s+'));
+      final title = (words.length <= 9 ? seg : '${words.take(9).join(' ')}…')
+          .replaceAll(RegExp(r'[.!?;,]+$'), '');
+      items.add({'title': title, 'description': seg, 'note': '', 'parent': null});
+      if (items.length >= 8) break; // bound the batch like the AI path (3–8)
+    }
+    return items;
   }
 
   Future<String> _addUserStory(Map<String, dynamic> args) async {

@@ -64,16 +64,28 @@ class ProjectExplorationView extends ConsumerWidget {
     // Walk the tree: each story → its own scoped AI session → 1..N tasks. The
     // run keeps us on this screen (explorationStatus stays 'active' until done)
     // and updates per-story progress; the canvas shows a bar on each story.
-    await ref.read(taskGeneratorProvider(projectId)).run();
+    try {
+      await ref.read(taskGeneratorProvider(projectId)).run();
+    } catch (e) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Task generation failed: $e')),
+      );
+      return;
+    }
     if (!context.mounted) return; // generation can take minutes
     final p = ref.read(taskGeneratorProvider(projectId)).progress;
+    final base =
+        'Generated ${p.totalTasks} task${p.totalTasks == 1 ? '' : 's'} '
+        'from ${p.totalStories} stor${p.totalStories == 1 ? 'y' : 'ies'}.';
+    // Don't report a cheerful success when nothing was created or stories errored
+    // — show the real reason so a broken backend/DB is visible, not hidden.
+    final detail = p.failedStories > 0
+        ? ' ${p.failedStories} stor${p.failedStories == 1 ? 'y' : 'ies'} failed'
+              '${p.error != null ? ': ${p.error}' : ''}.'
+        : (p.totalTasks == 0 && p.error != null ? ' Error: ${p.error}' : '');
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(
-          'Generated ${p.totalTasks} task${p.totalTasks == 1 ? '' : 's'} '
-          'from ${p.totalStories} stor${p.totalStories == 1 ? 'y' : 'ies'}.',
-        ),
-      ),
+      SnackBar(content: Text('$base$detail')),
     );
   }
 

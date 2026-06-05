@@ -27,7 +27,9 @@ class AccountDashboard extends ConsumerWidget {
     final usageAsync = ref.watch(nexusUsageProvider);
     final accountAsync = ref.watch(nexusAccountSummaryProvider);
 
-    return SingleChildScrollView(
+    // No inner scroll: AccountView wraps the whole page (settings cards + this
+    // dashboard) in ONE scroll view so it all scrolls together.
+    return Padding(
       padding: const EdgeInsets.all(AppSpacing.xl),
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 860),

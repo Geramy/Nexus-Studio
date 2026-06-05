@@ -350,10 +350,15 @@ class AppTheme {
         ),
       ),
       tooltipTheme: TooltipThemeData(
+        // Dark themes were inheriting a light surface + the framework's default
+        // (dark) tooltip text → unreadable grey-on-black. Pin a dark-grey chip
+        // with white text in dark mode (and the standard inverse-surface chip in
+        // light mode) so tooltips read clearly in every theme.
+        textStyle: base.textTheme.bodySmall?.copyWith(
+          color: isDark ? Colors.white : scheme.onInverseSurface,
+        ),
         decoration: BoxDecoration(
-          color: isDark
-              ? scheme.surfaceContainerHighest
-              : scheme.inverseSurface,
+          color: isDark ? const Color(0xFF2A2A30) : scheme.inverseSurface,
           borderRadius: AppRadius.smAll,
         ),
       ),

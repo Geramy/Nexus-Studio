@@ -222,8 +222,11 @@ class SetupTools {
           'name': 'finalize_setup',
           'description':
               'Resolve the architecture from the confirmed tags and generate the '
-              '/PLANS layer files. Call when the user is satisfied with the '
-              'profile.',
+              '/PLANS layer files. PRECONDITION: every REQUIRED section must have '
+              'at least one tag first (and any industry sub-axis like Genre must '
+              'be answered) — if it is not ready this returns the list of what is '
+              'still missing instead of finalizing, so cover those first. Call '
+              'only when the profile is complete and the user is satisfied.',
           'parameters': {'type': 'object', 'properties': {}},
         },
       },
@@ -305,11 +308,19 @@ class SetupToolExecutor {
     required this.planStore,
     this.askQuestion,
     this.onPlansChanged,
+    this.requiredCategories = const {},
   });
 
   final NexusDatabase db;
   final int projectPk;
   final VerificationService verification;
+
+  /// Flow stage key → human label for the stages that MUST each have at least
+  /// one (non-rejected) tag before `finalize_setup` is allowed. Empty disables
+  /// the completeness gate (e.g. a background-only plan write, not a user
+  /// finalize). Populated from the active flow's required stages so the gate is
+  /// flow-aware (software vs IVR propose entirely different categories).
+  final Map<String, String> requiredCategories;
 
   /// Resolved plan store for the project workspace; null disables finalize's
   /// file generation (the resolver still runs and the status is set).
@@ -673,7 +684,41 @@ class SetupToolExecutor {
     return PlanGenerator(planStore!).generate(uiTags);
   }
 
+  /// Required stages (and unanswered industry sub-axes like Genre) that still
+  /// have no tag, as human labels. Empty ⇒ the profile is complete enough to
+  /// finalize. The single source of truth for the gate — used by both the AI's
+  /// `finalize_setup` tool and the UI "Generate plan" button.
+  Future<List<String>> missingRequiredLabels() async {
+    if (requiredCategories.isEmpty) return const [];
+    final tags = await db.getTagsForProject(projectPk);
+    final present = <String>{
+      for (final t in tags)
+        if (t.status != 'rejected') t.category,
+    };
+    final missing = <String>[];
+    requiredCategories.forEach((key, label) {
+      if (!present.contains(key)) missing.add(label);
+    });
+    // Sub-axes the chosen industry introduces (e.g. Gaming → Genre) are part of
+    // "all fields filled", so enforce any that are still unanswered.
+    final scope = await _readScope();
+    for (final a in scope.subAxes) {
+      if (!a.answered) missing.add(a.name);
+    }
+    return missing;
+  }
+
   Future<String> _finalize() async {
+    // Gate: don't generate the plan until every required section has a tag. This
+    // stops the host from ending the interview / the user from skipping ahead
+    // with a half-filled profile (returns guidance so the AI keeps interviewing).
+    final missing = await missingRequiredLabels();
+    if (missing.isNotEmpty) {
+      return 'Not ready to finalize — the profile still needs: '
+          '${missing.join(', ')}. Ask the user about each of these, propose_tags '
+          'for them, and only call finalize_setup once every required section '
+          'has at least one tag.';
+    }
     final generated = await generatePlans();
     // Enter the REFINE phase rather than completing outright: the plans now
     // exist, but the user keeps fleshing them out in Setup before tasks.

@@ -29,25 +29,39 @@ class AccountView extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final auth = ref.watch(nexusAuthProvider);
 
+    // Signed IN: the settings cards + dashboard share ONE scroll view so the
+    // whole page scrolls together (the dashboard no longer scrolls on its own).
+    // Signed OUT: the auth form brings its own scroll/centering, so keep the
+    // cards pinned above it via Expanded.
     return Container(
       color: Theme.of(context).colorScheme.surface,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          const _AppearancePicker(),
-          const _LeanContextToggle(),
-          const UpdateSettingsCard(),
-          Expanded(
-            child: auth.isSignedIn
-                ? const AccountDashboard()
-                // While hydrating the saved token from secure storage, show a
-                // spinner instead of flashing the login form.
-                : (auth.busy && auth.token == null)
-                ? const Center(child: CircularProgressIndicator())
-                : const AccountAuthForms(),
-          ),
-        ],
-      ),
+      child: auth.isSignedIn
+          ? SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: const [
+                  _AppearancePicker(),
+                  _LeanContextToggle(),
+                  UpdateSettingsCard(),
+                  AccountDashboard(),
+                ],
+              ),
+            )
+          : Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const _AppearancePicker(),
+                const _LeanContextToggle(),
+                const UpdateSettingsCard(),
+                Expanded(
+                  // While hydrating the saved token from secure storage, show a
+                  // spinner instead of flashing the login form.
+                  child: (auth.busy && auth.token == null)
+                      ? const Center(child: CircularProgressIndicator())
+                      : const AccountAuthForms(),
+                ),
+              ],
+            ),
     );
   }
 }

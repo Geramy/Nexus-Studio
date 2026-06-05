@@ -34,6 +34,15 @@ migrate_working_dir/
 /coverage/
 /dist/
 
+# Per-platform generated plugin files + lockfile — regenerated locally by Flutter
+# on each `pub get`/build, so they churn across machines/OSes. Kept out of the way
+# locally (these are also marked skip-worktree on this clone).
+**/flutter/generated_plugin_registrant.cc
+**/flutter/generated_plugin_registrant.h
+**/flutter/generated_plugins.cmake
+macos/Flutter/GeneratedPluginRegistrant.swift
+pubspec.lock
+
 # Symbolication related
 app.*.symbols
 

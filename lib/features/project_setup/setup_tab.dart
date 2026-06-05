@@ -63,6 +63,26 @@ class _SetupTabState extends ConsumerState<SetupTab> {
     final navigator = Navigator.of(context);
     final messenger = ScaffoldMessenger.of(context);
 
+    // Gate: every REQUIRED section (industries, platforms, objectives, features,
+    // languages, frameworks, libraries + any industry sub-axis like Genre) must
+    // have a tag before we generate the plan — no continuing on a half-filled
+    // profile. Databases/services are optional and don't block.
+    final gaps = await controller.setupCompletenessGaps();
+    if (!mounted) return;
+    if (gaps.isNotEmpty) {
+      messenger.showSnackBar(
+        SnackBar(
+          duration: const Duration(seconds: 6),
+          content: Text(
+            'Fill these before generating the plan: ${gaps.join(', ')}. '
+            'Keep talking with the host (or add them on the board) — or use Skip '
+            'to set up later.',
+          ),
+        ),
+      );
+      return;
+    }
+
     // Write the durable state FIRST (setupStatus=complete, explorationStatus=
     // active) so it can't race the background plan generation below.
     await controller.completeSetup();

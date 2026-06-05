@@ -140,10 +140,19 @@ How to work:
   platform-specific stack they return (e.g. desktop games → C#/C++ engines, not
   Flutter); don't call them mechanically.
 - Only these `propose_tags` categories are valid: ${tagCategories.join(', ')}.
+- REQUIRED before finalizing — every one of these sections must have at least one
+  tag (and any sub-axis like Genre must be answered): ${_requiredTitles()}. Don't
+  call `finalize_setup` until they're all covered; it will refuse and tell you
+  what's still missing otherwise.
 - ${flow.finalizeGuidance}
 - Keep spoken replies to 1-3 sentences. Be concrete and friendly.
 ''';
   }
+
+  /// Titles of the flow's required stages, for the "fill these before finalize"
+  /// line in the interview prompt (mirrors the executor's hard gate).
+  String _requiredTitles() =>
+      flow.stages.where((s) => s.required).map((s) => s.title).join(', ');
 
   String _refinePrompt() {
     return '''
