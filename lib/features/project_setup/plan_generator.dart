@@ -68,8 +68,7 @@ class PlanGenerator {
 
     _section(b, 'Industries', _values(tags, TagCategory.industries));
     _section(b, 'Platforms', _values(tags, TagCategory.platforms));
-    _section(b, 'Objectives', _values(tags, TagCategory.objectives));
-    _section(b, 'Features', _values(tags, TagCategory.features));
+    _section(b, 'Features & Capabilities', _featureValues(tags));
 
     b.writeln('## Architecture');
     b.writeln();
@@ -130,7 +129,7 @@ class PlanGenerator {
         )
         .toSet()
         .toList();
-    final objectives = _values(tags, TagCategory.objectives);
+    final objectives = _featureValues(tags);
 
     final b = StringBuffer();
     b.writeln('# ${layer.label}');
@@ -148,7 +147,7 @@ class PlanGenerator {
     _bullets(b, 'Libraries', libraries);
     b.writeln();
 
-    _section(b, 'Objectives', objectives);
+    _section(b, 'Features & Capabilities', objectives);
 
     if (layerTags.any((t) => t.rationale != null)) {
       b.writeln('## Rationale');
@@ -205,6 +204,18 @@ class PlanGenerator {
 
   List<String> _values(List<ProjectTag> tags, TagCategory category) => tags
       .where((t) => t.knownCategory == category)
+      .map((t) => t.value)
+      .toSet()
+      .toList();
+
+  /// Features + any legacy `objectives` tags, deduped. The two were merged into
+  /// one axis; reading the union keeps old projects' objectives visible.
+  List<String> _featureValues(List<ProjectTag> tags) => tags
+      .where(
+        (t) =>
+            t.knownCategory == TagCategory.features ||
+            t.knownCategory == TagCategory.objectives,
+      )
       .map((t) => t.value)
       .toSet()
       .toList();

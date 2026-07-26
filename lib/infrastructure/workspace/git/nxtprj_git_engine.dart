@@ -2,6 +2,7 @@
 // Author: Geramy Loveless <support@nexus-projects.ai>
 // Licensed under the Sustainable Use License. See LICENSE.md.
 
+import 'dart:convert';
 import 'dart:ffi';
 import 'dart:typed_data';
 
@@ -11,6 +12,7 @@ import 'package:git2dart_binaries/git2dart_binaries.dart';
 import '../git_status.dart';
 import '../vhd_workspace.dart';
 import '../workspace.dart';
+import 'additive_merge.dart';
 import 'nxtprj_git_odb.dart';
 import 'nxtprj_git_refdb.dart';
 
@@ -400,6 +402,31 @@ class NxtprjGitEngine {
     } finally {
       if (buf != nullptr) calloc.free(buf);
       calloc.free(oidOut);
+    }
+  }
+
+  /// Try to resolve a modify/modify conflict on a TEXT file with a deterministic
+  /// additive union (see [additiveThreeWayUnion]). Reads the three blobs, skips
+  /// binary content, and on a successful union writes the merged blob and
+  /// returns its oid; returns null to leave the conflict for the merge agent.
+  String? _tryAdditiveUnion(String baseOid, String ourOid, String theirOid) {
+    try {
+      final baseB = _readBlobBytes(baseOid);
+      final ourB = _readBlobBytes(ourOid);
+      final theirB = _readBlobBytes(theirOid);
+      // Skip binary blobs (a NUL byte is git's usual text/binary heuristic).
+      if (baseB.contains(0) || ourB.contains(0) || theirB.contains(0)) {
+        return null;
+      }
+      final merged = additiveThreeWayUnion(
+        utf8.decode(baseB, allowMalformed: true),
+        utf8.decode(ourB, allowMalformed: true),
+        utf8.decode(theirB, allowMalformed: true),
+      );
+      if (merged == null) return null;
+      return _createBlob(Uint8List.fromList(utf8.encode(merged)));
+    } catch (_) {
+      return null; // any failure → fall back to a normal conflict
     }
   }
 
@@ -954,7 +981,21 @@ class NxtprjGitEngine {
         continue;
       }
       // Both sides changed it differently (modify/modify, add/add,
-      // modify/delete, delete/modify) → real conflict.
+      // modify/delete, delete/modify). Before declaring a conflict, try a
+      // deterministic ADDITIVE union for the modify/modify TEXT case — the
+      // dominant real orchestrator conflict is two tasks that each only ADDED
+      // lines to the same shared file (e.g. a dependency appended to
+      // pubspec.yaml). The union applies ONLY when neither side removed or
+      // changed a base line, so it never fabricates a blended file; every other
+      // shape falls through to a real conflict for the merge agent, exactly as
+      // before.
+      if (b != null && o != null && t != null) {
+        final unionOid = _tryAdditiveUnion(b, o, t);
+        if (unionOid != null) {
+          merged[p] = unionOid;
+          continue;
+        }
+      }
       conflicts.add('/$p');
     }
 
@@ -976,6 +1017,61 @@ class NxtprjGitEngine {
     );
     await _materializeTree(mergeHex);
     return MergeResult(MergeOutcome.merged, oid: mergeHex);
+  }
+
+  /// For a CONFLICTED [merge] of [branch] into the current branch, write each
+  /// path in [paths] into [ws] with standard `<<<<<<< / ======= / >>>>>>>`
+  /// markers so an agent can SEE both sides and resolve them.
+  ///
+  /// [merge] itself is file-level and deliberately writes NOTHING on a conflict,
+  /// which left the merge agent staring at an unmodified file while being told to
+  /// "remove every conflict marker" — impossible, so every real conflict ended in
+  /// a Blocked task. Call this before handing the conflict to an agent.
+  ///
+  /// Binary blobs are skipped (nothing useful to mark). Returns how many files
+  /// were marked.
+  Future<int> writeConflictMarkers(
+    String branch,
+    Workspace ws,
+    List<String> paths,
+  ) async {
+    final theirHex = _resolveOid('refs/heads/$branch');
+    final ourHex = await headOid();
+    if (theirHex == null || ourHex == null) return 0;
+    final ourTree = _flattenHeadTree(ourHex);
+    final theirTree = _flattenHeadTree(theirHex);
+
+    String? textOf(String? oidHex) {
+      if (oidHex == null) return null;
+      final bytes = _readBlobBytes(oidHex);
+      if (bytes.contains(0)) return null; // binary
+      return utf8.decode(bytes, allowMalformed: true);
+    }
+
+    var marked = 0;
+    for (final raw in paths) {
+      final rel = raw.startsWith('/') ? raw.substring(1) : raw;
+      final oOid = ourTree[rel];
+      final tOid = theirTree[rel];
+      if (oOid == null && tOid == null) continue;
+      final oTxt = textOf(oOid);
+      final tTxt = textOf(tOid);
+      // Binary on either present side → leave the file alone.
+      if ((oOid != null && oTxt == null) || (tOid != null && tTxt == null)) {
+        continue;
+      }
+      await ws.writeString(
+        '/$rel',
+        conflictMarkedText(
+          oTxt ?? '(file deleted on this branch)',
+          tTxt ?? '(file deleted on "$branch")',
+          oursLabel: 'ours (current)',
+          theirsLabel: 'theirs ($branch)',
+        ),
+      );
+      marked++;
+    }
+    return marked;
   }
 
   /// Lowest common ancestor of two commits, or null if they share none.

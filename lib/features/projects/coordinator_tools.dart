@@ -2159,7 +2159,7 @@ class CoordinatorToolExecutor {
           s.title.trim().toLowerCase() == lower) {
         return 'Story "${s.title}" (id: ${s.story_pk}) already exists here — '
             'kept it, no duplicate created. Use update_user_story to refine it, '
-            'or add a DIFFERENT story.';
+            'or add a DIFFERENT story.${await storyTreeSnapshot()}';
       }
     }
     // Append after existing siblings so creation order is the display order.
@@ -2182,7 +2182,8 @@ class CoordinatorToolExecutor {
       ),
     );
     return 'Added user story "$title" (id: $id)'
-        '${parentId != null ? ' under #$parentId' : ''}.';
+        '${parentId != null ? ' under #$parentId' : ''}.'
+        '${await storyTreeSnapshot()}';
   }
 
   /// Re-parent / re-order a story to fix the tree (cycle-safe).
@@ -2234,7 +2235,8 @@ class CoordinatorToolExecutor {
       ),
     );
     return 'Moved story #$id ${makeRoot ? 'to root' : 'under #$newParent'}'
-        '${order != null ? ' at position $order' : ''}.';
+        '${order != null ? ' at position $order' : ''}.'
+        '${await storyTreeSnapshot()}';
   }
 
   /// Delete a story (and, recursively, its descendants + notes) the user asked
@@ -2264,7 +2266,8 @@ class CoordinatorToolExecutor {
     await db.deleteUserStory(id);
     final extra = branch - 1;
     return 'Deleted story #$id "${target.title}"'
-        '${extra > 0 ? ' and its $extra descendant${extra == 1 ? '' : 's'}' : ''}.';
+        '${extra > 0 ? ' and its $extra descendant${extra == 1 ? '' : 's'}' : ''}.'
+        '${await storyTreeSnapshot()}';
   }
 
   Future<String> _updateUserStory(Map<String, dynamic> args) async {
@@ -2305,6 +2308,29 @@ class CoordinatorToolExecutor {
           ? ' (child of #${s.parent_story_fk})'
           : '';
       b.writeln('- #${s.story_pk} [${s.kind}/${s.status}] ${s.title}$parent');
+    }
+    return b.toString();
+  }
+
+  /// A compact snapshot of the CURRENT story tree (id · kind · title · parent),
+  /// appended to every structural story mutation and to the loop-guard feedback
+  /// for the story tools. Grounding the (often weak, local) model with the real
+  /// tree after each edit is what stops the discovery spiral: without it the
+  /// model re-derives the tree from memory, re-issues moves it already made,
+  /// trips the loop guard, then reasons in circles about what the state is.
+  Future<String> storyTreeSnapshot() async {
+    final stories = await db.getUserStoriesForProject(projectId);
+    if (stories.isEmpty) return '\n\nCurrent story tree: (empty).';
+    final b = StringBuffer(
+      '\n\nCurrent story tree (${stories.length}) — this is the REAL current '
+      'state; trust it over your memory and do NOT re-issue moves it already '
+      'reflects:',
+    );
+    for (final s in stories) {
+      final parent = s.parent_story_fk != null
+          ? ' (child of #${s.parent_story_fk})'
+          : ' (root)';
+      b.write('\n- #${s.story_pk} [${s.kind}] ${s.title}$parent');
     }
     return b.toString();
   }

@@ -63,8 +63,8 @@ class _SetupTabState extends ConsumerState<SetupTab> {
     final navigator = Navigator.of(context);
     final messenger = ScaffoldMessenger.of(context);
 
-    // Gate: every REQUIRED section (industries, platforms, objectives, features,
-    // languages, frameworks, libraries + any industry sub-axis like Genre) must
+    // Gate: every REQUIRED section (industries, platforms, features,
+    // languages, frameworks + any industry sub-axis like Genre) must
     // have a tag before we generate the plan — no continuing on a half-filled
     // profile. Databases/services are optional and don't block.
     final gaps = await controller.setupCompletenessGaps();

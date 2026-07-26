@@ -73,6 +73,18 @@ Future<String> buildProjectBaseline(NexusDatabase db, int projectId) async {
     return v.isEmpty ? '—' : v.join(', ');
   }
 
+  // Features and the retired `objectives` section are one axis now — present
+  // their UNION under a single "Features & capabilities" line (deduped,
+  // case-insensitive) so legacy projects' objectives tags still show.
+  String featuresLine() {
+    final seen = <String>{};
+    final merged = <String>[
+      for (final v in [...?byCat['features'], ...?byCat['objectives']])
+        if (seen.add(v.toLowerCase())) v,
+    ];
+    return merged.isEmpty ? '—' : merged.join(', ');
+  }
+
   // Industry sub-axes / any non-standard categories (e.g. `genre`), shown right
   // after Industries so the domain reads correctly.
   final extras =
@@ -82,8 +94,7 @@ Future<String> buildProjectBaseline(NexusDatabase db, int projectId) async {
     '- Industries: ${cat('industries')}',
     for (final k in extras) '- ${_titleCase(k)}: ${cat(k)}',
     '- Target platforms: ${cat('platforms')}',
-    '- Objectives: ${cat('objectives')}',
-    '- Features: ${cat('features')}',
+    '- Features & capabilities: ${featuresLine()}',
     '- Languages: ${cat('languages')}',
     '- Frameworks / engines: ${cat('frameworks')}',
     '- Databases: ${cat('databases')}',
@@ -123,5 +134,5 @@ HARD RULES:
   WEB or DESKTOP app, do not choose a native game engine like Unity/C#; and
   vice-versa.)
 - Use the listed Databases, Libraries, and External services; don't invent others.
-- Keep scope to the Objectives and Features above.''';
+- Keep scope to the Features & capabilities above.''';
 }

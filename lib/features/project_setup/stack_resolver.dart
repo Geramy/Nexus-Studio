@@ -22,7 +22,8 @@ extension LayerX on Layer {
 }
 
 /// Deterministic architecture resolver. Reads the (non-rejected) intent tags —
-/// platforms + objectives — and computes the layers + language/framework stack
+/// platforms + features (incl. legacy objectives) — and computes the layers +
+/// language/framework stack
 /// per the project axioms. NEVER run by the AI; the AI only proposes intent.
 ///
 /// Axioms (see PROJECT_SETUP_PLAN.md):
@@ -40,8 +41,16 @@ class StackResolver {
   /// `layerKey` so the Tag Board can show them and the user can confirm.
   ResolvedStack resolve(List<ProjectTag> tags) {
     final active = tags.where((t) => !t.isRejected).toList();
+    // Features and the retired "objectives" section are one axis now — read the
+    // UNION so the capability signals (UI, dashboard, heavy computation,
+    // distributed, ML, memory-safety) drive the stack whether a new project
+    // tagged them under `features` or a legacy one under `objectives`.
     final objectives = active
-        .where((t) => t.knownCategory == TagCategory.objectives)
+        .where(
+          (t) =>
+              t.knownCategory == TagCategory.features ||
+              t.knownCategory == TagCategory.objectives,
+        )
         .map((t) => t.value.toLowerCase())
         .toSet();
     final platforms = active

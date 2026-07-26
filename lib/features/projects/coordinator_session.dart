@@ -98,6 +98,16 @@ class ProjectCoordinatorSession {
   final List<Map<String, dynamic>> _fullTrace = [];
   final StringBuffer _reasonBuf = StringBuffer();
 
+  /// Anti-runaway guards for the (often local/GGUF) coordinator + discovery
+  /// model. Without a repeat penalty a weak model can loop on its own reasoning
+  /// forever ("I'll add the root story. Then I'll ask the question. Let's do
+  /// it." repeated for thousands of lines, never emitting a tool call). A mild
+  /// [_kRepeatPenalty] breaks that degenerate loop; [_kMaxCompletionTokens] is a
+  /// hard backstop that bounds any round that still runs away (the turn then
+  /// ends with no tool call and the existing anti-stall nudge re-prompts it).
+  static const double _kRepeatPenalty = 1.15;
+  static const int _kMaxCompletionTokens = 8192;
+
   /// Detects when the coordinator agent gets stuck repeating the same tool call
   /// (same name + args) across rounds/turns and escalates warn → block so the
   /// model breaks out instead of burning rounds. The round cap is the backstop.
@@ -460,6 +470,8 @@ class ProjectCoordinatorSession {
       messages: messages,
       tools: effectiveTools,
       temperature: 0.7,
+      repeatPenalty: _kRepeatPenalty,
+      maxCompletionTokens: _kMaxCompletionTokens,
       enableThinking: enableThinking,
     );
   }
@@ -479,7 +491,16 @@ class ProjectCoordinatorSession {
     String? currentPlanContext,
     int maxToolRounds = 4,
   }) async* {
-    _history.add({'role': 'user', 'content': userMessage});
+    // Qwen soft-switch: the local Discovery collection ignores the API
+    // `enable_thinking:false`, so force thinking OFF via the `/no_think` token on
+    // the LATEST user turn (the placement Qwen honors most reliably), on top of
+    // the system-prompt `/no_think`. Only for the discovery interview — a
+    // decisive tool-calling flow that shouldn't ruminate. Kept out of the
+    // training trace so we don't train on the hack.
+    final wireUserMessage = discoveryMode
+        ? '$userMessage /no_think'
+        : userMessage;
+    _history.add({'role': 'user', 'content': wireUserMessage});
     _fullTrace.add({'role': 'user', 'content': userMessage});
     _reasonBuf.clear();
     // If this turn fails we roll back to here so a failed/retried send never
@@ -711,7 +732,15 @@ class ProjectCoordinatorSession {
             _guardArgs(call.function.name, args),
           );
           if (action == LoopAction.block) {
-            final note = _loopGuard.feedback(call.function.name, action);
+            var note = _loopGuard.feedback(call.function.name, action);
+            // A blocked call never executes, so it returns no state. For the
+            // story-tree tools that means the model is refused mid-reorg with NO
+            // view of the tree — exactly what makes it spiral reconstructing the
+            // state from memory. Hand it the real tree so it re-grounds and moves
+            // on instead of re-deriving what happened.
+            if (_isStoryTreeTool(call.function.name)) {
+              note += await executor.storyTreeSnapshot();
+            }
             onToolResult?.call(note);
             _history.add({
               'role': 'tool',
@@ -1097,6 +1126,8 @@ class ProjectCoordinatorSession {
           messages: messages,
           tools: tools,
           temperature: 0.7,
+          repeatPenalty: _kRepeatPenalty,
+          maxCompletionTokens: _kMaxCompletionTokens,
           enableThinking: enableThinking,
         )) {
           emitted = true;
@@ -1131,6 +1162,16 @@ class ProjectCoordinatorSession {
     onToolsDropped(true);
   }
 
+  /// The structural story-tree tools — a blocked call to one of these leaves the
+  /// model with no view of the tree, so its loop-guard feedback gets the current
+  /// tree appended (see the block path) to keep it grounded.
+  static bool _isStoryTreeTool(String name) => const {
+    'add_user_story',
+    'move_user_story',
+    'delete_user_story',
+    'update_user_story',
+  }.contains(name);
+
   /// True if [e] is the plan's concurrent-connection cap (HTTP 429 /
   /// too_many_connections) — transient backpressure worth retrying, not an error
   /// to surface to the user.
@@ -1149,6 +1190,8 @@ class ProjectCoordinatorSession {
       messages: messages,
       tools: tools,
       temperature: 0.7,
+      repeatPenalty: _kRepeatPenalty,
+      maxCompletionTokens: _kMaxCompletionTokens,
       enableThinking: enableThinking,
     );
     final msg = resp.choices.isNotEmpty ? resp.choices.first.message : null;

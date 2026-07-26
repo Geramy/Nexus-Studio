@@ -181,7 +181,7 @@ class _ResolveBarState extends ConsumerState<_ResolveBar> {
             const SizedBox(width: 8),
             const Expanded(
               child: Text(
-                'Resolve the stack from your platforms & objectives '
+                'Resolve the stack from your platforms & features '
                 '(Client ↔ Server ↔ PostgreSQL).',
               ),
             ),

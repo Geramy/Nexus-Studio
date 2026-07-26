@@ -1846,6 +1846,9 @@ class ProjectOrchestrator {
     // outcome is safe to auto-approve. An agent is only pulled in for a real
     // conflict, exactly as the user expects. Serialized through the lane since it
     // mutates the shared tree/refs while other agents may be committing.
+    // The paths that actually conflicted — handed to the agent below, and written
+    // into its worktree WITH conflict markers so it can see both sides.
+    var conflictPaths = const <String>[];
     if (git != null) {
       try {
         final result = await lane.run(() async {
@@ -1862,6 +1865,7 @@ class ProjectOrchestrator {
           );
           return;
         }
+        conflictPaths = result.conflicts;
         debugPrint(
           '[Orchestrator p$projectId] task ${task.task_pk}: merge conflicts on ${result.conflicts.length} file(s) — escalating.',
         );
@@ -1903,6 +1907,28 @@ class ProjectOrchestrator {
     }
     // Put the worktree on the target so the Coordinator resolves into it.
     await _checkout(handles.git, targetBranch, task.task_pk);
+
+    // Give the agent the conflict it is being asked to resolve. The file-level
+    // merge writes NOTHING on a conflict, so without this the agent lands on a
+    // pristine target tree while its prompt tells it to "remove every conflict
+    // marker" — impossible, so it burned its turns and the task always Blocked.
+    // Writing both sides in with real markers makes that workflow actually work.
+    final ws = handles.ws;
+    if (git != null && ws != null && conflictPaths.isNotEmpty) {
+      try {
+        final n = await lane.run(
+          () => git.writeConflictMarkers(branch, ws, conflictPaths),
+          timeout: _laneOpTimeout,
+        );
+        debugPrint(
+          '[Orchestrator p$projectId] task ${task.task_pk}: wrote conflict markers into $n file(s) for the agent.',
+        );
+      } catch (e) {
+        debugPrint(
+          '[Orchestrator p$projectId] task ${task.task_pk}: could not write conflict markers ($e) — agent gets the paths only.',
+        );
+      }
+    }
 
     final prompts = await _loadPrompts();
     final vars = _varsFor(task, branch, targetBranch: targetBranch);
@@ -1946,6 +1972,14 @@ class ProjectOrchestrator {
     );
 
     var kickoff = prompts.render(OrchestratorPromptField.mergeKickoff, vars);
+    if (conflictPaths.isNotEmpty) {
+      kickoff +=
+          '\n\nCONFLICTED FILES — each is ALREADY in your worktree with '
+          '`<<<<<<< ours (current)` / `=======` / `>>>>>>> theirs ($branch)` '
+          'markers around the divergent part. Open each one, combine BOTH '
+          'sides\' intent, delete every marker line, then git_commit and '
+          'approve_task:\n${conflictPaths.map((p) => '- $p').join('\n')}';
+    }
     for (var turn = 0; turn < _maxTurnsPerStage && !_disposed; turn++) {
       if (!await _stillRunning()) return;
       try {
@@ -2489,6 +2523,49 @@ class ProjectOrchestrator {
       final info = (kind == 'flutter' || kind == 'dart')
           ? await _appManifestInfo(ws)
           : (subdir: '', codegen: false);
+
+      // Guarantee `flutter test` / `dart test` has at least one test to run.
+      // With no `test/` dir those commands FAIL hard ("Test directory 'test' not
+      // found"), so a project with no feature tests yet can never go green and
+      // the CI gate loops forever. A trivial always-passing smoke test fixes it
+      // deterministically and shell-agnostically (CI steps run under cmd on
+      // Windows / bash on CI, so a `[ -d test ]` guard in the YAML isn't
+      // portable). Real tests from the Testing phase live alongside it. Runs
+      // even when the CI YAML already exists (below), so it isn't skipped by the
+      // early-return. flutter_test (SDK) / test (dev-dep) are always present when
+      // the corresponding `*  test` step runs.
+      if (kind == 'flutter' || kind == 'dart') {
+        final sub = info.subdir.trim();
+        final testPath =
+            '${sub.isEmpty ? '' : '/$sub'}/test/nxs_smoke_test.dart';
+        if (!await ws.exists(testPath)) {
+          final pkg = kind == 'flutter' ? 'flutter_test' : 'test';
+          final content =
+              '// Auto-added so `$kind test` always has a test to run — CI\'s test\n'
+              '// step must not fail merely because no feature tests exist yet.\n'
+              "import 'package:$pkg/$pkg.dart';\n\n"
+              'void main() {\n'
+              "  test('smoke — the test harness runs', () {\n"
+              '    expect(true, isTrue);\n'
+              '  });\n'
+              '}\n';
+          final lane = ref.read(gitLaneProvider(projectId));
+          await lane.run(() async {
+            try {
+              await git.checkoutBranch('main');
+            } catch (_) {}
+            await ws.writeString(testPath, content);
+            await git.commitAll(
+              message: 'ci: add smoke test so the test step passes',
+            );
+          }, timeout: _laneOpTimeout);
+          ref.read(workspaceRevisionProvider(projectId).notifier).state++;
+          debugPrint(
+            '[Orchestrator p$projectId] wrote smoke test at $testPath.',
+          );
+        }
+      }
+
       final existing = await ws.exists(_defaultCiPath)
           ? await ws.readString(_defaultCiPath)
           : null;

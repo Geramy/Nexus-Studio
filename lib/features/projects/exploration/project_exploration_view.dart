@@ -176,6 +176,8 @@ class ProjectExplorationView extends ConsumerWidget {
                   children: [
                     Text(
                       'User Stories — "$projectName"',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                       style: const TextStyle(
                         fontSize: 15,
                         fontWeight: FontWeight.w700,
@@ -187,6 +189,8 @@ class ProjectExplorationView extends ConsumerWidget {
                                 'user stories, then generate tasks when the idea is solid.'
                           : 'Your user-story map. Refine it with the Coordinator and '
                                 'regenerate tasks any time.',
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
                       style: theme.textTheme.bodySmall?.copyWith(
                         color: theme.colorScheme.onSurfaceVariant,
                       ),

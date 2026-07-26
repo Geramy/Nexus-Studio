@@ -50,7 +50,6 @@ class SetupTools {
         ? const [
             'industries',
             'platforms',
-            'objectives',
             'features',
             'languages',
             'frameworks',
@@ -124,7 +123,7 @@ class SetupTools {
               'Ask the user ONE interview question and get their answer. This is '
               'how you ask every setup question: it shows the options as buttons '
               'the user taps and returns their selection to you, so the user can '
-              'answer. Use it for each step (platforms, objectives, features, and '
+              'answer. Use it for each step (platforms, features, and '
               'so on). Give a clear question plus 2-8 short options, and keep '
               'multi=true so the user can pick several. Example: '
               'ask_question(question: "Question 2 of 7 — Which platforms should '
@@ -147,7 +146,7 @@ class SetupTools {
                 'description':
                     'Whether the user may pick more than one option. DEFAULTS '
                     'TO TRUE — most setup questions (platforms, languages, '
-                    'frameworks, libraries, industries, objectives) are '
+                    'frameworks, libraries, industries, features) are '
                     'additive and the user should be able to choose several. '
                     'Set this to false ONLY for a strict single-choice '
                     'question such as a yes/no or an end-of-stage '
@@ -180,7 +179,7 @@ class SetupTools {
           'description':
               'Get vocabulary tailored to the user\'s selected industry + '
               'sub-axis (e.g. genre) for a category. Call this BEFORE asking '
-              'objectives or features (use the returned values as the '
+              'features (use the returned values as the '
               'options), and when deriving languages/frameworks/libraries '
               '(pass the relevant platform). Platform-conditional: for '
               'languages/frameworks/libraries pass `platform` so you get the '
@@ -192,7 +191,6 @@ class SetupTools {
               'category': {
                 'type': 'string',
                 'enum': [
-                  'objectives',
                   'features',
                   'languages',
                   'frameworks',
@@ -314,8 +312,8 @@ class SetupTools {
               'Saved as `proposed` for the user to accept. Languages and '
               'platforms use the allowed vocab; databases/services/frameworks '
               'accept free entry. Example: propose_tags(tags: ['
-              '{"category": "objectives", "value": "Order tracking"}, '
-              '{"category": "objectives", "value": "Push notifications"}]).',
+              '{"category": "features", "value": "Order tracking"}, '
+              '{"category": "features", "value": "Push notifications"}]).',
           'parameters': {
             'type': 'object',
             'properties': {
@@ -375,7 +373,7 @@ class SetupTools {
               'of propose_tags). Removing an `industries` tag AUTOMATICALLY '
               'clears the sub-axis selections it introduced (e.g. dropping '
               '"Media" also clears its genre pick) — you do not need to remove '
-              'those yourself, but DO re-check objectives/features that only fit '
+              'those yourself, but DO re-check features that only fit '
               'the old industry and remove any that no longer apply. After '
               'removing, propose_tags the correct value if the user named one.',
           'parameters': {
@@ -870,7 +868,7 @@ class SetupToolExecutor {
     final pending = s.subAxes.where((a) => !a.answered).toList();
     if (pending.isEmpty) {
       b.write(
-        ' No sub-axis pending. Proceed to objectives/features '
+        ' No sub-axis pending. Proceed to features '
         '(call scope_options first for tailored options).',
       );
     } else {
@@ -1106,7 +1104,7 @@ class SetupToolExecutor {
           '${proposedIndustries.join(', ')} — ask which '
           '${a.name.toLowerCase()}(s) via ask_question using these options: '
           '${a.values.join(', ')}; then propose_tags(category `${a.key}`). '
-          'After that, call scope_options for objectives and features to get '
+          'After that, call scope_options for features to get '
           'vocabulary tailored to this selection.',
         );
       }

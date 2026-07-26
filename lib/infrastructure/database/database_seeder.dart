@@ -241,7 +241,7 @@ Future<void> _grantStoryToolsToManagers(NexusDatabase db) async {
 /// Bundled scoped-vocabulary catalog version. BUMP THIS whenever
 /// `assets/setup/scoped_vocab.json` is regenerated so existing installs reconcile
 /// (insert new industries, update changed ones) on next launch.
-const int _scopedVocabVersion = 1;
+const int _scopedVocabVersion = 3;
 
 /// Load the bundled scoped-vocabulary catalog and reconcile it into the DB.
 /// Version-gated: if the stored catalog version already matches the bundled one,

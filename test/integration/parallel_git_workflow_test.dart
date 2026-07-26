@@ -92,6 +92,61 @@ void main() {
       },
     );
 
+    test(
+      'additive edits to a shared file (pubspec deps) auto-merge as a union',
+      () async {
+        final ws = await VhdWorkspace.open('${dir.path}/pu.nxtprj');
+        final git = await NxtprjGitEngine.open(ws);
+        await ws.writeString(
+          '/pubspec.yaml',
+          'name: app\ndependencies:\n  flutter:\n    sdk: flutter\n',
+        );
+        await git.commitAll(message: 'base');
+
+        final t1 = await VhdWorkspace.open('${dir.path}/pu1.nxtprj');
+        final t2 = await VhdWorkspace.open('${dir.path}/pu2.nxtprj');
+        await git.createBranchAt('task/1', base: 'main');
+        await git.createBranchAt('task/2', base: 'main');
+        await git.materializeInto('task/1', t1);
+        await git.materializeInto('task/2', t2);
+
+        // Each task appends a DIFFERENT dependency — the dominant real conflict
+        // that used to block the orchestrator's merge lane.
+        await t1.writeString(
+          '/pubspec.yaml',
+          'name: app\ndependencies:\n  flutter:\n    sdk: flutter\n  flame: ^1.18.0\n',
+        );
+        await t2.writeString(
+          '/pubspec.yaml',
+          'name: app\ndependencies:\n  flutter:\n    sdk: flutter\n  audioplayers: ^6.0.0\n',
+        );
+        await git.commitFrom(t1, branch: 'task/1', message: 'a');
+        await git.commitFrom(t2, branch: 'task/2', message: 'b');
+
+        await git.checkoutBranch('main');
+        final m1 = await git.merge('task/1'); // fast-forward
+        expect(m1.outcome, isNot(MergeOutcome.conflicts));
+        final m2 = await git.merge('task/2'); // additive union — NOT a conflict
+        expect(
+          m2.outcome,
+          isNot(MergeOutcome.conflicts),
+          reason: 'additive dependency additions should union-merge, not block',
+        );
+
+        final mainTree = await VhdWorkspace.open('${dir.path}/pumain.nxtprj');
+        await git.materializeInto('main', mainTree);
+        final pubspec = await mainTree.readString('/pubspec.yaml');
+        expect(pubspec, contains('flame: ^1.18.0'));
+        expect(pubspec, contains('audioplayers: ^6.0.0'));
+        expect(pubspec, contains('sdk: flutter'));
+
+        git.dispose();
+        for (final w in [ws, t1, t2, mainTree]) {
+          w.dispose();
+        }
+      },
+    );
+
     test('a real merge conflict is reported (not silently merged)', () async {
       final ws = await VhdWorkspace.open('${dir.path}/p.nxtprj');
       final git = await NxtprjGitEngine.open(ws);

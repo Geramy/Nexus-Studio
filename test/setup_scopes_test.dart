@@ -102,5 +102,39 @@ void main() {
       category: 'features',
     );
     expect(gamingFeatures, isNotEmpty);
+
+    // MERGE: `features` now always includes the cross-cutting common base so
+    // every project is offered the interchangeable essentials on top of the
+    // industry-scoped options.
+    expect(
+      gamingFeatures,
+      contains('User accounts'),
+      reason: 'common base features appended to every features query',
+    );
+    expect(gamingFeatures, contains('Notifications'));
+
+    // NORMALIZATION: no option is a paragraph (all are ≤6-word labels) and
+    // there are no case-insensitive duplicates in a served list.
+    for (final f in gamingFeatures) {
+      expect(
+        f.split(RegExp(r'\s+')).length,
+        lessThanOrEqualTo(6),
+        reason: 'seed-time normalization drops paragraph-length values: "$f"',
+      );
+    }
+    final lowered = gamingFeatures.map((f) => f.toLowerCase()).toList();
+    expect(
+      lowered.toSet().length,
+      lowered.length,
+      reason: 'no duplicate options served',
+    );
+
+    // Base features are offered even for an industry with a thin/absent catalog.
+    final govFeatures = await db.scopeOptions(
+      industries: ['Government'],
+      subValues: const [],
+      category: 'features',
+    );
+    expect(govFeatures, contains('User accounts'));
   });
 }

@@ -137,12 +137,12 @@ You have $stepCount topics to fill (listed below). FIRST tag ONLY what the user 
 
 $steps
 START FROM WHAT THEY SAID:
-- Read the user's description and call `propose_tags` ONLY for what it clearly states or unmistakably requires (e.g. "a website" → platform Web; "log in" → Authentication). Do NOT pre-fill `objectives` or `features` with things the user did not say — those are for the user to choose when you ASK each topic, one at a time.
+- Read the user's description and call `propose_tags` ONLY for what it clearly states or unmistakably requires (e.g. "a website" → platform Web; "log in" → Authentication). Do NOT pre-fill `features` with things the user did not say — those are for the user to choose when you ASK each topic, one at a time.
 - Then reflect back in one short sentence what you recorded, and ask the NEXT TOPIC.
 
 HOW TO ASK (for the topics still open):
 - Each remaining question goes through the `ask_question` tool — it shows the options as buttons the user taps, so calling it is how you get their answer.
-- Put any progress label inside the tool call, e.g. ask_question(question: "Objectives — anything else it should do?", options: ["…","…"], multi: true).
+- Put any progress label inside the tool call, e.g. ask_question(question: "Features — anything else it should do?", options: ["…","…"], multi: true).
 
 ONE TOPIC AT A TIME, IN ORDER:
 1. Call the `ask_question` tool for the CURRENT topic (the "NEXT TOPIC") with its options, and wait for the answer.
@@ -154,11 +154,11 @@ RULES:
 - Base every tag on what the user picked or said. Use the `category` shown in each question's brackets.
 - ANSWER OUTSIDE THE QUESTION: the user can type anything at any time, even when it is not a reply to what you asked. Treat every typed message as authoritative — if it adds facts, `propose_tags` them under the right category; if it corrects something, fix it; then carry on. Never ignore a typed message just because it wasn't the option you offered.
 - CORRECTIONS / "you're wrong": if the user says a tag is WRONG ("this isn't a logistics app", "that's not ecommerce", "the Media tag is wrong, it's a game"), call `remove_tags` for EXACTLY the values they disowned, then `propose_tags` the right one if they named it. Only remove what the user explicitly rejected.
-- CATEGORY SWAP CASCADE: when the user changes the INDUSTRY (e.g. "it's a game, not media"), remove_tags the wrong industry — its sub-axis (e.g. genre) is cleared automatically — then propose_tags the correct industry and follow the resulting "NEXT:" sub-axis question. Also review objectives/features that only made sense for the OLD industry and remove_tags the ones that no longer fit before moving on.
+- CATEGORY SWAP CASCADE: when the user changes the INDUSTRY (e.g. "it's a game, not media"), remove_tags the wrong industry — its sub-axis (e.g. genre) is cleared automatically — then propose_tags the correct industry and follow the resulting "NEXT:" sub-axis question. Also review features that only made sense for the OLD industry and remove_tags the ones that no longer fit before moving on.
 - PICK THE RIGHT INDUSTRY UP FRONT: map the user's product to the closest industry deliberately. A game / gameplay / "make me a game" is the **Gaming** industry (it unlocks the Genre sub-axis) — do NOT file it under Media/Entertainment. Likewise match other products to their actual domain rather than a generic catch-all.
-- Each tag VALUE is a SHORT label — a few words (≤5), one idea per tag. Give several items as several tags. Example: "track orders and notify users" → propose_tags([{category:"objectives", value:"Order tracking"}, {category:"objectives", value:"User notifications"}]).
+- Each tag VALUE is a SHORT label — a few words (≤5), one idea per tag. Give several items as several tags. Example: "track orders and notify users" → propose_tags([{category:"features", value:"Order tracking"}, {category:"features", value:"User notifications"}]).
 - If a tool result says "NEXT: …", do that next (some answers unlock a follow-up question, e.g. Industry → Genre).
-- STACK: once platforms are known, `propose_tags` a MINIMAL, COHERENT stack yourself (the user usually won't mention it) — the language(s) the chosen framework ACTUALLY uses and NOTHING else. A framework implies its language: Flutter → Dart ONLY (NEVER TypeScript/JS alongside it); a React/Next web app → TypeScript; do NOT mix languages from different ecosystems or add a second language that doesn't fit. Propose a DATABASE or an AUTH/CLOUD library ONLY if the tagged objectives/features genuinely require persistence or accounts — never by default on a simple app. When you do, prefer one that works on ALL the target platforms: for a Flutter web+desktop app avoid heavyweight native-only SDKs (e.g. the Firebase C++ desktop SDK fails to link on Windows, native-only sqlite is blank on web) — pick a lighter cross-platform option.
+- STACK: once platforms are known, `propose_tags` a MINIMAL, COHERENT stack yourself (the user usually won't mention it) — the language(s) the chosen framework ACTUALLY uses and NOTHING else. A framework implies its language: Flutter → Dart ONLY (NEVER TypeScript/JS alongside it); a React/Next web app → TypeScript; do NOT mix languages from different ecosystems or add a second language that doesn't fit. Propose a DATABASE or an AUTH/CLOUD library ONLY if the tagged features genuinely require persistence or accounts — never by default on a simple app. When you do, prefer one that works on ALL the target platforms: for a Flutter web+desktop app avoid heavyweight native-only SDKs (e.g. the Firebase C++ desktop SDK fails to link on Windows, native-only sqlite is blank on web) — pick a lighter cross-platform option.
 - When every required question has at least one tag (${_requiredTitles()}), call `finalize_setup`. It refuses and lists what is missing if you call it too early.
 - ${flow.finalizeGuidance}
 ''';
@@ -510,6 +510,11 @@ How to work:
           messages: messages,
           tools: tools,
           temperature: 0.6,
+          // Anti-runaway: a mild repeat penalty stops a weak local model from
+          // looping on its own reasoning forever, and the token cap is a hard
+          // backstop so any runaway round still terminates.
+          repeatPenalty: 1.15,
+          maxCompletionTokens: 8192,
           enableThinking: enableThinking,
           // Ask the server (llama.cpp / Lemonade) to reuse the KV cache for the
           // identical [system + tools] prefix we now hold stable across rounds

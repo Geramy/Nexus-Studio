@@ -4,9 +4,12 @@
 
 /// The sections of the project profile. Every tag belongs to exactly one.
 /// Categories split into two families:
-///   - Intent (user-led): industries, platforms, objectives, features, services.
+///   - Intent (user-led): industries, platforms, features, services.
 ///   - Stack (AI/resolver-derived, user confirms): languages, frameworks,
 ///     databases, libraries.
+/// [objectives] is RETIRED (merged into [features] — the interview no longer
+/// asks it) but stays in the enum so legacy projects' `objectives` tags still
+/// read back; every consumer reads the union of features + objectives.
 /// [databases] and [services] are curated/open so the host can capture anything
 /// the user describes in conversation (PostgreSQL, Redis, Stripe, Twilio, …)
 /// rather than being limited to a fixed list.
@@ -43,7 +46,7 @@ extension TagCategoryX on TagCategory {
     TagCategory.industries => 'Applicable Industries',
     TagCategory.platforms => 'Platforms',
     TagCategory.objectives => 'Objectives',
-    TagCategory.features => 'Features',
+    TagCategory.features => 'Features & Capabilities',
     TagCategory.languages => 'Languages',
     TagCategory.frameworks => 'Frameworks',
     TagCategory.databases => 'Databases',
@@ -132,7 +135,12 @@ const List<String> kIndustries = [
   'IoT',
 ];
 
-/// Curated seeds — what the system must do (drives the resolver).
+/// LEGACY curated seeds for the retired [TagCategory.objectives] section. The
+/// setup interview no longer ASKS objectives — objectives and features were the
+/// same axis (every capability is a feature the app must ship), so they were
+/// merged into [kFeatures]. This list is kept only so existing projects whose
+/// tags were captured under `objectives` still render/read correctly; new
+/// projects capture everything under `features`.
 const List<String> kObjectives = [
   'Customer-facing UI',
   'Admin dashboard',
@@ -148,24 +156,40 @@ const List<String> kObjectives = [
   'Machine learning',
 ];
 
-/// Curated seeds — concrete product features (free entry encouraged; these are
-/// project-specific capabilities the app must ship, distinct from the broader
-/// [TagCategory.objectives] which describe system-level intent).
+/// Curated seeds — the app's features & capabilities. This ONE section now
+/// covers BOTH concrete product features AND the higher-level system
+/// capabilities that used to be a separate "objectives" section (they are the
+/// same axis — every capability is a feature the app must ship). The stack
+/// resolver reads these (union with any legacy `objectives` tags) to derive the
+/// architecture, so the capability signals at the end (UI, dashboard, API,
+/// realtime, heavy computation, distributed, ML, memory-safety) MUST stay
+/// pickable here. Ordered most-common-first: the cross-cutting essentials most
+/// apps/web want, then the system-level capabilities.
 const List<String> kFeatures = [
+  // Cross-cutting essentials (the interchangeable base most apps/web want).
   'User accounts',
+  'Authentication / login',
   'Role-based access',
-  'Client portal',
-  'Billing & invoicing',
-  'Expense tracking',
-  'Time tracking',
-  'Geofencing',
-  'Inventory / asset checkout',
-  'Scheduling / calendar',
+  'User profiles',
   'Notifications',
-  'Reporting & analytics',
-  'File uploads',
   'Search',
+  'Settings / preferences',
+  'File uploads',
+  'Reporting & analytics',
   'Audit log',
+  'Scheduling / calendar',
+  'Offline support',
+  'Payments / billing',
+  // System-level capabilities (these drive the resolved architecture stack).
+  'Customer-facing UI',
+  'Admin dashboard',
+  'Public API',
+  'Realtime / streaming',
+  'Data persistence',
+  'Heavy computation',
+  'Highly distributed',
+  'Machine learning',
+  'Memory-safety critical',
 ];
 
 /// Curated seeds — common frameworks (free entry still allowed).

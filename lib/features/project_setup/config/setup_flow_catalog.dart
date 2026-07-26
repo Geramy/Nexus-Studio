@@ -59,16 +59,18 @@ final SetupFlowDefinition applicationDevelopmentFlow = SetupFlowDefinition(
       vocab: SetupVocab.closed,
       suggestions: kPlatforms,
     ),
-    _s(
-      'objectives',
-      TagCategoryX(TagCategory.objectives).label,
-      'System-level intent (UI, API, realtime, ML…). Propose `objectives` tags.',
-      suggestions: kObjectives,
-    ),
+    // ONE features/capabilities stage — the old separate "objectives" stage was
+    // merged in (they're the same axis; two stages just doubled the fill and
+    // drifted the scope). Covers both concrete product features AND the
+    // system-level capabilities (UI, API, realtime, ML…) the resolver keys off.
     _s(
       'features',
       TagCategoryX(TagCategory.features).label,
-      'Concrete product features the app must ship. Propose `features` tags.',
+      'What the app must DO — its features and capabilities (both concrete '
+          'product features like order tracking AND system-level ones like a '
+          'customer-facing UI, an API, realtime, or ML). Scope these to the '
+          "user's chosen industry (call `scope_options` first for tailored, "
+          'industry-appropriate options). Propose `features` tags.',
       suggestions: kFeatures,
     ),
     _s(

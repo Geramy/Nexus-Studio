@@ -264,6 +264,7 @@ class NexusDatabase extends _$NexusDatabase {
   /// Editable in the DB afterward; safe to call on every launch.
   Future<void> seedSetupFlows() async {
     for (final flow in setup_cat.kBuiltinSetupFlows) {
+      final json = jsonEncode(flow.toJson());
       final existing =
           await (select(setupFlows)..where(
                 (f) =>
@@ -273,14 +274,32 @@ class NexusDatabase extends _$NexusDatabase {
                         : f.subCategory.equals(flow.subCategory!)),
               ))
               .getSingleOrNull();
-      if (existing != null) continue;
-      await into(setupFlows).insert(
-        SetupFlowsCompanion.insert(
-          projectType: flow.projectType,
-          subCategory: Value(flow.subCategory),
-          json: jsonEncode(flow.toJson()),
-        ),
-      );
+      if (existing == null) {
+        await into(setupFlows).insert(
+          SetupFlowsCompanion.insert(
+            projectType: flow.projectType,
+            subCategory: Value(flow.subCategory),
+            json: json,
+          ),
+        );
+        continue;
+      }
+      // RECONCILE built-ins: when the SHIPPED definition changes (e.g. the
+      // objectives stage was merged into features), overwrite the cached row so
+      // existing installs pick it up — otherwise the stale stored flow keeps
+      // driving the interview (and its required-gate). Only writes on an actual
+      // drift, so unchanged launches do nothing. (There is no in-app flow editor
+      // yet; if one is added, gate this behind an `isBuiltin`/edited flag.)
+      if (existing.json != json) {
+        await (update(setupFlows)
+              ..where((f) => f.setup_flow_pk.equals(existing.setup_flow_pk)))
+            .write(
+              SetupFlowsCompanion(
+                json: Value(json),
+                updatedAt: Value(DateTime.now()),
+              ),
+            );
+      }
     }
   }
 
@@ -350,6 +369,24 @@ class NexusDatabase extends _$NexusDatabase {
   /// no extra table. The query helpers filter on `axis='industry'`/sub-axis keys,
   /// so this sentinel row is never surfaced to the interview or board.
   static const String _scopeMetaAxis = '__catalog_meta__';
+
+  /// Cross-cutting "base" features every project can want, appended to the
+  /// industry-scoped `features` options so the interchangeable essentials are
+  /// always on offer even when a domain catalog is thin. Ordered deliberately
+  /// (most-common first). Mirrors the leading block of `kFeatures` in
+  /// tag_category.dart — keep the two roughly in sync.
+  static const List<String> _kBaseFeatureOptions = [
+    'User accounts',
+    'Authentication / login',
+    'Role-based access',
+    'User profiles',
+    'Notifications',
+    'Search',
+    'Settings / preferences',
+    'File uploads',
+    'Reporting & analytics',
+    'Offline support',
+  ];
 
   Future<int?> scopedCatalogVersion() async {
     final row =
@@ -463,6 +500,14 @@ class NexusDatabase extends _$NexusDatabase {
     Map<String, dynamic> map,
   ) async {
     var sort = 0;
+    // Seed-time normalization for the research-generated catalog, which has real
+    // defects: duplicate values (e.g. C#, C#, C#), and paragraph-length "values"
+    // that are unusable as a ≤5-word option label (and would be rejected by the
+    // propose_tags length guard anyway). Dedupe per (category+platform+lang) and
+    // drop anything too long to be a label, so only clean short options are seeded.
+    final seenValues = <String>{};
+    bool tooLongForLabel(String v) =>
+        v.split(RegExp(r'\s+')).length > 6 || v.length > 64;
     Future<void> add(
       String category,
       String value, {
@@ -471,6 +516,10 @@ class NexusDatabase extends _$NexusDatabase {
     }) async {
       final v = value.trim();
       if (v.isEmpty) return;
+      if (tooLongForLabel(v)) return; // skip paragraph-length catalog junk
+      final dedupKey = '$category|${platform ?? ''}|${forLanguage ?? ''}|'
+          '${v.toLowerCase()}';
+      if (!seenValues.add(dedupKey)) return; // skip catalog duplicates
       await into(setupScopeOptions).insert(
         SetupScopeOptionsCompanion.insert(
           setup_scope_fk: scopePk,
@@ -572,7 +621,11 @@ class NexusDatabase extends _$NexusDatabase {
               (s) => s.axis.equals('industry') & s.value.isIn(industries),
             ))
             .get();
-    if (industryScopes.isEmpty) return const [];
+    if (industryScopes.isEmpty) {
+      // No catalog for these industries — still offer the cross-cutting base for
+      // features so every project gets the interchangeable essentials.
+      return category == 'features' ? List.of(_kBaseFeatureOptions) : const [];
+    }
     final industryPks = industryScopes.map((s) => s.setup_scope_pk).toList();
 
     // Child (sub-axis) scopes under those industries whose value is selected.
@@ -586,11 +639,18 @@ class NexusDatabase extends _$NexusDatabase {
               .get();
     final childPks = childScopes.map((s) => s.setup_scope_pk).toList();
 
+    // Features and the retired "objectives" section are ONE axis now, but the
+    // research catalog still splits them into two arrays per scope — so when the
+    // caller asks for `features`, read BOTH categories' rows (union). Any other
+    // category reads only itself.
+    final wantCats = category == 'features'
+        ? const ['features', 'objectives']
+        : [category];
+
     Future<List<SetupScopeOption>> opts(List<int> pks) async {
       if (pks.isEmpty) return const [];
-      final q = select(
-        setupScopeOptions,
-      )..where((o) => o.setup_scope_fk.isIn(pks) & o.category.equals(category));
+      final q = select(setupScopeOptions)
+        ..where((o) => o.setup_scope_fk.isIn(pks) & o.category.isIn(wantCats));
       if (platform != null) {
         q.where((o) => o.platform.equals(platform) | o.platform.isNull());
       } else {
@@ -602,8 +662,17 @@ class NexusDatabase extends _$NexusDatabase {
 
     final seen = <String>{};
     final result = <String>[];
-    for (final row in [...await opts(childPks), ...await opts(industryPks)]) {
+    // Deepest (sub-axis) options first, then industry-level — most specific
+    // leads. For features, append the cross-cutting base last so the essentials
+    // are always offered even when the domain catalog is thin.
+    final rows = [...await opts(childPks), ...await opts(industryPks)];
+    for (final row in rows) {
       if (seen.add(row.value.toLowerCase())) result.add(row.value);
+    }
+    if (category == 'features') {
+      for (final v in _kBaseFeatureOptions) {
+        if (seen.add(v.toLowerCase())) result.add(v);
+      }
     }
     return result;
   }

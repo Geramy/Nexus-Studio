@@ -398,14 +398,23 @@ class _ProjectCoordinatorChatScreenState
         // the lane.
         gitLane: ref.read(gitLaneProvider(widget.projectId)),
         buildService: buildService,
-        // Agent-level thinking mode (Project Manager defaults Off, others Unset).
-        // Pass-2 will let a task override when the agent is Unset.
-        enableThinking: resolveEnableThinking(
-          agent: personaThinkingMode(
-            persona?.configJson,
-            personaName: persona?.name,
-          ),
-        ),
+        // DISCOVERY: force thinking OFF. Discovery is a decisive tool-calling
+        // interview (ask → add_user_story → ask), and the Coordinator persona is
+        // Unset (→ the reasoning model's default ON). On a weak local model that
+        // extended-thinking budget makes it dither/loop for pages before acting
+        // ("Actually… Wait… Self-Correction… Proceeding…"). The setup interview
+        // already runs thinking-off (Project Manager defaults Off), which is why
+        // it behaves; mirror that here. Normal Coordinator chat keeps the
+        // agent-level resolution (Project Manager Off, others Unset; a task may
+        // override in pass-2).
+        enableThinking: widget.discoveryMode
+            ? false
+            : resolveEnableThinking(
+                agent: personaThinkingMode(
+                  persona?.configJson,
+                  personaName: persona?.name,
+                ),
+              ),
         leanTools: ref.read(leanContextProvider),
         discoveryMode: widget.discoveryMode,
         systemPromptOverride: widget.systemPromptOverride,
