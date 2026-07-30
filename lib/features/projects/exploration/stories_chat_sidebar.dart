@@ -22,6 +22,7 @@ class StoriesChatSidebar extends StatelessWidget {
     required this.projectId,
     required this.projectName,
     this.discoveryMode = false,
+    this.editorMode = false,
     this.systemPromptOverride,
     this.autoOpenPrompt,
   });
@@ -32,6 +33,10 @@ class StoriesChatSidebar extends StatelessWidget {
   /// Discovery-phase passthrough: limits the chat to user-story tools, swaps in
   /// the discovery system prompt, and makes the Coordinator speak first.
   final bool discoveryMode;
+
+  /// Post-completion Editor passthrough: gives the chat the file/git/build edit
+  /// tools + the editor system prompt (maintain the already-built app).
+  final bool editorMode;
   final String? systemPromptOverride;
   final String? autoOpenPrompt;
 
@@ -72,6 +77,7 @@ class StoriesChatSidebar extends StatelessWidget {
                   projectId: projectId,
                   projectName: projectName,
                   discoveryMode: discoveryMode,
+                  editorMode: editorMode,
                   systemPromptOverride: systemPromptOverride,
                   autoOpenPrompt: autoOpenPrompt,
                 ),

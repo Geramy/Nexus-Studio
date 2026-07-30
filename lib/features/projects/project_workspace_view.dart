@@ -159,9 +159,15 @@ class _ProjectWorkspaceViewState extends ConsumerState<ProjectWorkspaceView>
       });
     }
 
-    const storiesTab = Tab(
-      icon: Icon(Icons.account_tree_outlined, size: 18),
-      text: 'User Stories',
+    // Once the build has finished, the first tab becomes the EDITOR (a mini-IDE)
+    // and the story tree is demoted to reference — so relabel it to match.
+    final isBuilt = projectRow?.orchestrationState == 'completed';
+    final storiesTab = Tab(
+      icon: Icon(
+        isBuilt ? Icons.edit_note_outlined : Icons.account_tree_outlined,
+        size: 18,
+      ),
+      text: isBuilt ? 'Editor' : 'User Stories',
     );
     const summaryTab = Tab(
       icon: Icon(Icons.summarize_outlined, size: 18),
@@ -180,7 +186,7 @@ class _ProjectWorkspaceViewState extends ConsumerState<ProjectWorkspaceView>
           controller: _tabs,
           isScrollable: true,
           tabAlignment: TabAlignment.start,
-          tabs: const [storiesTab, summaryTab, overviewTab, planTab],
+          tabs: [storiesTab, summaryTab, overviewTab, planTab],
         ),
         const Divider(height: 1),
         if (setupStatus == 'notStarted' ||

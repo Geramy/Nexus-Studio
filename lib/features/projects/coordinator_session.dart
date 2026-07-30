@@ -140,6 +140,7 @@ class ProjectCoordinatorSession {
     this.discoveryMode = false,
     this.scaffoldMode = false,
     this.fixMode = false,
+    this.editorMode = false,
   });
 
   /// Post-setup Exploration (discovery) mode: the model is offered ONLY the
@@ -157,6 +158,14 @@ class ProjectCoordinatorSession {
   /// CI/build tools) — the Testing phase re-runs CI itself and the generalist
   /// persona denies the CI tools, so the fixer just reads/edits/commits.
   final bool fixMode;
+
+  /// Post-COMPLETION Editor mode: the user-facing maintenance chat for a project
+  /// whose autonomous build has finished (orchestrationState == 'completed').
+  /// Offered the file/git/build/CI tool set up front (like the scaffolder) so it
+  /// can edit the built app on `main`, verify it still analyzes/builds, and
+  /// commit — but none of the story/task-orchestration tools. Framing via
+  /// [systemPromptOverride] ([buildEditorPrompt]).
+  final bool editorMode;
 
   /// When true (default), only the core task/plan tools are offered each turn;
   /// the file/git/CI groups are pulled in on demand via `request_tools`, cutting
@@ -519,6 +528,8 @@ class ProjectCoordinatorSession {
         ? CoordinatorTools.buildToolSchemas(fixOnly: true)
         : scaffoldMode
         ? CoordinatorTools.buildToolSchemas(scaffoldOnly: true)
+        : editorMode
+        ? CoordinatorTools.buildToolSchemas(editorOnly: true)
         : CoordinatorTools.buildToolSchemas(
             includePlanTools: planStore != null,
             includePlannerComplete: onPlanningComplete != null,
@@ -557,14 +568,22 @@ class ProjectCoordinatorSession {
     // recorded the story tree but is ending WITHOUT asking a question (the empty-
     // reasoning "reorganized then stopped" stall) so the interview keeps moving.
     var discoveryAskNudges = 0;
+    // EDITOR anti-stall: the editor model tends to READ the code, ANNOUNCE the
+    // change ("I'll create the pipe system now"), and then STOP — never calling
+    // an edit tool. `editorActed` tracks whether it actually wrote anything this
+    // turn; if not (and it only announced), we poke it to make the change.
+    var editorActed = false;
+    var editorNudges = 0;
     try {
       for (var round = 0; round < maxToolRounds; round++) {
         // Rebuilt each round so a request_tools unlock takes effect immediately.
         // Discovery mode uses the curated story-tool list verbatim (no lean
         // gating / request_tools — it must not reach task tools).
-        // Discovery + scaffold modes use their curated tool list verbatim (no
-        // lean gating / request_tools) so they stay inside their narrow job.
-        final tools = (discoveryMode || scaffoldMode || fixMode)
+        // Discovery + scaffold + fix + editor modes use their curated tool list
+        // verbatim (no lean gating / request_tools) so they stay inside their
+        // narrow job — the editor gets its file/git/build/CI set offered up front
+        // so it edits without a "request tools" dance.
+        final tools = (discoveryMode || scaffoldMode || fixMode || editorMode)
             ? allTools
             : _effectiveTools(allTools);
         final sys = await _buildSystemPrompt(
@@ -679,6 +698,28 @@ class ProjectCoordinatorSession {
             });
             continue;
           }
+          // EDITOR ANTI-STALL: it ANNOUNCED a change ("I'll create…", "let me
+          // add…") but did NOT act this turn — the "narrate then stop" failure.
+          // The editor is a pure delegator, so acting means scoping + launching
+          // the work. Push it to do that instead of ending on a promise. (Only
+          // when it announced an action, so a plain answer is left alone.)
+          if (editorMode &&
+              executor != null &&
+              !editorActed &&
+              editorNudges < 2 &&
+              _announcesAction(contentStr)) {
+            editorNudges++;
+            _history.add({
+              'role': 'user',
+              'content':
+                  'You described the change but have NOT delegated it. Do it '
+                  'NOW: call create_task with the concrete work (behaviour + '
+                  'file/area + acceptance criteria), then start_delegated_build '
+                  'to run it. Do not just describe it, and do not try to edit '
+                  'code yourself — you have no code tools.',
+            });
+            continue;
+          }
           if (executedTool) onTrace?.call(_traceMessages(lastSys));
           yield ChatStreamFinish(
             finishReason: 'stop',
@@ -765,6 +806,9 @@ class ProjectCoordinatorSession {
               name: call.function.name,
               args: args,
             );
+            // A real write happened this turn → the editor acted (suppresses the
+            // "you only described it" nudge).
+            if (_isEditWriteTool(call.function.name)) editorActed = true;
           } catch (e) {
             result =
                 'ERROR: ${call.function.name} failed and did NOT take effect: '
@@ -1171,6 +1215,35 @@ class ProjectCoordinatorSession {
     'delete_user_story',
     'update_user_story',
   }.contains(name);
+
+  /// Tools that actually CHANGE the project (vs. read/list/search) — used to
+  /// tell whether the editor really did something this turn or only talked.
+  static bool _isEditWriteTool(String name) => const {
+    'edit_file',
+    'write_file',
+    'create_file',
+    'create_directory',
+    'move_path',
+    'delete_path',
+    'delete_file',
+    'delete_folder',
+    'git_commit',
+    // Editor (pure delegator) "acts" by scoping + launching work, not editing.
+    'create_task',
+    'start_delegated_build',
+  }.contains(name);
+
+  /// True when [content] is the model PROMISING an edit ("I'll create…", "let me
+  /// add…", "I'm going to update…") rather than answering a question. Drives the
+  /// editor anti-stall nudge so an announced-but-unmade change gets made.
+  static final RegExp _actionIntentRe = RegExp(
+    r"\b(i'?ll|i will|i'?m going to|let me|going to|i can|i'?ve identified|next[, ])\b"
+    r"[^.\n]*\b(creat|implement|add|writ|updat|chang|fix|wir|build|edit|mak|"
+    r"set up|hook|generat|refactor|replac)",
+    caseSensitive: false,
+  );
+  static bool _announcesAction(String content) =>
+      _actionIntentRe.hasMatch(content);
 
   /// True if [e] is the plan's concurrent-connection cap (HTTP 429 /
   /// too_many_connections) — transient backpressure worth retrying, not an error

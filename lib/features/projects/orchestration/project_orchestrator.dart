@@ -290,6 +290,29 @@ class ProjectOrchestrator {
     caseSensitive: false,
   );
 
+  /// A REAL blocker line — an `error`/`warning` analyzer diagnostic (severity is
+  /// the FIRST token, so we anchor to line start to avoid matching the word
+  /// mid-message) or a test/runtime failure. CI runs `flutter analyze
+  /// --no-fatal-infos`, so `info -` lints (e.g. `withOpacity` deprecations) do
+  /// NOT fail the build. Counting them as failpoints inflates the number (2 real
+  /// errors + 21 deprecation infos → "23 failpoints"), floods the fix agent with
+  /// cosmetic noise instead of the errors that actually break CI, and flatlines
+  /// the progress gate (fixing a real error only nudges 23→21). Info lines are
+  /// dropped from the failpoint set whenever ANY genuine blocker is present.
+  static final RegExp _blockerLineRe = RegExp(
+    r'^\s*(error|warning)\b\s*[-:•]|\bError:|\bFAILED\b|\bException\b',
+    caseSensitive: false,
+  );
+
+  /// Keep only genuine blockers (errors/warnings/test failures) from matched
+  /// diagnostic [hits] when any exist; fall back to all hits for an info-only red
+  /// (the info-only finalize gate treats that as green anyway) so the fixer still
+  /// sees context rather than an empty list.
+  static List<String> _preferBlockers(List<String> hits) {
+    final blockers = hits.where(_blockerLineRe.hasMatch).toList();
+    return blockers.isNotEmpty ? blockers : hits;
+  }
+
   ProjectOrchestrator(this.ref, this.projectId);
 
   NexusDatabase get _db => ref.read(nexusDatabaseProvider);
@@ -1740,11 +1763,13 @@ class ProjectOrchestrator {
       }
     }
     final lines = buf.toString().split('\n');
-    final hits = lines
-        .where((l) => _diagLineRe.hasMatch(l) && !_stackFrameRe.hasMatch(l))
-        .map((l) => l.trimRight())
-        .where((l) => l.isNotEmpty)
-        .toList();
+    final hits = _preferBlockers(
+      lines
+          .where((l) => _diagLineRe.hasMatch(l) && !_stackFrameRe.hasMatch(l))
+          .map((l) => l.trimRight())
+          .where((l) => l.isNotEmpty)
+          .toList(),
+    );
     final picked = hits.isNotEmpty
         ? hits
         : lines.reversed.take(40).toList().reversed.toList();
@@ -1775,9 +1800,14 @@ class ProjectOrchestrator {
         .where((l) => l.isNotEmpty)
         .toList();
     // Count = diagnostic lines that are real failpoints (drop the "N issues
-    // found" / summary lines so the progress metric tracks failures, not totals).
+    // found" / summary lines so the progress metric tracks failures, not totals),
+    // then keep only genuine blockers (errors/warnings/test failures) so advisory
+    // `info` lints don't inflate the count or distract the fixer from what
+    // actually breaks CI.
     final summaryRe = RegExp(r'\bissues?\s+found\b', caseSensitive: false);
-    final failpoints = hits.where((l) => !summaryRe.hasMatch(l)).toList();
+    final failpoints = _preferBlockers(
+      hits.where((l) => !summaryRe.hasMatch(l)).toList(),
+    );
     final picked = failpoints.isNotEmpty
         ? failpoints
         : (hits.isNotEmpty

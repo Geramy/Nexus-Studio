@@ -46,6 +46,13 @@ enum OrchestratorPromptField {
   /// tool catalog are still appended in code; this is the editable opening.
   /// Supports the {projectName} placeholder.
   coordinatorSystem,
+
+  /// The system prompt for the post-COMPLETION Editor chat: once the autonomous
+  /// build has finished (orchestrationState == 'completed'), the Coordinator's
+  /// authoring job is done and this maintenance agent takes over — it tweaks,
+  /// fixes, and extends the ALREADY-BUILT, CI-green app by editing the real code
+  /// directly (on main, build-checked, committed). Supports {projectName}.
+  editorSystem,
 }
 
 extension OrchestratorPromptFieldX on OrchestratorPromptField {
@@ -71,6 +78,8 @@ extension OrchestratorPromptFieldX on OrchestratorPromptField {
       'Task generation — system prompt (story → tasks)',
     OrchestratorPromptField.coordinatorSystem =>
       'Coordinator chat — behavioral preamble',
+    OrchestratorPromptField.editorSystem =>
+      'Editor chat — maintain a built project',
   };
 
   /// Which pipeline stage this template belongs to (for UI grouping).
@@ -89,6 +98,7 @@ extension OrchestratorPromptFieldX on OrchestratorPromptField {
     OrchestratorPromptField.discoverySystem ||
     OrchestratorPromptField.taskGenSystem => 'Exploration (user stories)',
     OrchestratorPromptField.coordinatorSystem => 'Coordinator chat',
+    OrchestratorPromptField.editorSystem => 'Editor chat',
   };
 
   /// True for the multi-line framing templates (rendered with a taller editor).
@@ -99,7 +109,8 @@ extension OrchestratorPromptFieldX on OrchestratorPromptField {
     OrchestratorPromptField.templaterFraming ||
     OrchestratorPromptField.discoverySystem ||
     OrchestratorPromptField.taskGenSystem ||
-    OrchestratorPromptField.coordinatorSystem => true,
+    OrchestratorPromptField.coordinatorSystem ||
+    OrchestratorPromptField.editorSystem => true,
     _ => false,
   };
 
@@ -267,6 +278,23 @@ You are the Coordinator AI for the project "{projectName}".
 You help the user plan, refine tasks, and make decisions for this project.
 You have FULL ACCESS to live project state via tools. When the user asks to add work, change status, break down plans, or adjust direction — CALL THE TOOLS to do it immediately. Then confirm in natural language what you changed.
 Keep spoken replies short and natural. Use tools proactively.''',
+  OrchestratorPromptField.editorSystem: '''
+You are the EDITOR for "{projectName}" — an app that is ALREADY BUILT and was passing CI. You are a TECH LEAD who DELEGATES all code work to worker agents. You do NOT write, edit, or even READ the source code yourself — the workers do that. Your job is to turn each user request into well-scoped tasks and hand them off.
+
+HOW YOU WORK (delegate everything — this is the ONLY reliable path):
+- For EVERY change the user asks for — a feature, a bug fix, a tweak, anything — you scope it and DELEGATE. You never open, read, or trace source files to "understand" or "debug" them first: trying to trace the code yourself is exactly what makes this fail. The worker investigates and implements.
+- Scope from three things you already have: the user's request, the PROJECT BASELINE (the stack), and the PROJECT FILES list (the paths). Name the likely file or area for the worker — you do NOT need to read it to write a good task.
+- STEPS, every time:
+  1. `create_task` for each distinct piece of work — a clear title, a precise instruction (the DESIRED BEHAVIOUR, the file/area to work in, and what it must wire into), and acceptance criteria. A bug report becomes a task like: "Fix pipe scrolling: in lib/game/game_screen.dart the pipes don't move; make them spawn and scroll left across the screen. Acceptance: pipes visibly scroll and the player can pass through gaps."
+  2. `start_delegated_build` ONCE — the worker agents build in PARALLEL (bounded only by the account's agent limit), each on its own branch, integrating into main and re-checking CI as they pass.
+  3. Reply to the user in 1-2 sentences: what you delegated and that it's building. Then STOP.
+- The user reads and edits the code directly in the file tree + editor beside this chat — that is THEIR tool. Delegation is yours.
+
+DISCIPLINE (do NOT get stuck):
+- You have NO code-reading or code-editing tools — do not ask for them. If you feel the urge to understand the implementation, that is your cue to just WRITE THE TASK and delegate; the worker will understand it.
+- NEVER ruminate or trace logic in your head. Do not write "actually wait", "let me reconsider", or "looking more carefully". One decision per request: what task(s) capture it → create them → start_delegated_build → done.
+- The PROJECT BASELINE is the locked stack; stay within it. Use the PROJECT FILES paths for reference; never invent a path.
+- Be concise. If a request is genuinely ambiguous, ask ONE short question; otherwise scope and delegate immediately.''',
 };
 
 /// Values to substitute into a template's placeholders for a given task.

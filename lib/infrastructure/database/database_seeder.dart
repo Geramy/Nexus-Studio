@@ -12,6 +12,8 @@ import 'package:nexus_projects_client/features/agents/agent_role.dart';
 import 'package:nexus_projects_client/features/agents/agent_role_policy.dart'
     show kGeneralistDeniedTools;
 import 'package:nexus_projects_client/features/agents/agent_tool_permissions.dart';
+import 'package:nexus_projects_client/features/agents/packs/agent_pack.dart'
+    show PackAgent;
 import 'package:nexus_projects_client/infrastructure/database/nexus_database.dart';
 import 'package:nexus_projects_client/infrastructure/lemonade/services/persona_model_resolver.dart'
     show
@@ -101,6 +103,26 @@ Future<void> seedInitialData(NexusDatabase db) async {
     await _leanGeneralistTools(db);
   } catch (e) {
     debugPrint('Seeder: generalist-tool reconcile warning (non-fatal): $e');
+  }
+
+  // Provision the post-completion EDITOR persona onto clients seeded before the
+  // role existed (new installs get it via the default agent pack). Idempotent.
+  try {
+    await _ensureEditorPersona(db);
+  } catch (e) {
+    debugPrint('Seeder: editor-persona reconcile warning (non-fatal): $e');
+  }
+}
+
+/// Adds the [AgentRole.editor] persona to every client that lacks it — the
+/// user-facing maintenance agent for finished projects (edits code, runs CI,
+/// commits, delegates). `provisionAgentPack` dedupes by title, so this only
+/// inserts a missing 'editor' persona and never disturbs existing ones.
+Future<void> _ensureEditorPersona(NexusDatabase db) async {
+  for (final client in await db.getAllClients()) {
+    await db.provisionAgentPack(client.client_pk, [
+      PackAgent.fromRole(AgentRole.editor),
+    ]);
   }
 }
 

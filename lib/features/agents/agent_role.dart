@@ -16,6 +16,12 @@ enum AgentRole {
   /// The only role allowed to push/merge.
   coordinator,
 
+  /// Post-completion Editor. The user-facing agent for a FINISHED project: it
+  /// edits the built code directly, commits, runs build/CI, and can delegate
+  /// larger changes to worker agents. Blends the Generalist's code authoring
+  /// with the Coordinator's integration + task delegation.
+  editor,
+
   /// Default worker. Implements a task on its own branch, autonomously.
   sdeGeneralist,
 
@@ -49,6 +55,7 @@ extension AgentRoleX on AgentRole {
   String get displayTitle => switch (this) {
     AgentRole.projectManager => 'Project Manager',
     AgentRole.coordinator => 'Coordinator',
+    AgentRole.editor => 'Editor',
     AgentRole.sdeGeneralist => 'SDE Generalist',
     AgentRole.sdeNetworking => 'SDE Networking',
     AgentRole.sdePhysics => 'SDE Physics',
@@ -63,6 +70,8 @@ extension AgentRoleX on AgentRole {
       'Builds technical plans, decomposes them into tasks, assigns work, and reports progress. Your one live chat.',
     AgentRole.coordinator =>
       'Integrates approved task branches into main, resolves merges, and runs builds/CI.',
+    AgentRole.editor =>
+      'Edits and evolves a finished project: changes the code directly, runs build/CI, commits, and can delegate larger work to worker agents.',
     AgentRole.sdeGeneralist =>
       'General software engineer. Implements a task end-to-end on its own branch.',
     AgentRole.sdeNetworking =>

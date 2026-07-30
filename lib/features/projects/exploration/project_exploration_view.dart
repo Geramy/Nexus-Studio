@@ -17,7 +17,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../core/providers/database_provider.dart';
+import '../../../infrastructure/workspace/workspace_provider.dart';
 import '../../project_setup/providers/tag_providers.dart';
+import 'editor_workspace_view.dart';
 import 'exploration_session.dart';
 import 'stories_chat_sidebar.dart';
 import 'story_providers.dart';
@@ -32,6 +34,28 @@ final discoveryPromptProvider =
     ) {
       final db = ref.watch(nexusDatabaseProvider);
       return buildDiscoveryPrompt(db, key.projectId, key.projectName);
+    });
+
+/// The post-completion Editor system prompt (baseline + "what was built" + the
+/// REAL current file tree), seeded once the autonomous build has finished. The
+/// file tree grounds the agent so it locates code instead of guessing paths.
+final editorPromptProvider =
+    FutureProvider.family<String, ({int projectId, String projectName})>((
+      ref,
+      key,
+    ) async {
+      final db = ref.watch(nexusDatabaseProvider);
+      var fileTree = '';
+      try {
+        final fs = await ref.watch(workspaceFsProvider(key.projectId).future);
+        fileTree = buildEditorFileTree(await fs.walk());
+      } catch (_) {}
+      return buildEditorPrompt(
+        db,
+        key.projectId,
+        key.projectName,
+        fileTree: fileTree,
+      );
     });
 
 class ProjectExplorationView extends ConsumerWidget {
@@ -141,9 +165,20 @@ class ProjectExplorationView extends ConsumerWidget {
     // the Coordinator runs the story-building interview (story-only tools, speaks
     // first). Once tasks have been generated it stays available for editing the
     // tree and regenerating, with the normal Coordinator chat.
-    final explorationStatus =
-        ref.watch(projectRowProvider(projectId)).value?.explorationStatus;
-    final isDiscovery = explorationStatus != 'complete';
+    final projectRow = ref.watch(projectRowProvider(projectId)).value;
+    final isDiscovery = projectRow?.explorationStatus != 'complete';
+    // Once the autonomous build has FINISHED, the Coordinator's authoring job is
+    // done — this surface becomes the EDITOR: a mini-IDE (file tree + code +
+    // Editor chat + Launch) that replaces the story-tree, which is now just
+    // reference. Hand the whole pane to the Editor workspace.
+    final isEditor =
+        !isDiscovery && projectRow?.orchestrationState == 'completed';
+    if (isEditor) {
+      return EditorWorkspaceView(
+        projectId: projectId,
+        projectName: projectName,
+      );
+    }
     final promptAsync = isDiscovery
         ? ref.watch(
             discoveryPromptProvider((
@@ -165,7 +200,9 @@ class ProjectExplorationView extends ConsumerWidget {
           child: Row(
             children: [
               Icon(
-                isDiscovery ? Icons.explore_outlined : Icons.account_tree_outlined,
+                isDiscovery
+                    ? Icons.explore_outlined
+                    : Icons.account_tree_outlined,
                 color: theme.colorScheme.primary,
               ),
               const SizedBox(width: 8),

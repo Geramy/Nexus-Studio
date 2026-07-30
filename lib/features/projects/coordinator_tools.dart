@@ -67,6 +67,22 @@ class CoordinatorTools {
       )
       .toSet();
 
+  /// The post-completion EDITOR's toolset: a PURE DELEGATOR. Deliberately has NO
+  /// code read/edit/write tools — the editor turns each request into tasks and
+  /// hands them to worker agents (which read + implement). Reading/tracing the
+  /// source itself is what sent the weak local model into 30k-token loops, so it
+  /// simply can't do that here. It gets: task scoping + assignment, the
+  /// `start_delegated_build` trigger, review/sign-off, and read-only CI
+  /// visibility to report progress. (The human reads/edits code in the IDE panes
+  /// beside the chat.)
+  static const Set<String> _editorToolNames = {
+    'list_tasks', 'list_open_tasks', 'get_task', 'create_task', 'update_task',
+    'update_task_status', 'set_task_dates', 'set_task_build_config',
+    'assign_agent_to_task', 'list_agents', 'start_delegated_build',
+    'review_submission', 'approve_task', 'reject_task',
+    'list_ci_runs', 'get_ci_run',
+  };
+
   static List<Map<String, dynamic>> buildToolSchemas({
     bool includePlanTools = false,
     bool includePlannerComplete = false,
@@ -75,16 +91,24 @@ class CoordinatorTools {
     bool discoveryOnly = false,
     bool scaffoldOnly = false,
     bool fixOnly = false,
+    bool editorOnly = false,
   }) {
     // The post-setup Exploration (discovery) session gets ONLY the user-story
     // tools — deliberately NO task/plan-write tools, so it can't be "eager" and
     // create work before the user presses "Generate tasks".
     if (discoveryOnly) return [..._storyToolSchemas];
-    // The Templater (base scaffold) stage gets ONLY file/git/CI tools; the
+    // The Templater (base scaffold) stage gets file/git/CI tools; the
     // end-of-project Testing fix agent gets file/git ONLY (no CI — it can't run
-    // it and the phase re-runs CI itself).
-    if (scaffoldOnly || fixOnly) {
-      final allow = fixOnly ? _fixToolNames : _scaffoldToolNames;
+    // it and the phase re-runs CI itself); the post-completion EDITOR gets the
+    // same file/git/build/CI set as the scaffolder (it edits the built app and
+    // must be able to verify/build + run CI), just no story/task-orchestration
+    // tools it has no use for.
+    if (scaffoldOnly || fixOnly || editorOnly) {
+      final allow = fixOnly
+          ? _fixToolNames
+          : editorOnly
+          ? _editorToolNames
+          : _scaffoldToolNames;
       return buildToolSchemas().where((t) {
         final fn = t['function'];
         final name = fn is Map ? fn['name'] : null;
@@ -956,6 +980,22 @@ class CoordinatorTools {
             },
             'required': ['run_id'],
           },
+        },
+      },
+      // ── Editor delegation: run assigned tasks as parallel worker agents ──
+      {
+        'type': 'function',
+        'function': {
+          'name': 'start_delegated_build',
+          'description':
+              'EDITOR tool. Start the worker agents on the tasks you have created '
+              'and assigned, kicking off the autonomous build so they run in '
+              'PARALLEL (bounded only by the account\'s agent limit) — each on its '
+              'own branch, integrating into main and re-checking CI as it passes. '
+              'Use this for a change too big to make inline: create_task + assign '
+              'the work first, THEN call this to run it. Returns immediately; '
+              'track progress with list_tasks / get_ci_run.',
+          'parameters': {'type': 'object', 'properties': {}},
         },
       },
       // ── Orchestration: the spawn → submit → verify → review loop ──
@@ -1907,6 +1947,8 @@ class CoordinatorToolExecutor {
         case 'git_merge':
           return await _gitMerge(args);
         // Orchestration
+        case 'start_delegated_build':
+          return await _startDelegatedBuild();
         case 'submit_for_completion':
           return await _submitForCompletion(args);
         case 'run_verification':
@@ -3516,6 +3558,19 @@ class CoordinatorToolExecutor {
   }
 
   // ── Orchestration ─────────────────────────────────────────────────────
+
+  /// EDITOR delegation: flip the project to `running` so the orchestrator picks
+  /// up the (assigned, not-started) tasks the editor created and runs them as
+  /// parallel workers — bounded by the account's concurrency cap — integrating
+  /// and re-checking CI as each passes. Safe to call: if nothing is assignable
+  /// the orchestrator just re-verifies and settles back to completed.
+  Future<String> _startDelegatedBuild() async {
+    await db.setProjectOrchestrationState(projectId, 'running');
+    return 'Build started — your assigned tasks will run in parallel (up to the '
+        'account\'s agent limit), each on its own branch, integrating into main '
+        'and re-checking CI as they pass. It runs in the background: tell the '
+        'user it is underway and track it with list_tasks / get_ci_run.';
+  }
 
   Future<String> _submitForCompletion(Map<String, dynamic> args) async {
     final id = _asInt(args['task_id']);

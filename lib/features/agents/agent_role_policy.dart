@@ -268,6 +268,24 @@ const Map<AgentRole, List<String>> kRoleSkills = {
     'story-authoring',
     'merge-integration',
   ],
+  // The post-completion Editor blends the Generalist's code authoring
+  // (code-read/code-write + local git + build/CI) with the Coordinator's
+  // integration + delegation (merge/push, task-management + work-assignment to
+  // fan work out to worker agents, review to sign that work off). This is why it
+  // can ACTUALLY edit — unlike the Coordinator, which lacks `code-write`.
+  AgentRole.editor: [
+    'code-read',
+    'code-write',
+    'vcs-local',
+    'vcs-integration',
+    'build-ci',
+    'build-authoring',
+    'task-management',
+    'work-assignment',
+    'merge-integration',
+    'review',
+    'completion',
+  ],
   AgentRole.sdeGeneralist: _workerSkills,
   AgentRole.sdeNetworking: _workerSkills,
   AgentRole.sdePhysics: _workerSkills,
@@ -469,6 +487,14 @@ branch into main, then run the build/CI. Resolve trivial merge conflicts; when a
 conflict needs real source changes, send the task back so a worker resolves it.
 You are the only role that merges into the trunk. (The workspace repo is
 local-only, so there is no remote to push to.)''',
+    AgentRole.editor =>
+      '''
+Your role: Editor. The project is already built and passing. You maintain and
+evolve it for the user: edit the code directly, run build/CI, and commit. For a
+change big enough to parallelize, delegate: create tasks, assign them to worker
+agents, and integrate their branches. Work on the project's existing stack from
+the PROJECT BASELINE; make targeted changes, keep the app compiling, and commit
+each coherent change.''',
     AgentRole.sdeGeneralist =>
       '''
 Your role: SDE Generalist. Implement the assigned task end-to-end on its branch,

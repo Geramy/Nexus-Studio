@@ -66,6 +66,12 @@ class ProjectCoordinatorChatScreen extends ConsumerStatefulWidget {
   /// user-story tools and a discovery [systemPromptOverride], and proactively
   /// opens with [autoOpenPrompt] (the AI speaks first, no visible user bubble).
   final bool discoveryMode;
+
+  /// Post-COMPLETION Editor mode: for a project whose autonomous build has
+  /// finished, this becomes the user-facing MAINTENANCE chat — it gets the
+  /// file/git/build/CI tool set (edit the built app on main, verify, commit) and
+  /// an editor [systemPromptOverride], in its own distinct persisted session.
+  final bool editorMode;
   final String? systemPromptOverride;
   final String? autoOpenPrompt;
 
@@ -75,6 +81,7 @@ class ProjectCoordinatorChatScreen extends ConsumerStatefulWidget {
     required this.projectName,
     this.openPlanPath,
     this.discoveryMode = false,
+    this.editorMode = false,
     this.systemPromptOverride,
     this.autoOpenPrompt,
   });
@@ -170,13 +177,33 @@ class _ProjectCoordinatorChatScreenState
         // screen binds to its agent (and that agent's default Omni collection).
         // Falls back to (and persists) the Project Manager when no role persona
         // is found, so the chat always opens with a sensible default selected.
-        final personaId = widget.discoveryMode
-            ? (await db.getProjectRolePersonaId(
-                    widget.projectId,
-                    AgentRole.coordinator.key,
-                  ) ??
-                  await db.getOrAssignCoordinatorPersonaId(widget.projectId))
-            : await db.getOrAssignCoordinatorPersonaId(widget.projectId);
+        // Pick the hosting agent by mode. Discovery → Coordinator (runs the
+        // story interview). Editor → the dedicated EDITOR persona (it actually
+        // has code-write perms), falling back to the Generalist (also can edit),
+        // then Coordinator, so an older install still opens with a capable agent.
+        // Normal chat → Project Manager.
+        final int? personaId;
+        if (widget.editorMode) {
+          personaId =
+              await db.getProjectRolePersonaId(
+                widget.projectId,
+                AgentRole.editor.key,
+              ) ??
+              await db.getProjectRolePersonaId(
+                widget.projectId,
+                AgentRole.sdeGeneralist.key,
+              ) ??
+              await db.getOrAssignCoordinatorPersonaId(widget.projectId);
+        } else if (widget.discoveryMode) {
+          personaId =
+              await db.getProjectRolePersonaId(
+                widget.projectId,
+                AgentRole.coordinator.key,
+              ) ??
+              await db.getOrAssignCoordinatorPersonaId(widget.projectId);
+        } else {
+          personaId = await db.getOrAssignCoordinatorPersonaId(widget.projectId);
+        }
         if (personaId != null)
           persona = await db.resolveAgentPersona(personaId);
       } catch (e) {
@@ -344,7 +371,18 @@ class _ProjectCoordinatorChatScreenState
       try {
         planStore = await ref.read(planStoreProvider(widget.projectId).future);
       } catch (_) {}
-      if (widget.openPlanPath != null) {
+      if (widget.editorMode) {
+        // The Editor is its OWN maintenance conversation, kept distinct from the
+        // stored discovery/coordinator transcript via a reserved '#editor' scope
+        // (same mechanism as the '#agent:' sessions).
+        sessionId = await db.getOrCreateChatSession(
+          widget.projectId,
+          planPath: '#editor',
+        );
+        ref
+            .read(currentChatSessionProvider(widget.projectId).notifier)
+            .select(sessionId);
+      } else if (widget.openPlanPath != null) {
         sessionId = await db.getOrCreateChatSession(
           widget.projectId,
           planPath: widget.openPlanPath,
@@ -417,6 +455,7 @@ class _ProjectCoordinatorChatScreenState
               ),
         leanTools: ref.read(leanContextProvider),
         discoveryMode: widget.discoveryMode,
+        editorMode: widget.editorMode,
         systemPromptOverride: widget.systemPromptOverride,
       );
 
@@ -484,8 +523,12 @@ class _ProjectCoordinatorChatScreenState
             // Ephemeral greeting (not persisted) shown only for an empty session.
             _messages.add(
               _ChatMessage(
-                text:
-                    'Coordinator ready for project "${widget.projectName}".\n$ctx\n\nYou can type or use the call button for voice. The AI can create/update tasks live via tools.',
+                text: widget.editorMode
+                    ? 'Editor ready for "${widget.projectName}" — the app is '
+                          'built and was passing CI. Tell me what to change, fix '
+                          'or add and I\'ll edit the code directly, check it still '
+                          'builds, and commit it.'
+                    : 'Coordinator ready for project "${widget.projectName}".\n$ctx\n\nYou can type or use the call button for voice. The AI can create/update tasks live via tools.',
                 isUser: false,
               ),
             );
@@ -685,20 +728,27 @@ class _ProjectCoordinatorChatScreenState
       // arrive via onToolResult (shown as system notes between answer segments).
       final stream = _session!.runTurn(
         text,
-        // Discovery drafts + restructures a whole story tree in one turn, which
-        // can burn several tool rounds before the agent gets to speak/ask — give
-        // it more headroom than the normal chat so it never stops mid-build.
-        maxToolRounds: _session!.discoveryMode ? 8 : 4,
+        // Discovery drafts + restructures a whole story tree in one turn, and the
+        // Editor must READ a few files AND then edit/verify/commit in the same
+        // turn — both burn several tool rounds before finishing, so give them
+        // more headroom than the normal chat (4 rounds left the Editor capping
+        // out on reads before it ever reached edit_file).
+        maxToolRounds: (_session!.discoveryMode || _session!.editorMode) ? 8 : 4,
         onTrace: (messages) {
+          final kind = widget.discoveryMode
+              ? 'stories'
+              : widget.editorMode
+              ? 'editor'
+              : 'coordinator';
           final id = widget.discoveryMode
               ? 'discovery:${widget.projectId}'
-              : 'coordinator:${widget.projectId}:${_sessionId ?? 0}';
+              : '$kind:${widget.projectId}:${_sessionId ?? 0}';
           ref.read(trainingSinkProvider).post(id, messages);
           // Persist the same rich trace locally for Account → Export Tracking.
           unawaited(
             ref.read(nexusDatabaseProvider).upsertTrainingTrace(
                   projectPk: widget.projectId,
-                  aiKind: widget.discoveryMode ? 'stories' : 'coordinator',
+                  aiKind: kind,
                   conversationId: id,
                   messagesJson: jsonEncode(messages),
                 ),
@@ -939,17 +989,20 @@ class _ProjectCoordinatorChatScreenState
       }
     });
 
+    // The chat is hosted by different agents by mode — label the header to match
+    // (the Editor is NOT the Coordinator; it just reuses this chat surface).
+    final agentLabel = widget.editorMode ? 'Editor' : 'Coordinator';
     return Scaffold(
       appBar: AppBar(
-        title: Text('Coordinator — ${widget.projectName}'),
+        title: Text('$agentLabel — ${widget.projectName}'),
         actions: [
-          // Phone icon = Enter / Leave Voice Conversation with the Coordinator
+          // Phone icon = Enter / Leave Voice Conversation with the agent.
           IconButton(
             icon: Icon(voiceActive ? Icons.call_end : Icons.call),
             onPressed: ready ? _toggleVoiceCall : null,
             tooltip: voiceActive
                 ? 'End Voice Conversation'
-                : 'Start Voice Conversation with Coordinator',
+                : 'Start Voice Conversation with $agentLabel',
             color: voiceActive ? context.nx.danger : null,
           ),
           IconButton(
@@ -972,10 +1025,12 @@ class _ProjectCoordinatorChatScreenState
             padding: const EdgeInsets.all(AppSpacing.sm),
             child: Row(
               children: [
-                const Expanded(
+                Expanded(
                   child: Text(
-                    'Live project context • text + voice • AI can create/update tasks and propose plan changes in real time.',
-                    style: TextStyle(fontSize: 12),
+                    widget.editorMode
+                        ? 'Ask for changes — the Editor turns each request into tasks and runs worker agents to build them. Edit code yourself in the file tree beside this chat.'
+                        : 'Live project context • text + voice • AI can create/update tasks and propose plan changes in real time.',
+                    style: const TextStyle(fontSize: 12),
                   ),
                 ),
                 if (_clientError != null)
@@ -1010,58 +1065,40 @@ class _ProjectCoordinatorChatScreenState
                 // Trailing "thinking" bubble while the assistant turn is in
                 // flight but hasn't started streaming text yet.
                 if (index >= _messages.length) {
+                  // A plain (non-interactive) "thinking" spinner. Stopping is the
+                  // send/stop button (bottom-right) ONLY — the indicator used to
+                  // be tap-to-stop, but users kept aborting turns while trying to
+                  // read/expand the reasoning, so it no longer stops on tap.
                   return Align(
                     alignment: Alignment.centerLeft,
-                    child: Tooltip(
-                      message: 'Stop',
-                      // Tap the spinner to abort a stuck/looping turn.
-                      child: InkWell(
+                    child: Container(
+                      margin: const EdgeInsets.symmetric(
+                        vertical: AppSpacing.xs,
+                      ),
+                      padding: const EdgeInsets.all(AppSpacing.md),
+                      decoration: BoxDecoration(
+                        color: context.nx.glass,
                         borderRadius: AppRadius.lgAll,
-                        onTap: _stopTurn,
-                        child: Container(
-                          margin: const EdgeInsets.symmetric(
-                            vertical: AppSpacing.xs,
+                        border: Border.all(color: context.nx.hairline),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2),
                           ),
-                          padding: const EdgeInsets.all(AppSpacing.md),
-                          decoration: BoxDecoration(
-                            color: context.nx.glass,
-                            borderRadius: AppRadius.lgAll,
-                            border: Border.all(color: context.nx.hairline),
+                          const SizedBox(width: AppSpacing.sm),
+                          Text(
+                            'Thinking…',
+                            style: TextStyle(
+                              fontSize: 13,
+                              fontStyle: FontStyle.italic,
+                              color: context.nx.textMuted,
+                            ),
                           ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              // Spinner with a stop glyph centred to signal it's
-                              // clickable.
-                              SizedBox(
-                                width: 16,
-                                height: 16,
-                                child: Stack(
-                                  alignment: Alignment.center,
-                                  children: [
-                                    const CircularProgressIndicator(
-                                      strokeWidth: 2,
-                                    ),
-                                    Icon(
-                                      Icons.stop,
-                                      size: 9,
-                                      color: context.nx.textMuted,
-                                    ),
-                                  ],
-                                ),
-                              ),
-                              const SizedBox(width: AppSpacing.sm),
-                              Text(
-                                'Coordinator is thinking… (tap to stop)',
-                                style: TextStyle(
-                                  fontSize: 13,
-                                  fontStyle: FontStyle.italic,
-                                  color: context.nx.textMuted,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
+                        ],
                       ),
                     ),
                   );
