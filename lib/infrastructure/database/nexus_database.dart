@@ -112,7 +112,7 @@ class NexusDatabase extends _$NexusDatabase {
       _taskCompletedController.stream;
 
   @override
-  int get schemaVersion => 33;
+  int get schemaVersion => 34;
 
   @override
   MigrationStrategy get migration {
@@ -254,6 +254,20 @@ class NexusDatabase extends _$NexusDatabase {
           await addCol(() => m.addColumn(projects, projects.templateStatus));
           await addCol(() => m.addColumn(projects, projects.currentMilestone));
           await addCol(() => m.addColumn(projects, projects.milestoneCount));
+        }
+        if (from < 34) {
+          // Editor provenance flag: tasks created by the post-build Editor fast
+          // lane are filed under the workspace "Edits" tab, not the build board.
+          // Same idempotent guard as v33 (see addCol note above).
+          Future<void> addCol(Future<void> Function() add) async {
+            try {
+              await add();
+            } on Object catch (e) {
+              if (!'$e'.toLowerCase().contains('duplicate column')) rethrow;
+            }
+          }
+
+          await addCol(() => m.addColumn(tasks, tasks.isEdit));
         }
       },
     );
@@ -1416,6 +1430,7 @@ class NexusDatabase extends _$NexusDatabase {
     String status = 'Todo',
     String priority = 'MED',
     String? thinkingMode,
+    bool isEdit = false,
   }) async {
     // Hard guard against duplicates: never create a second task with the same
     // title in the same project. Returns the existing task's id instead, so a
@@ -1471,6 +1486,7 @@ class NexusDatabase extends _$NexusDatabase {
         thinkingMode: thinkingMode != null
             ? Value(thinkingMode)
             : const Value.absent(),
+        isEdit: Value(isEdit),
       ),
     );
   }

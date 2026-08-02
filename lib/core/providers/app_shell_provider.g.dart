@@ -208,7 +208,7 @@ final class CurrentProjectIdProvider
   }
 }
 
-String _$currentProjectIdHash() => r'dc0b7f1476dc7afcffe0097741f1d95a196e9136';
+String _$currentProjectIdHash() => r'47203f032825bdf387bdee40c1bd2215003bc7b4';
 
 /// Current selected project (part of Client → Projects → Tasks hierarchy)
 

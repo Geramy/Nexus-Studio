@@ -333,7 +333,7 @@ class ProjectOrchestrator {
     // DB would never be re-picked. Return them to the board.
     unawaited(_reconcileOrphans());
     _projectSub = _db.watchProject(projectId).listen((project) {
-      if (project?.orchestrationState == 'running') {
+      if (_isActiveState(project?.orchestrationState)) {
         unawaited(_pump());
       }
     });
@@ -353,9 +353,11 @@ class ProjectOrchestrator {
       if (_disposed) return;
       final project = await _db.getProjectById(projectId);
       if (project == null) return;
-      // Already finished, or already running (the pump handles it) — nothing to do.
+      // Already finished, or already active (the pump handles running/editing) —
+      // nothing to auto-start. (Editing is the Editor's fast lane; it drives its
+      // own light finalize, never the heavy Testing phase.)
       final state = project.orchestrationState;
-      if (state == 'completed' || state == 'running') return;
+      if (state == 'completed' || _isActiveState(state)) return;
       // Only when the backlog is fully done AND we're on the last milestone — i.e.
       // the project is genuinely at the end-of-project gate, not mid-build (we
       // must NOT auto-resume an in-progress build the user deliberately paused).
@@ -397,7 +399,7 @@ class ProjectOrchestrator {
     var spawnedFixWork = false;
     try {
       final project = await _db.getProjectById(projectId);
-      if (project == null || project.orchestrationState != 'running') return;
+      if (project == null || !_isActiveState(project.orchestrationState)) return;
       if (!isWithinWorkingHours(project)) return;
 
       // Honour the connection-cap backoff: a recent 429 means every slot the plan
@@ -621,8 +623,14 @@ class ProjectOrchestrator {
     final tasks = await _db.getTasksForProject(projectId);
     // Only the currently-open milestone batch is assignable for fresh implement
     // work; in-flight (Review) tasks always belong to it already.
-    final currentMilestone =
-        (await _db.getProjectById(projectId))?.currentMilestone ?? 0;
+    final project = await _db.getProjectById(projectId);
+    final currentMilestone = project?.currentMilestone ?? 0;
+    // FAST LANE: while the Editor is driving (state == 'editing'), tasks skip the
+    // per-task verify + build gates and go straight to merge the moment the
+    // worker submits — the whole point is snappy edits. A single quick analyze at
+    // finalize (see _maybeFinalizeProject) is the safety net, and a real breakage
+    // there falls back to the full Testing phase.
+    final editing = project?.orchestrationState == 'editing';
     final review = tasks
         .where(
           (t) => !_active.contains(t.task_pk) && t.status == TaskStatus.review,
@@ -639,33 +647,37 @@ class ProjectOrchestrator {
     bool live(Task t) => (_attempts[t.task_pk] ?? 0) < _maxAttemptsPerTask;
 
     addPool(_Stage.implement, _assignableTasks(tasks, currentMilestone));
-    addPool(
-      _Stage.verify,
-      review
-          // `verifying` is included so a verify stage that was interrupted
-          // (turn cap / crash / app restart) AFTER run_verification set the task
-          // to `verifying` is RE-PICKED rather than stranded — that strand was
-          // the "stuck in Review forever, holding a slot" bug.
-          .where(
-            (t) =>
-                (t.executionStatus == TaskExecStatus.submitted ||
-                    t.executionStatus == TaskExecStatus.verifying) &&
-                live(t),
-          )
-          .toList(),
-    );
-    addPool(
-      _Stage.build,
-      review
-          .where(
-            (t) =>
-                ((t.executionStatus == TaskExecStatus.verified &&
-                        t.requiresBuild) ||
-                    t.executionStatus == TaskExecStatus.building) &&
-                live(t),
-          )
-          .toList(),
-    );
+    // The verify + build gates are SKIPPED entirely in the Editor fast lane; a
+    // submitted task routes straight to merge below.
+    if (!editing) {
+      addPool(
+        _Stage.verify,
+        review
+            // `verifying` is included so a verify stage that was interrupted
+            // (turn cap / crash / app restart) AFTER run_verification set the task
+            // to `verifying` is RE-PICKED rather than stranded — that strand was
+            // the "stuck in Review forever, holding a slot" bug.
+            .where(
+              (t) =>
+                  (t.executionStatus == TaskExecStatus.submitted ||
+                      t.executionStatus == TaskExecStatus.verifying) &&
+                  live(t),
+            )
+            .toList(),
+      );
+      addPool(
+        _Stage.build,
+        review
+            .where(
+              (t) =>
+                  ((t.executionStatus == TaskExecStatus.verified &&
+                          t.requiresBuild) ||
+                      t.executionStatus == TaskExecStatus.building) &&
+                  live(t),
+            )
+            .toList(),
+      );
+    }
     addPool(
       _Stage.merge,
       review
@@ -680,7 +692,14 @@ class ProjectOrchestrator {
                 t.executionStatus == TaskExecStatus.built ||
                 (t.executionStatus == TaskExecStatus.verified &&
                     !t.requiresBuild) ||
-                (t.executionStatus == TaskExecStatus.merging && live(t)),
+                (t.executionStatus == TaskExecStatus.merging && live(t)) ||
+                // FAST LANE: a just-submitted (or mid-verify) editor task is
+                // merge-ready immediately — its work branch is already committed,
+                // and we deliberately skip verify/build for snappy edits.
+                (editing &&
+                    (t.executionStatus == TaskExecStatus.submitted ||
+                        t.executionStatus == TaskExecStatus.verifying ||
+                        t.executionStatus == TaskExecStatus.verified)),
           )
           .toList(),
     );
@@ -930,9 +949,9 @@ class ProjectOrchestrator {
         // Stop promptly if the human paused/stopped the project mid-task — return
         // the task to the board instead of leaving it parked "In Progress".
         final project = await _db.getProjectById(projectId);
-        if (project == null || project.orchestrationState != 'running') {
+        if (project == null || !_isActiveState(project.orchestrationState)) {
           debugPrint(
-            '[Orchestrator p$projectId] task ${task.task_pk}: project not running, halting worker.',
+            '[Orchestrator p$projectId] task ${task.task_pk}: project not active, halting worker.',
           );
           await _db.markTaskYieldedBack(task.task_pk);
           return;
@@ -1916,6 +1935,29 @@ class ProjectOrchestrator {
       }
     }
 
+    // FAST LANE (editor tasks): the Editor's worker model implements small edits
+    // well but CANNOT reliably resolve conflict markers — driving it through the
+    // conflict-resolver just burns turn caps and stalls (observed: two edits that
+    // both touched game_screen.dart looped 5× then blocked). Since editor edits
+    // are small and behaviour-specified, the reliable move is to REDO, not merge:
+    // reopen the task so the implement stage re-roots its branch onto the CURRENT
+    // target (which already has whatever merged first) and the worker re-applies
+    // its change conflict-free. Un-count this merge attempt so the redo gets the
+    // full retry budget rather than being double-charged. Bounded by
+    // _maxAttemptsPerTask, and it converges: once the sibling is merged, the redo
+    // has a clean base.
+    final full = await _db.getTaskById(task.task_pk);
+    if (full?.isEdit == true) {
+      _undoAttempt(task.task_pk);
+      await _db.reopenTask(task.task_pk);
+      debugPrint(
+        '[Orchestrator p$projectId] task ${task.task_pk}: editor merge conflict '
+        'on ${conflictPaths.length} file(s) → redo on fresh target '
+        '(skipping weak-model conflict resolution).',
+      );
+      return;
+    }
+
     // CONFLICT PATH: a real conflict needs an agent (the Coordinator) to resolve
     // it or send the task back for rework. If there's no Coordinator persona,
     // don't stall forever — return the task to the board so the worker redoes it
@@ -2835,6 +2877,21 @@ class ProjectOrchestrator {
     final ws = (await _resolveWorkspaceHandles()).ws;
     if (ws == null || !await ws.exists(_defaultCiPath)) return false;
 
+    // FAST LANE: an Editor session (state == 'editing') finalizes LIGHT — no
+    // linking pass, no double-check feature scan. Just confirm the edit still
+    // builds and flip back to 'completed'. Everything else uses the full Testing
+    // phase (linking → CI convergence → double-check).
+    if (project.orchestrationState == 'editing') {
+      _testing = true;
+      unawaited(
+        _runEditorFinalize(project, sig).whenComplete(() {
+          _testing = false;
+          if (!_disposed) unawaited(_pump());
+        }),
+      );
+      return false;
+    }
+
     // Enter the dedicated TESTING phase (mirrors the templating gate): run it in
     // the background and re-pump when it lands, so the pump never blocks on the
     // slow scan/fix loop.
@@ -2846,6 +2903,49 @@ class ProjectOrchestrator {
       }),
     );
     return false;
+  }
+
+  /// The Editor fast-lane finalize. Skips the two expensive phases the full
+  /// Testing gate runs — the LINKING pass and the per-feature DOUBLE-CHECK scan
+  /// (an already-built project doesn't need a whole-app re-audit after a tweak).
+  /// It just makes sure the edit didn't break the build: ensure the CI gate,
+  /// converge CI once (progress-gated, and now driven by the REAL-blocker
+  /// failpoint count so `info` lints don't stall it), and on green flip straight
+  /// back to `completed`. If CI can't go green on the fast lane, it FALLS BACK to
+  /// the full Testing phase so a genuine breakage is still driven to green — the
+  /// slow-but-reliable safety net.
+  Future<void> _runEditorFinalize(Project project, String doneSig) async {
+    _setTesting(true, 'Editor — checking your changes build…');
+    try {
+      if (!await _stillRunning()) return;
+      await _ensureCodegenDeps(project);
+      await _ensureDefaultCiWorkflow(project);
+      final green = await _convergeCi(project, doneSig);
+      if (green == null) return; // infra down — retry on a later pump/tick
+      if (green) {
+        _finalScanPassedSig = doneSig; // settled — don't re-finalize this state
+        await _db.setProjectOrchestrationState(projectId, 'completed');
+        debugPrint(
+          '[Orchestrator p$projectId] EDITOR finalize: CI green → COMPLETE '
+          '(fast lane — no linking pass, no double-check).',
+        );
+        return;
+      }
+      // Fast CI couldn't converge — the edit broke something the quick pass can't
+      // clear. Fall back to the full Testing phase (linking + convergence +
+      // double-check) so it's still driven to green. Reset the gate sigs the
+      // convergence may have set so the full pass runs fresh rather than being
+      // suppressed as "already exhausted".
+      _testingExhaustedSig = null;
+      _finalScanPassedSig = null;
+      debugPrint(
+        '[Orchestrator p$projectId] EDITOR finalize: fast CI did not converge → '
+        'falling back to the full Testing phase.',
+      );
+      await _db.setProjectOrchestrationState(projectId, 'running');
+    } finally {
+      _setTesting(false, null);
+    }
   }
 
   /// The TESTING phase: a dedicated end-of-project stage (like the yellow
@@ -4003,12 +4103,19 @@ class ProjectOrchestrator {
     }
   }
 
-  /// True while the project is still in the running state — used to bail out of
-  /// a multi-turn agent stage promptly when the human pauses/stops.
+  /// The orchestration states in which the pump/pipeline is ACTIVE and may drive
+  /// work: the normal full build (`running`) and the Editor's snappy fast lane
+  /// (`editing`). Every "is the project still going?" check routes through here
+  /// so the fast lane can't silently stall the loop by being an unrecognised
+  /// state — and so adding another active state later is a one-line change.
+  static bool _isActiveState(String? s) => s == 'running' || s == 'editing';
+
+  /// True while the project is still active (running or editing) — used to bail
+  /// out of a multi-turn agent stage promptly when the human pauses/stops.
   Future<bool> _stillRunning() async {
     if (_disposed) return false; // torn-down orchestrator: never touch _db (ref)
     final project = await _db.getProjectById(projectId);
-    return project != null && project.orchestrationState == 'running';
+    return _isActiveState(project?.orchestrationState);
   }
 
   /// Resolve the inference backend + chat model for [persona] from its connected

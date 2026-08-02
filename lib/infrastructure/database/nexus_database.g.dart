@@ -5410,6 +5410,19 @@ class $TasksTable extends Tasks with TableInfo<$TasksTable, Task> {
     type: DriftSqlType.int,
     requiredDuringInsert: false,
   );
+  static const VerificationMeta _isEditMeta = const VerificationMeta('isEdit');
+  @override
+  late final GeneratedColumn<bool> isEdit = GeneratedColumn<bool>(
+    'is_edit',
+    aliasedName,
+    false,
+    type: DriftSqlType.bool,
+    requiredDuringInsert: false,
+    defaultConstraints: GeneratedColumn.constraintIsAlways(
+      'CHECK ("is_edit" IN (0, 1))',
+    ),
+    defaultValue: const Constant(false),
+  );
   static const VerificationMeta _requiresBuildMeta = const VerificationMeta(
     'requiresBuild',
   );
@@ -5528,6 +5541,7 @@ class $TasksTable extends Tasks with TableInfo<$TasksTable, Task> {
     worker_session_fk,
     workBranch,
     milestoneOrder,
+    isEdit,
     requiresBuild,
     dockerfilePath,
     workflowPath,
@@ -5732,6 +5746,12 @@ class $TasksTable extends Tasks with TableInfo<$TasksTable, Task> {
         ),
       );
     }
+    if (data.containsKey('is_edit')) {
+      context.handle(
+        _isEditMeta,
+        isEdit.isAcceptableOrUnknown(data['is_edit']!, _isEditMeta),
+      );
+    }
     if (data.containsKey('requires_build')) {
       context.handle(
         _requiresBuildMeta,
@@ -5886,6 +5906,10 @@ class $TasksTable extends Tasks with TableInfo<$TasksTable, Task> {
         DriftSqlType.int,
         data['${effectivePrefix}milestone_order'],
       ),
+      isEdit: attachedDatabase.typeMapping.read(
+        DriftSqlType.bool,
+        data['${effectivePrefix}is_edit'],
+      )!,
       requiresBuild: attachedDatabase.typeMapping.read(
         DriftSqlType.bool,
         data['${effectivePrefix}requires_build'],
@@ -5986,6 +6010,12 @@ class Task extends DataClass implements Insertable<Task> {
   /// current one. Null = unassigned (short projects / legacy tasks → batch 0).
   final int? milestoneOrder;
 
+  /// True for tasks created by the EDITOR (the post-build fast lane) rather than
+  /// the original autonomous build. Purely a provenance/UI flag: edit tasks are
+  /// filed under the workspace's "Edits" tab instead of bloating the main build
+  /// task board. Does not affect scheduling.
+  final bool isEdit;
+
   /// When true, the orchestration pipeline runs a Docker build / CI gate on this
   /// task after verification passes and before it is handed off for merge.
   final bool requiresBuild;
@@ -6030,6 +6060,7 @@ class Task extends DataClass implements Insertable<Task> {
     this.worker_session_fk,
     this.workBranch,
     this.milestoneOrder,
+    required this.isEdit,
     required this.requiresBuild,
     this.dockerfilePath,
     this.workflowPath,
@@ -6090,6 +6121,7 @@ class Task extends DataClass implements Insertable<Task> {
     if (!nullToAbsent || milestoneOrder != null) {
       map['milestone_order'] = Variable<int>(milestoneOrder);
     }
+    map['is_edit'] = Variable<bool>(isEdit);
     map['requires_build'] = Variable<bool>(requiresBuild);
     if (!nullToAbsent || dockerfilePath != null) {
       map['dockerfile_path'] = Variable<String>(dockerfilePath);
@@ -6161,6 +6193,7 @@ class Task extends DataClass implements Insertable<Task> {
       milestoneOrder: milestoneOrder == null && nullToAbsent
           ? const Value.absent()
           : Value(milestoneOrder),
+      isEdit: Value(isEdit),
       requiresBuild: Value(requiresBuild),
       dockerfilePath: dockerfilePath == null && nullToAbsent
           ? const Value.absent()
@@ -6214,6 +6247,7 @@ class Task extends DataClass implements Insertable<Task> {
       worker_session_fk: serializer.fromJson<int?>(json['worker_session_fk']),
       workBranch: serializer.fromJson<String?>(json['workBranch']),
       milestoneOrder: serializer.fromJson<int?>(json['milestoneOrder']),
+      isEdit: serializer.fromJson<bool>(json['isEdit']),
       requiresBuild: serializer.fromJson<bool>(json['requiresBuild']),
       dockerfilePath: serializer.fromJson<String?>(json['dockerfilePath']),
       workflowPath: serializer.fromJson<String?>(json['workflowPath']),
@@ -6250,6 +6284,7 @@ class Task extends DataClass implements Insertable<Task> {
       'worker_session_fk': serializer.toJson<int?>(worker_session_fk),
       'workBranch': serializer.toJson<String?>(workBranch),
       'milestoneOrder': serializer.toJson<int?>(milestoneOrder),
+      'isEdit': serializer.toJson<bool>(isEdit),
       'requiresBuild': serializer.toJson<bool>(requiresBuild),
       'dockerfilePath': serializer.toJson<String?>(dockerfilePath),
       'workflowPath': serializer.toJson<String?>(workflowPath),
@@ -6284,6 +6319,7 @@ class Task extends DataClass implements Insertable<Task> {
     Value<int?> worker_session_fk = const Value.absent(),
     Value<String?> workBranch = const Value.absent(),
     Value<int?> milestoneOrder = const Value.absent(),
+    bool? isEdit,
     bool? requiresBuild,
     Value<String?> dockerfilePath = const Value.absent(),
     Value<String?> workflowPath = const Value.absent(),
@@ -6333,6 +6369,7 @@ class Task extends DataClass implements Insertable<Task> {
     milestoneOrder: milestoneOrder.present
         ? milestoneOrder.value
         : this.milestoneOrder,
+    isEdit: isEdit ?? this.isEdit,
     requiresBuild: requiresBuild ?? this.requiresBuild,
     dockerfilePath: dockerfilePath.present
         ? dockerfilePath.value
@@ -6400,6 +6437,7 @@ class Task extends DataClass implements Insertable<Task> {
       milestoneOrder: data.milestoneOrder.present
           ? data.milestoneOrder.value
           : this.milestoneOrder,
+      isEdit: data.isEdit.present ? data.isEdit.value : this.isEdit,
       requiresBuild: data.requiresBuild.present
           ? data.requiresBuild.value
           : this.requiresBuild,
@@ -6442,6 +6480,7 @@ class Task extends DataClass implements Insertable<Task> {
           ..write('worker_session_fk: $worker_session_fk, ')
           ..write('workBranch: $workBranch, ')
           ..write('milestoneOrder: $milestoneOrder, ')
+          ..write('isEdit: $isEdit, ')
           ..write('requiresBuild: $requiresBuild, ')
           ..write('dockerfilePath: $dockerfilePath, ')
           ..write('workflowPath: $workflowPath, ')
@@ -6478,6 +6517,7 @@ class Task extends DataClass implements Insertable<Task> {
     worker_session_fk,
     workBranch,
     milestoneOrder,
+    isEdit,
     requiresBuild,
     dockerfilePath,
     workflowPath,
@@ -6513,6 +6553,7 @@ class Task extends DataClass implements Insertable<Task> {
           other.worker_session_fk == this.worker_session_fk &&
           other.workBranch == this.workBranch &&
           other.milestoneOrder == this.milestoneOrder &&
+          other.isEdit == this.isEdit &&
           other.requiresBuild == this.requiresBuild &&
           other.dockerfilePath == this.dockerfilePath &&
           other.workflowPath == this.workflowPath &&
@@ -6546,6 +6587,7 @@ class TasksCompanion extends UpdateCompanion<Task> {
   final Value<int?> worker_session_fk;
   final Value<String?> workBranch;
   final Value<int?> milestoneOrder;
+  final Value<bool> isEdit;
   final Value<bool> requiresBuild;
   final Value<String?> dockerfilePath;
   final Value<String?> workflowPath;
@@ -6577,6 +6619,7 @@ class TasksCompanion extends UpdateCompanion<Task> {
     this.worker_session_fk = const Value.absent(),
     this.workBranch = const Value.absent(),
     this.milestoneOrder = const Value.absent(),
+    this.isEdit = const Value.absent(),
     this.requiresBuild = const Value.absent(),
     this.dockerfilePath = const Value.absent(),
     this.workflowPath = const Value.absent(),
@@ -6609,6 +6652,7 @@ class TasksCompanion extends UpdateCompanion<Task> {
     this.worker_session_fk = const Value.absent(),
     this.workBranch = const Value.absent(),
     this.milestoneOrder = const Value.absent(),
+    this.isEdit = const Value.absent(),
     this.requiresBuild = const Value.absent(),
     this.dockerfilePath = const Value.absent(),
     this.workflowPath = const Value.absent(),
@@ -6643,6 +6687,7 @@ class TasksCompanion extends UpdateCompanion<Task> {
     Expression<int>? worker_session_fk,
     Expression<String>? workBranch,
     Expression<int>? milestoneOrder,
+    Expression<bool>? isEdit,
     Expression<bool>? requiresBuild,
     Expression<String>? dockerfilePath,
     Expression<String>? workflowPath,
@@ -6676,6 +6721,7 @@ class TasksCompanion extends UpdateCompanion<Task> {
       if (worker_session_fk != null) 'worker_session_fk': worker_session_fk,
       if (workBranch != null) 'work_branch': workBranch,
       if (milestoneOrder != null) 'milestone_order': milestoneOrder,
+      if (isEdit != null) 'is_edit': isEdit,
       if (requiresBuild != null) 'requires_build': requiresBuild,
       if (dockerfilePath != null) 'dockerfile_path': dockerfilePath,
       if (workflowPath != null) 'workflow_path': workflowPath,
@@ -6710,6 +6756,7 @@ class TasksCompanion extends UpdateCompanion<Task> {
     Value<int?>? worker_session_fk,
     Value<String?>? workBranch,
     Value<int?>? milestoneOrder,
+    Value<bool>? isEdit,
     Value<bool>? requiresBuild,
     Value<String?>? dockerfilePath,
     Value<String?>? workflowPath,
@@ -6742,6 +6789,7 @@ class TasksCompanion extends UpdateCompanion<Task> {
       worker_session_fk: worker_session_fk ?? this.worker_session_fk,
       workBranch: workBranch ?? this.workBranch,
       milestoneOrder: milestoneOrder ?? this.milestoneOrder,
+      isEdit: isEdit ?? this.isEdit,
       requiresBuild: requiresBuild ?? this.requiresBuild,
       dockerfilePath: dockerfilePath ?? this.dockerfilePath,
       workflowPath: workflowPath ?? this.workflowPath,
@@ -6822,6 +6870,9 @@ class TasksCompanion extends UpdateCompanion<Task> {
     if (milestoneOrder.present) {
       map['milestone_order'] = Variable<int>(milestoneOrder.value);
     }
+    if (isEdit.present) {
+      map['is_edit'] = Variable<bool>(isEdit.value);
+    }
     if (requiresBuild.present) {
       map['requires_build'] = Variable<bool>(requiresBuild.value);
     }
@@ -6874,6 +6925,7 @@ class TasksCompanion extends UpdateCompanion<Task> {
           ..write('worker_session_fk: $worker_session_fk, ')
           ..write('workBranch: $workBranch, ')
           ..write('milestoneOrder: $milestoneOrder, ')
+          ..write('isEdit: $isEdit, ')
           ..write('requiresBuild: $requiresBuild, ')
           ..write('dockerfilePath: $dockerfilePath, ')
           ..write('workflowPath: $workflowPath, ')
@@ -20766,6 +20818,7 @@ typedef $$TasksTableCreateCompanionBuilder =
       Value<int?> worker_session_fk,
       Value<String?> workBranch,
       Value<int?> milestoneOrder,
+      Value<bool> isEdit,
       Value<bool> requiresBuild,
       Value<String?> dockerfilePath,
       Value<String?> workflowPath,
@@ -20799,6 +20852,7 @@ typedef $$TasksTableUpdateCompanionBuilder =
       Value<int?> worker_session_fk,
       Value<String?> workBranch,
       Value<int?> milestoneOrder,
+      Value<bool> isEdit,
       Value<bool> requiresBuild,
       Value<String?> dockerfilePath,
       Value<String?> workflowPath,
@@ -21039,6 +21093,11 @@ class $$TasksTableFilterComposer
 
   ColumnFilters<int> get milestoneOrder => $composableBuilder(
     column: $table.milestoneOrder,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<bool> get isEdit => $composableBuilder(
+    column: $table.isEdit,
     builder: (column) => ColumnFilters(column),
   );
 
@@ -21353,6 +21412,11 @@ class $$TasksTableOrderingComposer
     builder: (column) => ColumnOrderings(column),
   );
 
+  ColumnOrderings<bool> get isEdit => $composableBuilder(
+    column: $table.isEdit,
+    builder: (column) => ColumnOrderings(column),
+  );
+
   ColumnOrderings<bool> get requiresBuild => $composableBuilder(
     column: $table.requiresBuild,
     builder: (column) => ColumnOrderings(column),
@@ -21626,6 +21690,9 @@ class $$TasksTableAnnotationComposer
     column: $table.milestoneOrder,
     builder: (column) => column,
   );
+
+  GeneratedColumn<bool> get isEdit =>
+      $composableBuilder(column: $table.isEdit, builder: (column) => column);
 
   GeneratedColumn<bool> get requiresBuild => $composableBuilder(
     column: $table.requiresBuild,
@@ -21903,6 +21970,7 @@ class $$TasksTableTableManager
                 Value<int?> worker_session_fk = const Value.absent(),
                 Value<String?> workBranch = const Value.absent(),
                 Value<int?> milestoneOrder = const Value.absent(),
+                Value<bool> isEdit = const Value.absent(),
                 Value<bool> requiresBuild = const Value.absent(),
                 Value<String?> dockerfilePath = const Value.absent(),
                 Value<String?> workflowPath = const Value.absent(),
@@ -21934,6 +22002,7 @@ class $$TasksTableTableManager
                 worker_session_fk: worker_session_fk,
                 workBranch: workBranch,
                 milestoneOrder: milestoneOrder,
+                isEdit: isEdit,
                 requiresBuild: requiresBuild,
                 dockerfilePath: dockerfilePath,
                 workflowPath: workflowPath,
@@ -21967,6 +22036,7 @@ class $$TasksTableTableManager
                 Value<int?> worker_session_fk = const Value.absent(),
                 Value<String?> workBranch = const Value.absent(),
                 Value<int?> milestoneOrder = const Value.absent(),
+                Value<bool> isEdit = const Value.absent(),
                 Value<bool> requiresBuild = const Value.absent(),
                 Value<String?> dockerfilePath = const Value.absent(),
                 Value<String?> workflowPath = const Value.absent(),
@@ -21998,6 +22068,7 @@ class $$TasksTableTableManager
                 worker_session_fk: worker_session_fk,
                 workBranch: workBranch,
                 milestoneOrder: milestoneOrder,
+                isEdit: isEdit,
                 requiresBuild: requiresBuild,
                 dockerfilePath: dockerfilePath,
                 workflowPath: workflowPath,

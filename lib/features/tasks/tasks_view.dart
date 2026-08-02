@@ -25,6 +25,10 @@ class TasksView extends ConsumerStatefulWidget {
 
 class _TasksViewState extends ConsumerState<TasksView> {
   TaskViewMode _viewMode = TaskViewMode.list;
+  // Which task source the board shows: the original autonomous BUILD tasks, or
+  // the post-build EDITOR's edits. Editor edits are filed here (not merged into
+  // the build board) so a long editing session doesn't bloat the build history.
+  bool _showEdits = false;
   final Set<int> _expanded = {};
 
   @override
@@ -58,13 +62,50 @@ class _TasksViewState extends ConsumerState<TasksView> {
                   const SizedBox(width: 8),
                   allTasksAsync.when(
                     data: (tasks) => Chip(
-                      label: Text('${tasks.length} items'),
+                      label: Text(
+                        '${tasks.where((t) => t.isEdit == _showEdits).length} items',
+                      ),
                       visualDensity: VisualDensity.compact,
                     ),
                     loading: () => const Chip(label: Text('...')),
                     error: (_, __) => const Chip(label: Text('Error')),
                   ),
                 ],
+              ),
+
+              // Build ↔ Edits source toggle — only shown once the Editor has
+              // created edit tasks, so it stays out of the way during the build.
+              allTasksAsync.maybeWhen(
+                data: (tasks) {
+                  final hasEdits = tasks.any((t) => t.isEdit);
+                  if (!hasEdits) return const SizedBox.shrink();
+                  final editCount = tasks.where((t) => t.isEdit).length;
+                  final buildCount = tasks.length - editCount;
+                  return SegmentedButton<bool>(
+                    segments: [
+                      ButtonSegment(
+                        value: false,
+                        icon: const Icon(Icons.construction, size: 18),
+                        label: Text('Build ($buildCount)'),
+                      ),
+                      ButtonSegment(
+                        value: true,
+                        icon: const Icon(Icons.edit_note, size: 18),
+                        label: Text('Edits ($editCount)'),
+                      ),
+                    ],
+                    selected: {_showEdits},
+                    onSelectionChanged: (s) =>
+                        setState(() => _showEdits = s.first),
+                    style: ButtonStyle(
+                      visualDensity: VisualDensity.compact,
+                      padding: WidgetStateProperty.all(
+                        const EdgeInsets.symmetric(horizontal: 6),
+                      ),
+                    ),
+                  );
+                },
+                orElse: () => const SizedBox.shrink(),
               ),
 
               // View mode switcher
@@ -104,7 +145,11 @@ class _TasksViewState extends ConsumerState<TasksView> {
         ),
         Expanded(
           child: allTasksAsync.when(
-            data: (allTasks) {
+            data: (allSourceTasks) {
+              // Show only the selected source (build vs editor edits).
+              final allTasks = allSourceTasks
+                  .where((t) => t.isEdit == _showEdits)
+                  .toList();
               if (_viewMode == TaskViewMode.kanban) {
                 return TaskKanbanBoard(
                   tasks: allTasks,

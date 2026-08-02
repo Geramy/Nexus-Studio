@@ -557,6 +557,7 @@ class ProjectCoordinatorSession {
             workBranch: workBranch,
             gitLane: gitLane,
             claimFile: fileClaim,
+            editorMode: editorMode,
           )
         : null;
 
@@ -1308,6 +1309,7 @@ class ProjectCoordinatorSession {
       workBranch: workBranch,
       gitLane: gitLane,
       claimFile: fileClaim,
+      editorMode: editorMode,
     );
 
     final results = <String>[];

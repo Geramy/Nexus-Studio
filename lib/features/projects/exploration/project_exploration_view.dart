@@ -171,8 +171,10 @@ class ProjectExplorationView extends ConsumerWidget {
     // done — this surface becomes the EDITOR: a mini-IDE (file tree + code +
     // Editor chat + Launch) that replaces the story-tree, which is now just
     // reference. Hand the whole pane to the Editor workspace.
-    final isEditor =
-        !isDiscovery && projectRow?.orchestrationState == 'completed';
+    // 'editing' is the Editor's own fast-lane build state — stay on the Editor
+    // workspace while a delegated edit runs, don't flip back to the story-tree.
+    final state = projectRow?.orchestrationState;
+    final isEditor = !isDiscovery && (state == 'completed' || state == 'editing');
     if (isEditor) {
       return EditorWorkspaceView(
         projectId: projectId,

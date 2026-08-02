@@ -15,6 +15,8 @@ import 'package:nexus_projects_client/features/project_plans/plan_store.dart';
 import 'package:nexus_projects_client/features/project_setup/plan_task_sync.dart';
 import 'package:nexus_projects_client/infrastructure/workspace/async_lock.dart';
 import 'package:nexus_projects_client/infrastructure/workspace/workspace.dart';
+import 'package:nexus_projects_client/infrastructure/workspace/git_status.dart'
+    show GitFileStatus;
 import 'package:nexus_projects_client/infrastructure/workspace/git/nxtprj_git_engine.dart';
 import 'package:nexus_projects_client/infrastructure/build/build_service.dart';
 import 'package:nexus_projects_client/infrastructure/build/build_models.dart';
@@ -1690,6 +1692,11 @@ class CoordinatorToolExecutor {
   /// Null in the interactive chat (no queue).
   final bool Function(String path)? claimFile;
 
+  /// True when this executor is the post-build EDITOR. Tasks it creates are
+  /// flagged `isEdit` so they file under the workspace "Edits" tab instead of
+  /// the build board. Provenance only — no effect on scheduling/execution.
+  final bool editorMode;
+
   CoordinatorToolExecutor({
     required this.db,
     required this.projectId,
@@ -1711,6 +1718,7 @@ class CoordinatorToolExecutor {
     this.workBranch,
     this.gitLane,
     this.claimFile,
+    this.editorMode = false,
   });
 
   /// Gate a file mutation through the orchestrator's file-claim queue. Returns a
@@ -2466,6 +2474,7 @@ class CoordinatorToolExecutor {
       chatSessionPk: chatSessionPk,
       agentPk: assignee,
       thinkingMode: thinkingMode,
+      isEdit: editorMode,
     );
 
     if (assignee == null) {
@@ -3416,10 +3425,99 @@ class CoordinatorToolExecutor {
     }
   }
 
+  /// A file still holds an UNRESOLVED git conflict — it has both a
+  /// `<<<<<<< ` and a `>>>>>>> ` marker line. Requiring BOTH keeps false
+  /// positives near zero (real source never opens a `<<<<<<< ` line and closes a
+  /// `>>>>>>> ` line), so this never blocks a legitimate commit.
+  static bool _hasConflictMarkers(String content) {
+    var sawStart = false, sawEnd = false;
+    for (final line in content.split('\n')) {
+      if (line.startsWith('<<<<<<< ')) sawStart = true;
+      if (line.startsWith('>>>>>>> ')) sawEnd = true;
+      if (sawStart && sawEnd) return true;
+    }
+    return false;
+  }
+
+  /// Likely-binary path (skip the marker scan — reading it as text is pointless
+  /// and its bytes could false-trigger). Coarse extension check; anything not
+  /// listed is treated as text and scanned.
+  static bool _looksBinaryPath(String p) {
+    final lower = p.toLowerCase();
+    const bin = [
+      '.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.bmp', '.svg',
+      '.ttf', '.otf', '.woff', '.woff2', '.mp3', '.wav', '.ogg', '.mp4',
+      '.mov', '.zip', '.gz', '.jar', '.so', '.dll', '.exe', '.wasm', '.bin',
+      '.pdf', '.keystore', '.jks', '.p12',
+    ];
+    return bin.any(lower.endsWith);
+  }
+
+  /// Workspace paths that would be committed AND still contain conflict markers.
+  /// [onlyPaths] limits the scan to an explicit commit path list; otherwise every
+  /// changed (modified/untracked) file is scanned. This is the guard that stops a
+  /// half-resolved merge from baking `<<<<<<<`/`=======`/`>>>>>>>` into history —
+  /// exactly how a project's game_screen.dart got corrupted and stalled CI.
+  Future<List<String>> _conflictMarkedFiles({List<String>? onlyPaths}) async {
+    final ws = workspace;
+    if (ws == null || git == null) return const [];
+    List<String> candidates;
+    try {
+      if (onlyPaths != null && onlyPaths.isNotEmpty) {
+        candidates = onlyPaths
+            .map((p) => p.startsWith('/') ? p : '/$p')
+            .toList();
+      } else {
+        final st = await git!.status();
+        candidates = st.byPath.entries
+            .where(
+              (e) =>
+                  e.value == GitFileStatus.modified ||
+                  e.value == GitFileStatus.untracked,
+            )
+            .map((e) => e.key)
+            .toList();
+      }
+    } catch (_) {
+      return const []; // status failed — don't block the commit on a scan error
+    }
+    final marked = <String>[];
+    for (final p in candidates) {
+      if (_looksBinaryPath(p)) continue;
+      try {
+        if (_hasConflictMarkers(await ws.readString(p))) marked.add(p);
+      } catch (_) {
+        // Unreadable/binary/deleted — nothing to scan.
+      }
+    }
+    return marked;
+  }
+
   Future<String> _gitCommit(Map<String, dynamic> args) async {
     if (git == null) return 'Git is unavailable in this context.';
     final message = (args['message'] as String? ?? '').trim();
     if (message.isEmpty) return 'git_commit failed: message is required.';
+
+    // GUARD: never commit unresolved conflict markers — they turn a source file
+    // into un-parseable garbage the moment they land in history (observed: a
+    // merge-resolution left markers in game_screen.dart → 193 CI errors, all in
+    // that one file, and the build stalled). Refuse and tell the agent to finish
+    // resolving. Scans only the paths being committed (or all changed files).
+    final rawPathsForScan = args['paths'];
+    final scanPaths = (rawPathsForScan is List)
+        ? rawPathsForScan.map((e) => '$e'.trim()).where((e) => e.isNotEmpty).toList()
+        : const <String>[];
+    final marked = await _conflictMarkedFiles(
+      onlyPaths: scanPaths.isEmpty ? null : scanPaths,
+    );
+    if (marked.isNotEmpty) {
+      final shown = marked.take(5).join(', ');
+      final more = marked.length > 5 ? ' (+${marked.length - 5} more)' : '';
+      return 'git_commit BLOCKED: unresolved conflict markers remain in '
+          '${marked.length} file(s): $shown$more. Remove EVERY `<<<<<<<`, '
+          '`=======`, and `>>>>>>>` block — keep the correct code from each side — '
+          'then commit. Committing markers corrupts the file and breaks the build.';
+    }
     // Orchestrated worker: snapshot the ISOLATED task tree onto its branch in
     // the shared object DB, serialized so concurrent agents never interleave.
     if (_isolatedTask) {
@@ -3565,11 +3663,17 @@ class CoordinatorToolExecutor {
   /// and re-checking CI as each passes. Safe to call: if nothing is assignable
   /// the orchestrator just re-verifies and settles back to completed.
   Future<String> _startDelegatedBuild() async {
-    await db.setProjectOrchestrationState(projectId, 'running');
-    return 'Build started — your assigned tasks will run in parallel (up to the '
-        'account\'s agent limit), each on its own branch, integrating into main '
-        'and re-checking CI as they pass. It runs in the background: tell the '
-        'user it is underway and track it with list_tasks / get_ci_run.';
+    // 'editing' (not 'running') puts the orchestrator on the Editor FAST LANE:
+    // tasks skip the per-task verify + build gates and go straight to merge, and
+    // finalize is light (no linking pass, no double-check scan) — snappy edits
+    // instead of the full end-of-project ceremony. It still falls back to the
+    // full Testing phase if a change actually breaks the build.
+    await db.setProjectOrchestrationState(projectId, 'editing');
+    return 'Build started — your assigned tasks run in parallel (up to the '
+        'account\'s agent limit), each on its own branch, merging into main as '
+        'soon as they submit (fast lane: no per-task test/build gate). It runs in '
+        'the background: tell the user it is underway and track it with '
+        'list_tasks / get_ci_run.';
   }
 
   Future<String> _submitForCompletion(Map<String, dynamic> args) async {

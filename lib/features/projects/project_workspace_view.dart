@@ -161,7 +161,10 @@ class _ProjectWorkspaceViewState extends ConsumerState<ProjectWorkspaceView>
 
     // Once the build has finished, the first tab becomes the EDITOR (a mini-IDE)
     // and the story tree is demoted to reference — so relabel it to match.
-    final isBuilt = projectRow?.orchestrationState == 'completed';
+    // 'editing' is the Editor's fast-lane build state, so keep the Editor label.
+    final finishedState = projectRow?.orchestrationState;
+    final isBuilt =
+        finishedState == 'completed' || finishedState == 'editing';
     final storiesTab = Tab(
       icon: Icon(
         isBuilt ? Icons.edit_note_outlined : Icons.account_tree_outlined,

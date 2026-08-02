@@ -84,6 +84,12 @@ class Tasks extends Table {
   /// current one. Null = unassigned (short projects / legacy tasks → batch 0).
   IntColumn get milestoneOrder => integer().nullable()();
 
+  /// True for tasks created by the EDITOR (the post-build fast lane) rather than
+  /// the original autonomous build. Purely a provenance/UI flag: edit tasks are
+  /// filed under the workspace's "Edits" tab instead of bloating the main build
+  /// task board. Does not affect scheduling.
+  BoolColumn get isEdit => boolean().withDefault(const Constant(false))();
+
   // ==================== Build pipeline config ====================
   /// When true, the orchestration pipeline runs a Docker build / CI gate on this
   /// task after verification passes and before it is handed off for merge.
