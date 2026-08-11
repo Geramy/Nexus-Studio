@@ -227,8 +227,7 @@ class TaskGenerator extends ChangeNotifier {
     if (resolved == null) return const [];
     final notes = await db.getNotesForStory(s.story_pk);
     final ac = (s.acceptanceCriteria ?? '').trim();
-    final b = StringBuffer()
-      ..writeln('STORY: ${s.title}');
+    final b = StringBuffer()..writeln('STORY: ${s.title}');
     if (s.narrative.trim().isNotEmpty) {
       b.writeln('Narrative: ${s.narrative.trim()}');
     }
@@ -291,7 +290,8 @@ class TaskGenerator extends ChangeNotifier {
       models = (jsonDecode(chosen.availableModelsJson) as List).cast<String>();
     } catch (_) {}
     final model =
-        (chosen.selectedModel != null && chosen.selectedModel!.trim().isNotEmpty)
+        (chosen.selectedModel != null &&
+            chosen.selectedModel!.trim().isNotEmpty)
         ? chosen.selectedModel!.trim()
         : (models.isNotEmpty ? models.first : 'default-coordinator');
     final uiServer = ui_server.InferenceServer(
@@ -299,7 +299,7 @@ class TaskGenerator extends ChangeNotifier {
       name: chosen.name,
       baseUrl: chosen.baseUrl,
       apiKey: chosen.apiKey,
-      providerType: 'lemonade',
+      providerType: chosen.providerType,
       selectedModel: chosen.selectedModel,
       availableModels: models,
     );
@@ -310,7 +310,6 @@ class TaskGenerator extends ChangeNotifier {
   }
 }
 
-final taskGeneratorProvider =
-    ChangeNotifierProvider.family<TaskGenerator, int>(
-      (ref, projectId) => TaskGenerator(ref, projectId),
-    );
+final taskGeneratorProvider = ChangeNotifierProvider.family<TaskGenerator, int>(
+  (ref, projectId) => TaskGenerator(ref, projectId),
+);

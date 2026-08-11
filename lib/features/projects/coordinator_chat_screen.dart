@@ -13,7 +13,7 @@ import 'package:nexus_projects_client/infrastructure/database/nexus_database.dar
     show ChatMessagesCompanion, ChatMessage, AgentPersona;
 // Backward-compat types (InferenceClient = InferenceBackend).
 import 'package:nexus_projects_client/infrastructure/inference/inference_backend_factory.dart'
-    show backendForServer;
+    show backendForServer, sttFallbackBackend;
 import 'package:nexus_projects_client/infrastructure/inference/routed_server.dart'
     show isRoutedProviderType;
 import 'package:nexus_projects_client/infrastructure/inference/inference_client.dart';
@@ -173,8 +173,8 @@ class _ProjectCoordinatorChatScreenState
         '[Voice] Agent="${persona?.name ?? "(none)"}" → server "${chosen.name}" @ ${chosen.baseUrl}',
       );
 
-      final models =
-          (jsonDecode(chosen.availableModelsJson) as List).cast<String>();
+      final models = (jsonDecode(chosen.availableModelsJson) as List)
+          .cast<String>();
 
       // Live model list from the chosen (agent's) server.
       final cache = ref.read(aiServersCacheProvider.notifier);
@@ -240,7 +240,7 @@ class _ProjectCoordinatorChatScreenState
         name: chosen.name,
         baseUrl: chosen.baseUrl,
         apiKey: chosen.apiKey,
-        providerType: 'lemonade',
+        providerType: chosen.providerType,
         selectedModel: chosen.selectedModel,
         availableModels: models,
       );
@@ -276,8 +276,10 @@ class _ProjectCoordinatorChatScreenState
             .select(sessionId);
       }
       _sessionId = sessionId;
-      _inferenceClient =
-          backendForServer(uiServer, sessionId: 'chat-$sessionId');
+      _inferenceClient = backendForServer(
+        uiServer,
+        sessionId: 'chat-$sessionId',
+      );
 
       // Workspace + git + build access for the file/git/build agent tools.
       // Resolved best-effort; if any fail those tools degrade to "unavailable"
@@ -338,6 +340,17 @@ class _ProjectCoordinatorChatScreenState
         defaultVoice: ttsVoice,
       );
 
+      // Zyphra Cloud can't transcribe — hear via the first LAN/Router server
+      // while think+speak stay on the persona's Zyphra backend.
+      InferenceBackend? sttFallback;
+      if (uiServer.providerType == 'zyphra') {
+        sttFallback = await sttFallbackBackend(
+          clientId: ref.read(currentClientIdProvider),
+          db: ref.read(nexusDatabaseProvider),
+          excludeProviderType: 'zyphra',
+        );
+      }
+
       // Duplex (VAD-driven continuous conversation) is now the ONLY voice path for the Coordinator call.
       // This gives the automatic speak → pause (VAD) → AI processes (with tools) → speaks back → auto resume listening behavior.
       _duplexVoiceSession = CoordinatorDuplexVoiceSession(
@@ -345,6 +358,7 @@ class _ProjectCoordinatorChatScreenState
         recorder: _voiceRecorder!,
         tts: ttsSvc,
         sttModel: sttModel,
+        sttBackend: sttFallback,
         // Surface each voice turn in the chat transcript so the conversation is
         // visible even if TTS audio fails.
         onUserTranscript: (t) {

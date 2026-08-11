@@ -444,7 +444,7 @@ class _PersonaEditorState extends ConsumerState<PersonaEditor> {
   Widget _voiceSelector() {
     final cur =
         (selectedVoice != null &&
-            kKokoroVoices.any((v) => v.id == selectedVoice))
+            kAllTtsVoices.any((v) => v.id == selectedVoice))
         ? selectedVoice
         : null;
     final items = <DropdownMenuItem<String?>>[
@@ -455,7 +455,7 @@ class _PersonaEditorState extends ConsumerState<PersonaEditor> {
           overflow: TextOverflow.ellipsis,
         ),
       ),
-      for (final v in kKokoroVoices)
+      for (final v in kAllTtsVoices)
         DropdownMenuItem(
           value: v.id,
           child: Text(v.label, overflow: TextOverflow.ellipsis),
@@ -478,7 +478,7 @@ class _PersonaEditorState extends ConsumerState<PersonaEditor> {
           ),
           const SizedBox(height: AppSpacing.xs),
           Text(
-            'The speaking voice for spoken replies (Kokoro TTS).',
+            'The speaking voice for spoken replies (Kokoro for Lemonade, ZONOS2 for Zyphra Cloud).',
             style: TextStyle(fontSize: 12, color: context.nx.textMuted),
           ),
           const SizedBox(height: AppSpacing.sm),
@@ -741,8 +741,7 @@ class _PersonaEditorState extends ConsumerState<PersonaEditor> {
           ),
           // Each category is a collapsible group (collapsed by default) so the
           // long tool list stays scannable; expand the groups you care about.
-          for (final category in kToolCategories)
-            _toolGroup(context, category),
+          for (final category in kToolCategories) _toolGroup(context, category),
         ],
       ),
     );
@@ -785,14 +784,11 @@ class _PersonaEditorState extends ConsumerState<PersonaEditor> {
                       tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                     ),
                     onPressed: () => _setGroupPerms(category, p),
-                    child: Text(
-                      switch (p) {
-                        ToolPerm.grant => 'Grant all',
-                        ToolPerm.ask => 'Ask all',
-                        ToolPerm.deny => 'Deny all',
-                      },
-                      style: const TextStyle(fontSize: 11),
-                    ),
+                    child: Text(switch (p) {
+                      ToolPerm.grant => 'Grant all',
+                      ToolPerm.ask => 'Ask all',
+                      ToolPerm.deny => 'Deny all',
+                    }, style: const TextStyle(fontSize: 11)),
                   ),
               ],
             ),
@@ -835,7 +831,9 @@ class _PersonaEditorState extends ConsumerState<PersonaEditor> {
 
   void _setGroupPerms(String category, ToolPerm p) {
     setState(() {
-      for (final t in kCoordinatorToolSpecs.where((t) => t.category == category)) {
+      for (final t in kCoordinatorToolSpecs.where(
+        (t) => t.category == category,
+      )) {
         _toolPerms[t.name] = p;
       }
     });

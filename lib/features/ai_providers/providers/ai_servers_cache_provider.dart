@@ -17,6 +17,9 @@ import 'package:nexus_projects_client/core/providers/database_provider.dart';
 import 'package:nexus_projects_client/core/providers/app_shell_provider.dart';
 import 'package:nexus_projects_client/infrastructure/database/nexus_database.dart'
     show InferenceServer;
+import 'package:nexus_projects_client/infrastructure/inference/inference_backend_factory.dart';
+import 'package:nexus_projects_client/infrastructure/models/ui/inference_server.dart'
+    as ui_model;
 import 'package:nexus_projects_client/infrastructure/lemonade/api/lemonade_client.dart';
 import 'package:nexus_projects_client/infrastructure/lemonade/api/types/model_info.dart';
 import 'package:nexus_projects_client/infrastructure/lemonade/models/server_config.dart';
@@ -62,6 +65,18 @@ Future<ServerConfig> _toServerConfig(InferenceServer row) async {
   return ServerConfig(baseUrl: row.baseUrl, apiKey: apiKey, name: row.name);
 }
 
+/// Minimal UI-model conversion for [backendForServer] (only name/baseUrl/
+/// apiKey/providerType are read when building a backend).
+ui_model.InferenceServer _toUiServer(InferenceServer row) {
+  return ui_model.InferenceServer(
+    id: row.server_pk.toString(),
+    name: row.name,
+    baseUrl: row.baseUrl,
+    apiKey: row.apiKey,
+    providerType: row.providerType,
+  );
+}
+
 /// Notifier that fetches + caches models for all configured inference servers.
 class AiServersCacheNotifier extends StateNotifier<AiServersCache> {
   final Ref ref;
@@ -86,6 +101,22 @@ class AiServersCacheNotifier extends StateNotifier<AiServersCache> {
       }
 
       try {
+        // Zyphra Cloud has no /models endpoint — use the backend's catalog.
+        // Lemonade/Router keep the rich client (labels, recipes, omni bundles).
+        if (server.providerType == 'zyphra') {
+          final backend = backendForServer(_toUiServer(server));
+          final models = <ApiModelInfo>[
+            for (final m in await backend.listModels())
+              ApiModelInfo(id: m.id, labels: const []),
+          ];
+          updated[server.server_pk] = ServerModelsEntry(
+            server: server,
+            models: models,
+            fetchedAt: DateTime.now(),
+          );
+          continue;
+        }
+
         final config = await _toServerConfig(server);
         final client = LemonadeApiClient(config);
         final models = await client.models.all();
@@ -125,6 +156,23 @@ class AiServersCacheNotifier extends StateNotifier<AiServersCache> {
     );
 
     try {
+      if (server.providerType == 'zyphra') {
+        final backend = backendForServer(_toUiServer(server));
+        final models = <ApiModelInfo>[
+          for (final m in await backend.listModels())
+            ApiModelInfo(id: m.id, labels: const []),
+        ];
+        state = {
+          ...state,
+          serverId: ServerModelsEntry(
+            server: server,
+            models: models,
+            fetchedAt: DateTime.now(),
+          ),
+        };
+        return;
+      }
+
       final config = await _toServerConfig(server);
       final client = LemonadeApiClient(config);
       final models = await client.models.all();

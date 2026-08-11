@@ -8,9 +8,14 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../core/providers/app_shell_provider.dart';
 import '../../core/providers/database_provider.dart';
 import '../../core/providers/lean_context_provider.dart';
 import '../../infrastructure/database/nexus_database.dart';
+import '../../infrastructure/inference/inference_backend.dart'
+    show InferenceBackend;
+import '../../infrastructure/inference/inference_backend_factory.dart'
+    show sttFallbackBackend;
 import '../../infrastructure/registry/verification_service.dart';
 import '../../infrastructure/workspace/workspace_provider.dart';
 import '../../services/audio/audio_recorder_service.dart';
@@ -488,7 +493,6 @@ class SetupChatController extends ChangeNotifier {
     }
   }
 
-
   Future<void> skip() async {
     await _ref
         .read(nexusDatabaseProvider)
@@ -525,11 +529,22 @@ class SetupChatController extends ChangeNotifier {
       ttsModel: resolved.ttsModel,
       defaultVoice: resolved.ttsVoice,
     );
+    // Zyphra Cloud can't transcribe — hear via the first LAN/Router server
+    // while think+speak stay on the persona's Zyphra backend.
+    InferenceBackend? sttFallback;
+    if (resolved.backend.implementationType == 'zyphra') {
+      sttFallback = await sttFallbackBackend(
+        clientId: _ref.read(currentClientIdProvider),
+        db: _ref.read(nexusDatabaseProvider),
+        excludeProviderType: 'zyphra',
+      );
+    }
     final voice = SetupVoiceSession(
       backend: resolved.backend,
       recorder: _voiceRecorder!,
       tts: tts,
       sttModel: resolved.sttModel,
+      sttBackend: sttFallback,
       onFreeUtterance: (t) => send(t),
       onSystemNote: (n) =>
           _append(SetupMsg(kind: SetupMsgKind.system, text: n)),

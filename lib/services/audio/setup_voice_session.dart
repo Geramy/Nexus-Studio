@@ -52,12 +52,17 @@ class SetupVoiceSession {
     required this.recorder,
     required this.tts,
     this.sttModel,
+    this.sttBackend,
     this.onFreeUtterance,
     this.onSystemNote,
     VoiceActivityService? vadService,
   }) : vad = vadService ?? VoiceActivityService();
 
   final InferenceBackend backend;
+
+  /// Optional separate STT backend (e.g. a LAN server) used when [backend]
+  /// can't transcribe (Zyphra Cloud). Falls back to [backend] when null.
+  final InferenceBackend? sttBackend;
   final AudioRecorderService recorder;
   final TtsService tts;
   final VoiceActivityService vad;
@@ -250,7 +255,7 @@ class SetupVoiceSession {
 
   Future<String> _transcribe(List<double> samples) async {
     final wav = _floatSamplesToWav(samples);
-    final result = await backend.transcribeAudio(
+    final result = await (sttBackend ?? backend).transcribeAudio(
       audioBytes: wav,
       filename: 'utterance.wav',
       model: sttModel,

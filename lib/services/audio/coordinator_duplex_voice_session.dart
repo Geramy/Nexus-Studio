@@ -30,6 +30,11 @@ class CoordinatorDuplexVoiceSession {
   final TtsService tts;
   final VoiceActivityService vad;
 
+  /// Optional separate STT backend (e.g. a LAN server) used when the
+  /// coordinator's backend can't transcribe (Zyphra Cloud). Falls back to the
+  /// coordinator client when null.
+  final InferenceBackend? sttBackend;
+
   /// STT model id to transcribe with. When null the server/default is used
   /// (which may 404 on servers without an OpenAI-style `whisper-1`).
   final String? sttModel;
@@ -57,6 +62,7 @@ class CoordinatorDuplexVoiceSession {
     required this.recorder,
     required this.tts,
     this.sttModel,
+    this.sttBackend,
     this.onUserTranscript,
     this.onAssistantReply,
     this.onSystemNote,
@@ -112,11 +118,12 @@ class CoordinatorDuplexVoiceSession {
       debugPrint(
         '[Voice] transcribing ${wav.length} WAV bytes with model=${sttModel ?? "(server default)"}',
       );
-      final stt = await coordinatorSession.client.transcribeAudio(
-        audioBytes: wav,
-        filename: 'utterance.wav',
-        model: sttModel,
-      );
+      final stt = await (sttBackend ?? coordinatorSession.client)
+          .transcribeAudio(
+            audioBytes: wav,
+            filename: 'utterance.wav',
+            model: sttModel,
+          );
       final transcript = stt.text.trim();
       debugPrint('[Voice] transcript: "$transcript"');
 

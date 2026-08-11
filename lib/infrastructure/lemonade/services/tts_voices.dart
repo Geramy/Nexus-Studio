@@ -49,9 +49,32 @@ const List<TtsVoice> kKokoroVoices = [
   TtsVoice('bm_lewis', 'Lewis — UK Male'),
 ];
 
+/// Selectable TTS voices for Zyphra Cloud's ZONOS2 speech model (served from
+/// `GET /audio/default-voices`). The [id] is what we send as `voice` to
+/// `POST /audio/speech`.
+const List<TtsVoice> kZyphraVoices = [
+  TtsVoice('american-female-2', 'American Female 2 — Zyphra (default)'),
+  TtsVoice('american-female', 'American Female — Zyphra'),
+  TtsVoice('american-female-3', 'American Female 3 — Zyphra'),
+  TtsVoice('american-male', 'American Male — Zyphra'),
+  TtsVoice('american-male-2', 'American Male 2 — Zyphra'),
+  TtsVoice('british-female', 'British Female — Zyphra'),
+  TtsVoice('british-male', 'British Male — Zyphra'),
+  TtsVoice('irish-male', 'Irish Male — Zyphra'),
+  TtsVoice('japanese-female', 'Japanese Female — Zyphra'),
+  TtsVoice('japanese-male', 'Japanese Male — Zyphra'),
+  TtsVoice('anime-girl', 'Anime Girl — Zyphra'),
+  TtsVoice('energetic-boy', 'Energetic Boy — Zyphra'),
+  TtsVoice('energetic-girl', 'Energetic Girl — Zyphra'),
+];
+
+/// Every voice the app can send to a TTS backend (Kokoro for Lemonade, Zyphra
+/// for Zyphra Cloud). Ids don't collide across the two namespaces.
+const List<TtsVoice> kAllTtsVoices = [...kKokoroVoices, ...kZyphraVoices];
+
 /// Human label for a voice id (falls back to the raw id).
 String ttsVoiceLabel(String id) {
-  for (final v in kKokoroVoices) {
+  for (final v in kAllTtsVoices) {
     if (v.id == id) return v.label;
   }
   return id;

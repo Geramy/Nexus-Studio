@@ -101,11 +101,36 @@ class AiProvidersPage extends ConsumerWidget {
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (context, setState) => AlertDialog(
-          title: const Text('Add Lemonade Server'),
+          title: const Text('Add Inference Server'),
           content: SingleChildScrollView(
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
+                DropdownButtonFormField<String>(
+                  initialValue: selectedType,
+                  decoration: const InputDecoration(labelText: 'Provider'),
+                  items: const [
+                    DropdownMenuItem(
+                      value: 'lemonade',
+                      child: Text('Lemonade (LAN server)'),
+                    ),
+                    DropdownMenuItem(
+                      value: 'zyphra',
+                      child: Text('Zyphra Cloud'),
+                    ),
+                  ],
+                  onChanged: (v) {
+                    if (v == null) return;
+                    setState(() {
+                      selectedType = v;
+                      nameCtrl.text = suggestName(v);
+                      urlCtrl.text = v == 'zyphra'
+                          ? 'https://api.zyphracloud.com/api/v1'
+                          : 'http://localhost:13305';
+                    });
+                  },
+                ),
+                const SizedBox(height: 8),
                 TextField(
                   controller: nameCtrl,
                   decoration: const InputDecoration(
@@ -158,14 +183,16 @@ class AiProvidersPage extends ConsumerWidget {
                     // Store the key in the DB — that's what the coordinator
                     // client reads. (Also mirrored to SecureKeyStore below.)
                     apiKey: Value(apiKey),
-                    providerType: const Value('lemonade'),
+                    providerType: Value(selectedType),
                     maxConcurrency: const Value(4),
                     maxAgents: const Value(8),
                     isEnabled: const Value(true),
                     availableModelsJson: const Value('[]'),
                     extraConfigJson: const Value('{}'),
-                    capabilitiesJson: const Value(
-                      '{"isLemonade":true,"fullLemonadeManaged":true}',
+                    capabilitiesJson: Value(
+                      selectedType == 'zyphra'
+                          ? '{"isLemonade":false,"zyphra":true}'
+                          : '{"isLemonade":true,"fullLemonadeManaged":true}',
                     ),
                   ),
                 );

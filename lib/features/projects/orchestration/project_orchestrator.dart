@@ -961,7 +961,7 @@ class ProjectOrchestrator {
       name: chosen.name,
       baseUrl: chosen.baseUrl,
       apiKey: chosen.apiKey,
-      providerType: 'lemonade',
+      providerType: chosen.providerType,
       selectedModel: chosen.selectedModel,
       availableModels: models,
     );
@@ -969,8 +969,11 @@ class ProjectOrchestrator {
     // spreads different agents across the fleet (agent 1..N → server 1..N), instead
     // of every agent piling onto one box.
     return (
-      client: backendForServer(uiServer,
-          agentName: persona.name, sessionId: 'agent-${persona.agent_pk}'),
+      client: backendForServer(
+        uiServer,
+        agentName: persona.name,
+        sessionId: 'agent-${persona.agent_pk}',
+      ),
       model: model,
     );
   }
