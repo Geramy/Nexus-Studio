@@ -103,6 +103,25 @@ class ProjectOrchestrator {
   /// failing to submit rather than spinning forever.
   final Map<int, int> _attempts = {};
 
+  /// Cooldown after a task PARKS (it wanted a file another task holds). A park
+  /// deliberately does NOT count as an attempt (it's waiting, not failing), so
+  /// without this the task re-dispatches instantly — and when several tasks
+  /// contend for the same files they thrash in a tight busy-loop (grab → the
+  /// others park → yield → re-grab …), churning thousands of no-op dispatches and
+  /// flickering the board. A short cooldown turns that busy-loop into a calm
+  /// retry, giving the file's owner time to make progress / merge first.
+  final Map<int, DateTime> _parkedUntil = {};
+  static const Duration _parkCooldown = Duration(seconds: 12);
+
+  /// Tasks being REDONE after a merge conflict → a short hint (their prior
+  /// submission summary). Presence means "re-apply, don't rediscover": the redo
+  /// worker gets its previous plan plus a smaller turn budget ([_maxRedoTurns]),
+  /// because main already contains the sibling work it collided with, so it
+  /// should converge quickly rather than pay a full from-scratch implementation
+  /// again. Cleared once the redo submits.
+  final Map<int, String> _redoHint = {};
+  static const int _maxRedoTurns = 6;
+
   /// File-claim table for the same-file queue: normalized workspace path → the
   /// task_pk that currently OWNS it. A worker claims a file the first time it
   /// edits it and holds it until the task merges, so two tasks never submit
@@ -156,6 +175,54 @@ class ProjectOrchestrator {
       p = p.substring(1);
     }
     return p;
+  }
+
+  /// File paths a task DECLARES it will touch, mined from its title/description
+  /// (which the templater writes to name the file/area). A relative path with a
+  /// slash + extension (`prisma/schema.prisma`, `src/pages/api/x.ts`) or a
+  /// well-known root config file. Used to SEED [_taskFootprint] so the scope gate
+  /// serialises tasks that edit the same hot file (e.g. everyone adding models to
+  /// prisma/schema.prisma) from the very first pump — before any of them run and
+  /// collide — instead of only after they've each conflicted once. Prevents the
+  /// merge conflicts that drive the expensive resolve/redo cycle.
+  static final RegExp _declaredPathRe = RegExp(
+    r'\b([A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+\.[A-Za-z]{1,6}'
+    r'|package\.json|tsconfig\.json|schema\.prisma|Dockerfile|pubspec\.yaml'
+    r'|next\.config\.[jt]s|tailwind\.config\.[jt]s)\b',
+  );
+
+  /// Seed [taskPk]'s footprint with the files its text declares (idempotent —
+  /// unions into any already-learned set). No-op if nothing parses.
+  void _seedDeclaredFootprint(Task t) {
+    final text = '${t.title}\n${t.description ?? ''}';
+    Set<String>? fp;
+    for (final m in _declaredPathRe.allMatches(text)) {
+      (fp ??= (_taskFootprint[t.task_pk] ??= <String>{})).add(
+        _normFile(m.group(1)!),
+      );
+    }
+  }
+
+  /// Record that [t] is being REDONE after a merge conflict, stashing its prior
+  /// submission summary as a re-apply hint for the redo worker (see [_redoHint]).
+  /// Call BEFORE reopenTask, which clears the submission.
+  void _markRedo(Task t) {
+    var hint =
+        'This task is being REDONE because your previous attempt merge-conflicted '
+        'with a sibling task. main NOW INCLUDES that sibling work. Re-apply the '
+        'SAME change against the CURRENT code — build on what is already there, do '
+        'not assume a blank slate — and keep it tight.';
+    final s = t.submissionJson;
+    if (s != null && s.trim().isNotEmpty) {
+      try {
+        final summary =
+            (jsonDecode(s) as Map)['summary']?.toString().trim() ?? '';
+        if (summary.isNotEmpty) {
+          hint = '$hint\n\nWhat you built last time: $summary';
+        }
+      } catch (_) {}
+    }
+    _redoHint[t.task_pk] = hint;
   }
 
   /// After hitting the plan's concurrent-connection cap (HTTP 429), pause NEW
@@ -325,6 +392,8 @@ class ProjectOrchestrator {
     // always actually starts the work instead of immediately re-surfacing a
     // board full of Blocked tasks the user can't get past.
     _attempts.clear();
+    _parkedUntil.clear();
+    _redoHint.clear();
     _finalPassPrevCount = null;
     _finalPassStagnant = 0;
     unawaited(_db.requeueBlockedTasks(projectId));
@@ -743,6 +812,15 @@ class ProjectOrchestrator {
       if (_active.contains(t.task_pk)) continue;
       if ((_attempts[t.task_pk] ?? 0) >= _maxAttemptsPerTask) continue;
       if ((t.milestoneOrder ?? 0) > currentMilestone) continue;
+      // Park cooldown: a task that just parked on a held file waits a beat before
+      // it's eligible again, so contending tasks don't thrash in a busy-loop.
+      final until = _parkedUntil[t.task_pk];
+      if (until != null && DateTime.now().isBefore(until)) continue;
+      // Seed this task's footprint from the files it DECLARES (title/description)
+      // so the scope gate can serialise same-hot-file tasks from the first pump,
+      // before any of them run and collide — the cheapest way to cut merge
+      // conflicts (and the resolve/redo cost they cause) is to not create them.
+      _seedDeclaredFootprint(t);
       // Predictive scope gate: don't start a task that's known to edit files
       // another in-flight task holds — it would only collide and park. Leave it
       // on the board; it dispatches cleanly once the conflicting task merges.
@@ -939,13 +1017,20 @@ class ProjectOrchestrator {
       );
 
       var kickoff = prompts.render(OrchestratorPromptField.workerKickoff, vars);
+      // REDO (lighter): if this task is being re-applied after a merge conflict,
+      // lead with the re-apply hint (its prior plan) and give it a smaller turn
+      // budget — main already has the sibling work, so it should converge fast
+      // instead of paying a full from-scratch implementation again.
+      final redoHint = _redoHint[task.task_pk];
+      final maxTurns = redoHint != null ? _maxRedoTurns : _maxTurnsPerTask;
+      if (redoHint != null) kickoff = '$redoHint\n\n$kickoff';
       // Diagnostics carried across turns: did the model ever actually use a tool,
       // and did the backend ever drop tools (model can't tool-call)? A worker
       // that "hits turn cap without submission" on every task is almost always
       // one of these — surface it instead of failing silently.
       var sawToolActivity = false;
       var toolsRejected = false;
-      for (var turn = 0; turn < _maxTurnsPerTask && !_disposed; turn++) {
+      for (var turn = 0; turn < maxTurns && !_disposed; turn++) {
         // Stop promptly if the human paused/stopped the project mid-task — return
         // the task to the board instead of leaving it parked "In Progress".
         final project = await _db.getProjectById(projectId);
@@ -1015,10 +1100,21 @@ class ProjectOrchestrator {
               '(no stream for ${_turnIdleTimeout.inMinutes}m) — aborting, yielding back.',
             );
           } else if (_isNotTaskFault(e)) {
-            // 429 backpressure or a transient 5xx — NOT a failure. Undo this
-            // attempt so a busy/flaky gateway can never push the task to Blocked.
-            // It returns to the board and is retried once things recover.
+            // 429 backpressure or a transient 5xx/closed/network — NOT a failure.
+            // Undo this attempt so a busy/flaky gateway can never push the task to
+            // Blocked. But back it off first: a "transient" that keeps recurring
+            // (e.g. an over-large prompt that fails every call) would otherwise
+            // re-dispatch instantly and spin in a SILENT tight loop (no attempt
+            // cost, no log). The cooldown + this log turn that into a visible,
+            // calm retry. (429s already carry their own dispatch backoff via
+            // _isConnCap; this covers the other transient faults.)
             _undoAttempt(task.task_pk);
+            _parkedUntil[task.task_pk] = DateTime.now().add(_parkCooldown);
+            debugPrint(
+              '[Orchestrator p$projectId] task ${task.task_pk}: turn $turn '
+              'transient fault (${e.runtimeType}) — backing off '
+              '${_parkCooldown.inSeconds}s, yielding back.',
+            );
           } else {
             debugPrint(
               '[Orchestrator p$projectId] task ${task.task_pk}: turn $turn failed: $e',
@@ -1034,6 +1130,7 @@ class ProjectOrchestrator {
           // KEEP this task's file locks — they're held through the merge so no
           // other task can submit conflicting edits to the same files meanwhile.
           submitted = true;
+          _redoHint.remove(task.task_pk); // redo produced a submission — done
           debugPrint(
             '[Orchestrator p$projectId] task ${task.task_pk}: submitted for review.',
           );
@@ -1065,6 +1162,9 @@ class ProjectOrchestrator {
             }
           }
           _undoAttempt(task.task_pk);
+          // Back off before this task is eligible again, so it doesn't instantly
+          // re-dispatch and thrash against the file's owner (the busy-loop above).
+          _parkedUntil[task.task_pk] = DateTime.now().add(_parkCooldown);
           debugPrint(
             '[Orchestrator p$projectId] task ${task.task_pk}: parked — a file it '
             'needs is held by another task; work preserved, will resume after that task merges.',
@@ -1949,6 +2049,7 @@ class ProjectOrchestrator {
     final full = await _db.getTaskById(task.task_pk);
     if (full?.isEdit == true) {
       _undoAttempt(task.task_pk);
+      _markRedo(full!);
       await _db.reopenTask(task.task_pk);
       debugPrint(
         '[Orchestrator p$projectId] task ${task.task_pk}: editor merge conflict '
@@ -2077,9 +2178,25 @@ class ProjectOrchestrator {
       }
       kickoff = prompts.render(OrchestratorPromptField.mergeContinue, vars);
     }
+    // RESOLVER ONCE, THEN REDO: the resolver got one honest shot at the conflict
+    // and couldn't clear the markers (the weak local model can't reliably resolve
+    // them — this is what leaves tasks Blocked after 5 escalations, e.g. everyone
+    // adding models to prisma/schema.prisma). Rather than re-escalate the same
+    // failing resolver, REDO the task on fresh main: reopen it so the implement
+    // stage re-roots its branch onto the CURRENT target (which already has
+    // whatever merged first) and re-applies the change against a base where it no
+    // longer conflicts — for additive files that lands clean. The auto-merge
+    // committed nothing on conflict (the engine is conservative) and the resolver
+    // couldn't commit markers (the commit guard blocks them), so main is clean to
+    // redo onto. Bounded by _maxAttemptsPerTask. Editor tasks never reach here —
+    // they redo BEFORE the resolver (see the isEdit branch above).
     debugPrint(
-      '[Orchestrator p$projectId] task ${task.task_pk}: merge hit turn cap without resolution.',
+      '[Orchestrator p$projectId] task ${task.task_pk}: merge resolver could not '
+      'clear the conflict on one pass — redoing on fresh main instead of '
+      're-escalating.',
     );
+    _markRedo(task);
+    await _db.reopenTask(task.task_pk);
   }
 
   // ── Templater stage (one-shot base scaffold + milestone planning) ───────

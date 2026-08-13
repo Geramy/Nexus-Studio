@@ -3663,17 +3663,27 @@ class CoordinatorToolExecutor {
   /// and re-checking CI as each passes. Safe to call: if nothing is assignable
   /// the orchestrator just re-verifies and settles back to completed.
   Future<String> _startDelegatedBuild() async {
-    // 'editing' (not 'running') puts the orchestrator on the Editor FAST LANE:
-    // tasks skip the per-task verify + build gates and go straight to merge, and
-    // finalize is light (no linking pass, no double-check scan) — snappy edits
-    // instead of the full end-of-project ceremony. It still falls back to the
-    // full Testing phase if a change actually breaks the build.
-    await db.setProjectOrchestrationState(projectId, 'editing');
+    // ONLY the post-build Editor uses the 'editing' FAST LANE (skip per-task
+    // verify+build, light finalize). The SAME tool kicks off the INITIAL build
+    // from the story/coordinator flow — that MUST use the normal 'running'
+    // pipeline (full verify/build gates + full end-of-project Testing) so the
+    // first release is genuinely tested & launchable before the Editor ever
+    // takes over. Gating on editorMode is what keeps a first build out of the
+    // fast lane (which otherwise made tasks flick through states and surfaced the
+    // Editor UI mid-build).
+    if (editorMode) {
+      await db.setProjectOrchestrationState(projectId, 'editing');
+      return 'Build started — your assigned tasks run in parallel (up to the '
+          'account\'s agent limit), each on its own branch, merging into main as '
+          'soon as they submit (fast lane: no per-task test/build gate). It runs '
+          'in the background: tell the user it is underway and track it with '
+          'list_tasks / get_ci_run.';
+    }
+    await db.setProjectOrchestrationState(projectId, 'running');
     return 'Build started — your assigned tasks run in parallel (up to the '
-        'account\'s agent limit), each on its own branch, merging into main as '
-        'soon as they submit (fast lane: no per-task test/build gate). It runs in '
-        'the background: tell the user it is underway and track it with '
-        'list_tasks / get_ci_run.';
+        'account\'s agent limit), each on its own branch, integrating into main '
+        'and re-checking CI as they pass. It runs in the background: tell the '
+        'user it is underway and track it with list_tasks / get_ci_run.';
   }
 
   Future<String> _submitForCompletion(Map<String, dynamic> args) async {

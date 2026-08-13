@@ -950,11 +950,17 @@ class ProjectCoordinatorSession {
   /// one. Messages carrying tool_calls and `tool`-role results are left intact
   /// (they must keep their exact structure for tool-calling to work).
   /// Recent tool results kept VERBATIM on the wire; older ones are elided.
-  static const int _keepFullToolResults = 6;
+  static const int _keepFullToolResults = 4;
 
   /// Only old tool results bigger than this (chars) get elided — small status
   /// messages are left alone (they're cheap and often still relevant).
-  static const int _elideToolResultOver = 1200;
+  static const int _elideToolResultOver = 1000;
+
+  /// Matches a `read_file` tool result so we can dedupe: only the NEWEST full
+  /// copy of a given file needs to stay on the wire — any earlier read of the
+  /// SAME file is superseded and re-sending it verbatim every turn is pure waste
+  /// (observed: the same file read twice, both kept full).
+  static final RegExp _fileReadRe = RegExp(r'^File "([^"]+)" contents:');
 
   /// Context compaction. A worker re-sends its ENTIRE history on every tool
   /// round, across up to a dozen turns, so every file it read early is re-billed
@@ -972,21 +978,40 @@ class ProjectCoordinatorSession {
       for (var i = 0; i < msgs.length; i++)
         if (msgs[i]['role'] == 'tool') i,
     ];
-    if (toolIdx.length <= _keepFullToolResults) return msgs;
+    // The newest wire index at which each file was read — any EARLIER read of
+    // the same file is stale and gets elided even if it's within the keep window
+    // (dedupe), because the newest copy already carries the current contents.
+    final latestReadOf = <String, int>{};
+    for (final i in toolIdx) {
+      final match = _fileReadRe.firstMatch((msgs[i]['content'] ?? '').toString());
+      if (match != null) latestReadOf[match.group(1)!] = i;
+    }
     // Everything before this index is "old" and eligible for elision.
-    final keepFrom = toolIdx[toolIdx.length - _keepFullToolResults];
+    final keepFrom = toolIdx.length <= _keepFullToolResults
+        ? 0
+        : toolIdx[toolIdx.length - _keepFullToolResults];
+    if (toolIdx.length <= _keepFullToolResults && latestReadOf.length == toolIdx.length) {
+      return msgs; // nothing old AND no duplicate reads → nothing to compact
+    }
     final out = <Map<String, dynamic>>[];
     for (var i = 0; i < msgs.length; i++) {
       final m = msgs[i];
-      if (m['role'] == 'tool' && i < keepFrom) {
+      if (m['role'] == 'tool') {
         final content = (m['content'] ?? '').toString();
-        if (content.length > _elideToolResultOver) {
+        final fileMatch = _fileReadRe.firstMatch(content);
+        // Stale if it's an OLD result OR a superseded duplicate read of a file
+        // that was read again later in the conversation.
+        final supersededDup =
+            fileMatch != null && latestReadOf[fileMatch.group(1)] != i;
+        if ((i < keepFrom || supersededDup) &&
+            content.length > _elideToolResultOver) {
+          final what = fileMatch != null ? '"${fileMatch.group(1)}"' : 'a resource';
           out.add({
             ...m,
             'content':
-                '[earlier tool output elided to save context '
-                '(${content.length} chars). Re-read the file/resource if you '
-                'still need it.]',
+                '[earlier read of $what elided to save context '
+                '(${content.length} chars). Re-read it if you still need its '
+                'current contents.]',
           });
           continue;
         }
