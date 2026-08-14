@@ -1283,17 +1283,12 @@ class ProjectOrchestrator {
     } catch (_) {}
     b.write('''
 
-=== FULLY IMPLEMENT — NO STUBS (your task is REJECTED if you leave any) ===
-- Actually BUILD the feature. Do NOT leave TODO/FIXME comments, empty method bodies, `UnimplementedError`, "not yet implemented", "coming soon", or placeholder screens/text. Compiling is NOT the bar — a working, wired-up feature is.
-- WIRE IT IN where the task tells you to. If your feature must be reachable (a screen/route/button/menu/tab/handler), make the SMALLEST ADDITIVE change to the shared router / navigation / entrypoint so the app actually reaches it. An orphaned widget or service that nothing routes to or calls is an INCOMPLETE task — link it exactly where the task says it belongs. (Adding your one entry to a shared glue file is explicitly allowed — see STAY IN YOUR LANE.)
-- If your task depends on something not built yet, implement your own part FULLY against the expected interface; never stub your own feature to "make it compile".
-- Do NOT hand-write GENERATED files (`*.g.dart`, `*.freezed.dart`, `*.mocks.dart`, `*.pb.dart`). Write the SOURCE (the drift table/DAO, freezed/json_serializable model, etc.) with its `part '...g.dart';` directive and let the build run code generation — a hand-faked generated file is the source of hundreds of mismatched-type errors. Make sure the codegen deps (`build_runner` + the generator, e.g. `drift_dev`) are in pubspec dev_dependencies if your feature needs them.
-- Review verifies this and sends the task back if it finds any placeholder markers, so finish it for real the first time.
-
-=== STAY IN YOUR LANE (this is how parallel tasks avoid overwriting each other) ===
-- Implement ONLY your task's artifact (the file[s] this task is about). Other tasks own the other files — do NOT rewrite or "improve" a file that belongs to another task.
-- When you need something another task provides (a model, service, route, widget), READ its contract/interface file (the scaffold declares shared components as complete interfaces) and code EXACTLY to its DECLARED members — do NOT recreate it, and do NOT call methods/fields it doesn't declare. If a member you need is genuinely absent from the contract, add it to that interface as the SMALLEST additive change (so the implementer sees it) rather than inventing a call to a method that doesn't exist. If the component YOU own declares an interface (abstract members / a contract), implement EVERY declared member.
-- The scaffold ALREADY wired the shared glue — `main.dart` / the app entry, the route/navigation table, the DI/service container, barrel exports, and the manifest (pubspec/package.json) declare every screen/service/dependency up front. So DON'T edit those files: your screen/route/service is already registered — just fill in your own file's body. Editing a shared glue file makes your branch collide with other tasks and get Blocked on merge. ONLY if your entry is genuinely missing from the glue, make the SMALLEST ADDITIVE change (add just your one line) — never rewrite or reformat the file.''');
+=== RULES ===
+- FULLY IMPLEMENT your file(s): a working, wired feature — NOT just compiling. No TODO/FIXME/UnimplementedError/"coming soon"/placeholder bodies (Review scans for these and bounces the task).
+- WIRE IT IN: if your feature must be reachable, make the SMALLEST additive change to the shared entry/router so the app reaches it — an orphaned widget/service is incomplete.
+- STAY IN YOUR LANE: implement ONLY your task's file(s); other tasks own theirs. To use another component, READ its declared contract/interface and code to its EXACT members — don't recreate it or call members it doesn't declare.
+- SHARED GLUE IS COMPLETE — the scaffold already declared the DB schema, main/entry, router/nav, DI container, barrels, and manifest/deps. Code AGAINST them; do NOT edit them (editing collides with siblings → Blocked on merge). Only if your entry is genuinely MISSING, add your ONE line additively — never rewrite the file.
+- Do NOT hand-write generated files (`*.g.dart`/`*.freezed.dart`/`*.mocks.dart`): write the SOURCE with its `part '...g.dart';` directive and let codegen run (deps go in dev_dependencies).''');
     return b.toString().trimRight();
   }
 

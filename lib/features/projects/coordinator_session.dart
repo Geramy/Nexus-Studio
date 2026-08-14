@@ -4,6 +4,8 @@
 
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart' show debugPrint;
+
 import 'package:nexus_projects_client/infrastructure/database/nexus_database.dart';
 // Backward-compat types (InferenceClient = InferenceBackend).
 import 'package:nexus_projects_client/infrastructure/inference/inference_client.dart';
@@ -210,6 +212,36 @@ class ProjectCoordinatorSession {
       : kDefaultOmniCollection;
 
   List<Map<String, dynamic>> get history => List.unmodifiable(_history);
+
+  // ── Token-cost instrumentation (investigation) ────────────────────────────
+  /// Per-turn counter for THIS session instance (a worker session is one
+  /// dispatch), so the `[tok]` lines read as a per-agent turn sequence.
+  int _tokTurn = 0;
+
+  /// Log the SIZE of the wire prompt about to be sent (chars → ~tokens) so a
+  /// run's log reveals how much context each turn re-sends and where the volume
+  /// concentrates. Estimate (chars/4); the server-reported figure (when a
+  /// non-streaming call returns usage) is logged by [_logServerUsage].
+  void _logWirePrompt(List<Map<String, dynamic>> messages) {
+    var chars = 0;
+    for (final m in messages) {
+      chars += (m['content']?.toString().length ?? 0);
+    }
+    debugPrint(
+      '[tok] agent="$agentName" turn=${_tokTurn++} '
+      'prompt~=${chars ~/ 4} tok ($chars chars, ${messages.length} msgs)',
+    );
+  }
+
+  /// Log SERVER-REPORTED usage when a call returns it (the non-streaming paths).
+  /// Ground truth for whether cache_prompt actually cuts BILLED prompt tokens.
+  void _logServerUsage(Usage? u) {
+    if (u == null) return;
+    debugPrint(
+      '[tok] agent="$agentName" SERVER usage: prompt=${u.promptTokens} '
+      'completion=${u.completionTokens} total=${u.totalTokens}',
+    );
+  }
 
   /// A full OpenAI-shape conversation trace (system + history) for the training
   /// sink. [sys] is the system prompt used this turn.
@@ -423,13 +455,16 @@ class ProjectCoordinatorSession {
 
     final effectiveTools = tools ?? CoordinatorTools.buildToolSchemas();
 
+    _logWirePrompt(messages);
     final response = await client.createChatCompletion(
       model: _effectiveModel,
       messages: messages,
       tools: effectiveTools,
       temperature: 0.7,
       enableThinking: enableThinking,
+      extra: const {'cache_prompt': true},
     );
+    _logServerUsage(response.usage);
 
     _history.add({'role': 'user', 'content': userMessage});
     if (response.choices.isNotEmpty) {
@@ -474,6 +509,7 @@ class ProjectCoordinatorSession {
 
     final effectiveTools = tools ?? CoordinatorTools.buildToolSchemas();
 
+    _logWirePrompt(messages);
     yield* client.streamChatCompletion(
       model: _effectiveModel,
       messages: messages,
@@ -482,6 +518,7 @@ class ProjectCoordinatorSession {
       repeatPenalty: _kRepeatPenalty,
       maxCompletionTokens: _kMaxCompletionTokens,
       enableThinking: enableThinking,
+      extra: const {'cache_prompt': true},
     );
   }
 
@@ -1188,6 +1225,7 @@ class ProjectCoordinatorSession {
     // cap (429 / too_many_connections) with backoff — that's transient pressure
     // (a busy slot frees up shortly), NOT a request-shape problem, so retrying
     // beats both failing the turn AND falling through to the no-tools fallback.
+    _logWirePrompt(messages);
     var emitted = false;
     for (var attempt = 0; attempt <= 3; attempt++) {
       try {
@@ -1199,6 +1237,10 @@ class ProjectCoordinatorSession {
           repeatPenalty: _kRepeatPenalty,
           maxCompletionTokens: _kMaxCompletionTokens,
           enableThinking: enableThinking,
+          // Reuse the server KV cache for the stable prefix (system + prior
+          // turns) instead of re-prefilling the whole context every turn — the
+          // dominant build-time cost. Harmless on backends that ignore it.
+          extra: const {'cache_prompt': true},
         )) {
           emitted = true;
           yield ev;
@@ -1284,6 +1326,7 @@ class ProjectCoordinatorSession {
     List<Map<String, dynamic>> messages,
     List<Map<String, dynamic>>? tools,
   ) async* {
+    _logWirePrompt(messages);
     final resp = await client.createChatCompletion(
       model: _effectiveModel,
       messages: messages,
@@ -1292,7 +1335,9 @@ class ProjectCoordinatorSession {
       repeatPenalty: _kRepeatPenalty,
       maxCompletionTokens: _kMaxCompletionTokens,
       enableThinking: enableThinking,
+      extra: const {'cache_prompt': true},
     );
+    _logServerUsage(resp.usage);
     final msg = resp.choices.isNotEmpty ? resp.choices.first.message : null;
     final content = msg?.content ?? '';
     if (content.isNotEmpty) yield ChatContentDelta(content);

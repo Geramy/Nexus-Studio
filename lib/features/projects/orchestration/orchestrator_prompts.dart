@@ -129,20 +129,14 @@ Work branch: "{branch}" — every commit you make must land on this branch.
 
 Build this task with the project's stack from the PROJECT BASELINE above — use its languages, frameworks, databases, libraries, and services (and only those). Implement the task end-to-end, then commit to your branch with git_commit.
 
-WORK EFFICIENTLY — you have a LIMITED number of turns, so converge, don't wander:
-- Read ONLY the files THIS task touches. Do NOT re-list directories or re-read files you've already read this session — their contents are still in context. The PROJECT BASELINE and layer plans are already given above; do not re-read the plans.
-- After a successful create_file / write_file / edit_file, the change is SAVED — do NOT read the file back to confirm it, and do NOT re-read a file just to make another edit to it (you already have its current contents). Batch all your edits to one file together.
-- Use the CURRENT PROJECT FILES list above to know what exists — do NOT read_file a path that isn't on it (the read just fails and wastes the turn).
-- Move to editing quickly: read a file → edit it → next. Don't survey the whole project before writing.
-- If a file is "held by another task", do NOT retry it — edit a different file and let it merge later. Repeating a blocked write wastes your turns.
-- SHARED GLUE IS OWNED AND COMPLETE — do NOT edit it. The base scaffold already declared the DB SCHEMA (every model/table you need), the app entry / `main`, the ROUTE/NAV table, the DI container, and the manifest/dependencies. Code AGAINST the existing models, routes and deps — do NOT add a model to the schema file, a route to the router, or a package to the manifest. Editing a shared file collides with sibling tasks and Blocks the merge. If something you need genuinely isn't declared, implement your feature against what IS there and note the gap in your submission — never edit the shared file to add it.
-- `git_log` shows YOUR task branch. Once you see your commit there, TRUST that it landed — do not re-commit the same work.
+WORK EFFICIENTLY — each step re-processes your WHOLE context, so do the MOST per step and finish in as FEW steps as possible:
+- BATCH your tool calls: issue MULTIPLE at once in a SINGLE step. Read ALL the files you need together (several read_file calls in one step), then write ALL your files together, then commit. Do NOT go one file per step — that multiplies the cost. Aim for: read-everything → write-everything → commit → submit, in a handful of steps.
+- Read ONLY files THIS task touches; don't re-list dirs or re-read files already in context (they're still here). After a create/edit it's SAVED — don't read it back. Don't read_file a path not in CURRENT PROJECT FILES (it just fails). If a file is "held by another task", don't retry — edit something else. Trust your commit once git_log shows it; don't re-commit.
+- Do NOT run build/analyze/CI yourself — it runs ONCE at project end. If this task was bounced, its Description has the FULL error list — fix EVERY error in one pass before resubmitting.
 
-FINISH AND SUBMIT — this is how the task completes:
-- Do NOT run the build, analyze, or CI yourself — the project's full CI/test runs ONCE at the very end, not per task. Spend your turns writing correct, compiling code and committing it. If this task was previously bounced, the reason is in its Description above — under a "[Build gate FAILED …]" block or verification note with the FULL error list (e.g. from the end-of-project CI scan); fix EVERY listed error in one pass (don't stop after the first) before resubmitting.
-- The MOMENT the work is committed, call submit_for_completion with task_id={taskId}, a concise summary, and your evidence (what you changed, diffs). Do NOT keep exploring or polishing after that — submitting is the ONLY way the task leaves "In Progress". A task that is done but never submitted is wasted work. Leave push and merge to the Coordinator.''',
+FINISH: the MOMENT your work is committed, call submit_for_completion (task_id={taskId}, concise summary, evidence) — that's the ONLY way it leaves "In Progress". Don't keep polishing after; unsubmitted work is wasted. Push/merge are the Coordinator's job.''',
   OrchestratorPromptField.workerKickoff:
-      'Begin implementing your assigned task (#{taskId}) now. Work autonomously and commit to branch "{branch}". As soon as it is committed, call submit_for_completion — do not keep working past that.',
+      'Begin implementing your assigned task (#{taskId}) now. Work in as FEW steps as possible — batch your file reads together, then write all your files, then commit. As soon as it is committed, call submit_for_completion — do not keep working past that.',
   OrchestratorPromptField.workerContinue:
       'Continue — but converge. If the task is already implemented and committed to "{branch}", call submit_for_completion NOW (task_id={taskId}, summary, evidence) — do NOT re-read files or re-explore. Otherwise make the next concrete edit toward done. Do not repeat a tool call you already made.',
   OrchestratorPromptField.verifyFraming: '''
