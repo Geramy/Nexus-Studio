@@ -114,9 +114,8 @@ class TaskGenerator extends ChangeNotifier {
       // — it's the Templater's base spec (the scaffold is built from it) and is
       // NOT turned into a worker task. EVERY other node, at any depth (not just
       // the leaves), becomes task(s) so mid-tree stories aren't skipped.
-      final roots =
-          stories.where((s) => s.parent_story_fk == null).toList()
-            ..sort((a, b) => a.orderIndex.compareTo(b.orderIndex));
+      final roots = stories.where((s) => s.parent_story_fk == null).toList()
+        ..sort((a, b) => a.orderIndex.compareTo(b.orderIndex));
       final templaterRootPk = roots.isNotEmpty ? roots.first.story_pk : null;
       // Parent-first order so a child story's tasks can link UNDER its parent
       // story's task — the task tree then mirrors the story tree instead of
@@ -147,79 +146,145 @@ class TaskGenerator extends ChangeNotifier {
       // story's tasks are generated within the project's locked tech choices.
       final profile = await buildProjectBaseline(db, projectId);
 
-      for (final s in buildable) {
-        _setStory(s.story_pk, const StoryGen(StoryGenStatus.generating));
-        // The parent anchor: a child story's tasks hang under its parent story's
-        // first task, so the task tree mirrors the story tree. A story whose
-        // parent is the Templater root (or which has no parent) is top-level.
-        final parentStoryPk = s.parent_story_fk;
-        final parentTaskPk =
-            (parentStoryPk != null && parentStoryPk != templaterRootPk)
-            ? storyRepTask[parentStoryPk]
-            : null;
-        try {
-          // _tasksForStory swallows AI/parse errors and returns [] so a flaky or
-          // unconfigured backend degrades to the one-task-per-story fallback
-          // below rather than producing ZERO tasks for the whole run.
-          final specs = await _tasksForStory(db, resolved, sys, profile, s);
-          var made = 0;
-          for (final t in specs) {
-            final title = (t['title'] ?? '').toString().trim();
-            if (title.isEmpty) continue;
-            final ac = (t['acceptance_criteria'] ?? '').toString().trim();
-            final layer = (t['layer'] ?? '').toString().trim();
-            // Route each task to a layer-appropriate specialist persona when one
-            // exists (UI/UX for client, Database for db, …), else the worker.
-            final agentPk = await resolveWorkerPersonaForLayer(
-              db,
-              projectId,
-              layer,
-              fallback: worker,
-            );
-            final taskPk = await db.createTaskInProject(
-              projectPk: projectId,
-              title: title,
-              description: (t['description'] ?? '').toString().trim(),
-              acceptanceCriteria: ac.isEmpty ? null : ac,
-              verification: ac.isEmpty
-                  ? null
-                  : 'Confirm every acceptance criterion above is satisfied; run '
-                        'the project\'s build/tests where applicable.',
-              agentPk: agentPk,
-              storyPk: s.story_pk,
-              parentPk: parentTaskPk,
-            );
-            storyRepTask.putIfAbsent(s.story_pk, () => taskPk);
-            made++;
-          }
-          // Never leave a story with zero tasks — fall back to one task = story.
-          if (made == 0) {
-            final taskPk = await db.createTaskInProject(
-              projectPk: projectId,
-              title: s.title,
-              description: s.narrative,
-              agentPk: worker,
-              storyPk: s.story_pk,
-              parentPk: parentTaskPk,
-            );
-            storyRepTask.putIfAbsent(s.story_pk, () => taskPk);
-            made = 1;
-          }
-          totalTasks += made;
-          _setStory(s.story_pk, StoryGen(StoryGenStatus.done, made));
-        } catch (e) {
-          // A story only lands here if even the fallback task INSERT threw — a
-          // real DB/code break, not just a missing AI backend. Record it so the
-          // UI can report "N stories failed: <reason>" instead of a silent 0.
-          debugPrint('task-gen for story #${s.story_pk} failed: $e');
-          failedStories++;
-          _setStory(s.story_pk, const StoryGen(StoryGenStatus.error));
-          _emit(progress.copyWith(failedStories: failedStories, error: '$e'));
-        }
-        doneStories++;
-        _emit(
-          progress.copyWith(doneStories: doneStories, totalTasks: totalTasks),
+      // TOKEN LEVER (C): cluster related stories into FEWER, FATTER tasks so the
+      // build spins up far fewer cold-start worker sessions (each re-establishes
+      // the whole context). Falls back to the per-story path below when grouping
+      // isn't worth it or the AI is unavailable.
+      // Deterministic title-keyword clustering first (reliable — the routed
+      // model won't emit the clustering JSON), then the story-tree structure as
+      // a fallback for genuinely nested trees.
+      final groups =
+          _groupStoriesByKeyword(buildable) ??
+          _groupStoriesByTree(buildable, stories, templaterRootPk);
+      if (groups != null) {
+        // ignore: avoid_print
+        print(
+          '[TaskGen] grouped ${buildable.length} stories → ${groups.length} '
+          'feature-area task sets for project $projectId',
         );
+        for (final group in groups) {
+          for (final s in group) {
+            _setStory(s.story_pk, const StoryGen(StoryGenStatus.generating));
+          }
+          final rep = group.first;
+          try {
+            final specs = group.length == 1
+                ? await _tasksForStory(db, resolved, sys, profile, rep)
+                : await _tasksForGroup(db, resolved, profile, group);
+            var made = await _createTasksFromSpecs(
+              db,
+              specs,
+              storyPk: rep.story_pk,
+              parentPk: null,
+              worker: worker,
+            );
+            if (made == 0) {
+              // Never leave an area with zero tasks: one combined task, and fold
+              // in every story's narrative so no context is lost.
+              final combined = group
+                  .map((s) => '### ${s.title}\n${s.narrative.trim()}')
+                  .join('\n\n');
+              await db.createTaskInProject(
+                projectPk: projectId,
+                title: rep.title,
+                description: combined,
+                agentPk: worker,
+                storyPk: rep.story_pk,
+              );
+              made = 1;
+            }
+            totalTasks += made;
+            for (final s in group) {
+              _setStory(s.story_pk, StoryGen(StoryGenStatus.done, made));
+              doneStories++;
+            }
+          } catch (e) {
+            debugPrint('task-gen for group "${rep.title}" failed: $e');
+            failedStories += group.length;
+            for (final s in group) {
+              _setStory(s.story_pk, const StoryGen(StoryGenStatus.error));
+            }
+            _emit(progress.copyWith(failedStories: failedStories, error: '$e'));
+          }
+          _emit(
+            progress.copyWith(doneStories: doneStories, totalTasks: totalTasks),
+          );
+        }
+      } else {
+        for (final s in buildable) {
+          _setStory(s.story_pk, const StoryGen(StoryGenStatus.generating));
+          // The parent anchor: a child story's tasks hang under its parent story's
+          // first task, so the task tree mirrors the story tree. A story whose
+          // parent is the Templater root (or which has no parent) is top-level.
+          final parentStoryPk = s.parent_story_fk;
+          final parentTaskPk =
+              (parentStoryPk != null && parentStoryPk != templaterRootPk)
+              ? storyRepTask[parentStoryPk]
+              : null;
+          try {
+            // _tasksForStory swallows AI/parse errors and returns [] so a flaky or
+            // unconfigured backend degrades to the one-task-per-story fallback
+            // below rather than producing ZERO tasks for the whole run.
+            final specs = await _tasksForStory(db, resolved, sys, profile, s);
+            var made = 0;
+            for (final t in specs) {
+              final title = (t['title'] ?? '').toString().trim();
+              if (title.isEmpty) continue;
+              final ac = (t['acceptance_criteria'] ?? '').toString().trim();
+              final layer = (t['layer'] ?? '').toString().trim();
+              // Route each task to a layer-appropriate specialist persona when one
+              // exists (UI/UX for client, Database for db, …), else the worker.
+              final agentPk = await resolveWorkerPersonaForLayer(
+                db,
+                projectId,
+                layer,
+                fallback: worker,
+              );
+              final taskPk = await db.createTaskInProject(
+                projectPk: projectId,
+                title: title,
+                description: (t['description'] ?? '').toString().trim(),
+                acceptanceCriteria: ac.isEmpty ? null : ac,
+                verification: ac.isEmpty
+                    ? null
+                    : 'Confirm every acceptance criterion above is satisfied; run '
+                          'the project\'s build/tests where applicable.',
+                agentPk: agentPk,
+                storyPk: s.story_pk,
+                parentPk: parentTaskPk,
+              );
+              storyRepTask.putIfAbsent(s.story_pk, () => taskPk);
+              made++;
+            }
+            // Never leave a story with zero tasks — fall back to one task = story.
+            if (made == 0) {
+              final taskPk = await db.createTaskInProject(
+                projectPk: projectId,
+                title: s.title,
+                description: s.narrative,
+                agentPk: worker,
+                storyPk: s.story_pk,
+                parentPk: parentTaskPk,
+              );
+              storyRepTask.putIfAbsent(s.story_pk, () => taskPk);
+              made = 1;
+            }
+            totalTasks += made;
+            _setStory(s.story_pk, StoryGen(StoryGenStatus.done, made));
+          } catch (e) {
+            // A story only lands here if even the fallback task INSERT threw — a
+            // real DB/code break, not just a missing AI backend. Record it so the
+            // UI can report "N stories failed: <reason>" instead of a silent 0.
+            debugPrint('task-gen for story #${s.story_pk} failed: $e');
+            failedStories++;
+            _setStory(s.story_pk, const StoryGen(StoryGenStatus.error));
+            _emit(progress.copyWith(failedStories: failedStories, error: '$e'));
+          }
+          doneStories++;
+          _emit(
+            progress.copyWith(doneStories: doneStories, totalTasks: totalTasks),
+          );
+        }
       }
 
       // Leave the Exploration phase and start orchestration only once done.
@@ -237,8 +302,10 @@ class TaskGenerator extends ChangeNotifier {
         await db.setProjectTemplateStatus(projectId, 'pending');
         await db.setProjectOrchestrationState(projectId, 'running');
         // ignore: avoid_print
-        print('[TaskGen] done: $totalTasks task(s); set templateStatus=pending, '
-            'orchestrationState=running for project $projectId');
+        print(
+          '[TaskGen] done: $totalTasks task(s); set templateStatus=pending, '
+          'orchestrationState=running for project $projectId',
+        );
       }
       _emit(progress.copyWith(running: false, done: true));
     } catch (e, st) {
@@ -258,9 +325,8 @@ class TaskGenerator extends ChangeNotifier {
   /// dropping [rootPk] (the Templater's base spec). A story whose parent is the
   /// root or null is top-level. Cycle/orphan leftovers are appended as-is.
   List<UserStory> _storiesParentFirst(List<UserStory> all, int? rootPk) {
-    final remaining =
-        all.where((s) => s.story_pk != rootPk).toList()
-          ..sort((a, b) => a.orderIndex.compareTo(b.orderIndex));
+    final remaining = all.where((s) => s.story_pk != rootPk).toList()
+      ..sort((a, b) => a.orderIndex.compareTo(b.orderIndex));
     final out = <UserStory>[];
     final added = <int>{};
     bool parentReady(int? p) => p == null || p == rootPk || added.contains(p);
@@ -290,8 +356,7 @@ class TaskGenerator extends ChangeNotifier {
     if (resolved == null) return const [];
     final notes = await db.getNotesForStory(s.story_pk);
     final ac = (s.acceptanceCriteria ?? '').trim();
-    final b = StringBuffer()
-      ..writeln('STORY: ${s.title}');
+    final b = StringBuffer()..writeln('STORY: ${s.title}');
     if (s.narrative.trim().isNotEmpty) {
       b.writeln('Narrative: ${s.narrative.trim()}');
     }
@@ -318,6 +383,388 @@ class TaskGenerator extends ChangeNotifier {
       return parseJsonObjectArray(raw);
     } catch (e) {
       debugPrint('task-gen scoped call for story #${s.story_pk} failed: $e');
+      return const [];
+    }
+  }
+
+  /// Create the DB tasks for a list of AI-produced task [specs], routing each to
+  /// a layer-appropriate persona. Returns how many were created. Shared by the
+  /// per-story and grouped paths.
+  Future<int> _createTasksFromSpecs(
+    NexusDatabase db,
+    List<Map<String, dynamic>> specs, {
+    required int storyPk,
+    required int? parentPk,
+    required int? worker,
+    void Function(int firstTaskPk)? onFirstTask,
+  }) async {
+    var made = 0;
+    for (final t in specs) {
+      final title = (t['title'] ?? '').toString().trim();
+      if (title.isEmpty) continue;
+      final ac = (t['acceptance_criteria'] ?? '').toString().trim();
+      final layer = (t['layer'] ?? '').toString().trim();
+      final agentPk = await resolveWorkerPersonaForLayer(
+        db,
+        projectId,
+        layer,
+        fallback: worker,
+      );
+      final taskPk = await db.createTaskInProject(
+        projectPk: projectId,
+        title: title,
+        description: (t['description'] ?? '').toString().trim(),
+        acceptanceCriteria: ac.isEmpty ? null : ac,
+        verification: ac.isEmpty
+            ? null
+            : 'Confirm every acceptance criterion above is satisfied; run '
+                  'the project\'s build/tests where applicable.',
+        agentPk: agentPk,
+        storyPk: storyPk,
+        parentPk: parentPk,
+      );
+      if (made == 0) onFirstTask?.call(taskPk);
+      made++;
+    }
+    return made;
+  }
+
+  /// Common words that don't identify a feature area — dropped before keyword
+  /// clustering so stories group on their real subject (account, product, …).
+  static const Set<String> _stopWords = {
+    'the',
+    'a',
+    'an',
+    'and',
+    'or',
+    'of',
+    'to',
+    'for',
+    'in',
+    'on',
+    'with',
+    'my',
+    'their',
+    'as',
+    'i',
+    'want',
+    'so',
+    'that',
+    'can',
+    'be',
+    'able',
+    'view',
+    'see',
+    'manage',
+    'add',
+    'edit',
+    'create',
+    'update',
+    'delete',
+    'remove',
+    'set',
+    'get',
+    'use',
+    'using',
+    'via',
+    'from',
+    'is',
+    'are',
+    'it',
+    'this',
+    'page',
+    'pages',
+    'system',
+    'feature',
+    'user',
+    'users',
+    'app',
+    'when',
+    'where',
+    'which',
+    'into',
+    'per',
+    'each',
+    'all',
+    'any',
+    'new',
+    'own',
+    'support',
+    'ability',
+    'allow',
+    'let',
+    'lets',
+  };
+
+  /// Deterministic title-keyword clustering — NO AI (the routed model won't
+  /// reliably emit the clustering JSON). Groups stories that share a significant
+  /// title word: all "…Account…" together, all "…Product…" together, etc. —
+  /// exactly "scan the titles and group like ones". Each story joins the group
+  /// of its MOST-SHARED title word; a story whose words are all unique stays its
+  /// own group. Returns null if it can't meaningfully reduce, or would collapse
+  /// nearly everything into one mega-group (so the caller falls through).
+  List<List<UserStory>>? _groupStoriesByKeyword(List<UserStory> buildable) {
+    if (buildable.length < 6) return null;
+    String stem(String w) =>
+        // Crude singularisation so "products"/"product" share a key.
+        (w.length > 4 && w.endsWith('s')) ? w.substring(0, w.length - 1) : w;
+
+    final wordsOf = <int, Set<String>>{};
+    final freq = <String, int>{};
+    for (final s in buildable) {
+      final ws = <String>{};
+      // Split on ANY non-alphanumeric so "Return/Refund", "add/list" yield their
+      // real words instead of one glued token.
+      for (final tok in s.title.toLowerCase().split(RegExp(r'[^a-z0-9]+'))) {
+        final w = stem(tok);
+        if (w.length < 3 || _stopWords.contains(w)) continue;
+        ws.add(w);
+      }
+      wordsOf[s.story_pk] = ws;
+      for (final w in ws) {
+        freq[w] = (freq[w] ?? 0) + 1;
+      }
+    }
+    final byTheme = <String, List<UserStory>>{};
+    final order = <String>[];
+    var solo = 0;
+    for (final s in buildable) {
+      final shared =
+          wordsOf[s.story_pk]!.where((w) => (freq[w] ?? 0) >= 2).toList()
+            ..sort((a, b) => (freq[b] ?? 0).compareTo(freq[a] ?? 0));
+      final theme = shared.isEmpty ? '__solo${solo++}' : shared.first;
+      byTheme
+          .putIfAbsent(theme, () {
+            order.add(theme);
+            return <UserStory>[];
+          })
+          .add(s);
+    }
+    final groups = [for (final t in order) byTheme[t]!];
+    final biggest = groups.fold<int>(0, (m, g) => g.length > m ? g.length : m);
+    // Must reduce, and must not lump the majority into one group.
+    if (groups.length < 2 ||
+        groups.length >= buildable.length ||
+        biggest * 10 > buildable.length * 7) {
+      return null;
+    }
+    // ignore: avoid_print
+    print(
+      '[TaskGen] keyword-grouped ${buildable.length} stories → '
+      '${groups.length} theme(s) (biggest area=$biggest)',
+    );
+    return groups;
+  }
+
+  /// AI clustering — kept for when the backend can reliably return the JSON
+  /// (today the routed model returns empty content, so [run] uses the
+  /// deterministic keyword clusterer instead). NEVER drops a story.
+  // ignore: unused_element
+  Future<List<List<UserStory>>?> _groupStories(
+    NexusDatabase db,
+    ({InferenceBackend backend, String model})? resolved,
+    List<UserStory> stories,
+  ) async {
+    if (resolved == null || stories.length < 6)
+      return null; // too few to bother
+    final byPk = {for (final s in stories) s.story_pk: s};
+    final b = StringBuffer()
+      ..writeln('User stories to cluster (id — title — one-line):');
+    for (final s in stories) {
+      final oneLine = s.narrative.trim().split('\n').first;
+      final snippet = oneLine.length > 110
+          ? oneLine.substring(0, 110)
+          : oneLine;
+      b.writeln('#${s.story_pk} — ${s.title} — $snippet');
+    }
+    final target = (stories.length / 2.5).ceil().clamp(3, stories.length);
+    const sys =
+        'You group user stories into cohesive FEATURE AREAS so each area is built '
+        'as ONE larger task set instead of many tiny per-story tasks. Cluster by '
+        'shared subject — e.g. accounts/auth, admin, products/catalog, '
+        'search & filtering, cart & checkout, orders, reviews, shipping. Put '
+        'stories about the SAME area in one group; keep a genuinely standalone '
+        'story in its own group. Return ONLY a JSON array (no prose, no fences): '
+        '[{"title": "<feature area>", "story_pks": [<ids>]}]. Every id appears in '
+        'exactly one group.';
+    try {
+      final raw = await scopedComplete(
+        backend: resolved.backend,
+        model: resolved.model,
+        // Big budget: this model tends to ignore enableThinking:false and burn
+        // tokens reasoning before the JSON — too small a cap returns EMPTY
+        // content (observed raw=0c). Give it room for think + output.
+        maxTokens: 4000,
+        system: sys,
+        user: 'Aim for roughly $target groups.\n\n$b',
+      );
+      var arr = parseJsonObjectArray(raw);
+      if (arr.isEmpty) arr = parseLooseJsonObjects(raw);
+      // ignore: avoid_print
+      print(
+        '[TaskGen] grouping: raw=${raw.length}c, parsed=${arr.length} '
+        'candidate group(s) for ${stories.length} stories',
+      );
+      if (arr.isEmpty) {
+        debugPrint(
+          '[TaskGen] grouping raw (unparseable): '
+          '${raw.length > 300 ? raw.substring(0, 300) : raw}',
+        );
+        return null;
+      }
+      final used = <int>{};
+      final groups = <List<UserStory>>[];
+      for (final g in arr) {
+        final rawPks = g['story_pks'];
+        if (rawPks is! List) continue;
+        final grp = <UserStory>[];
+        for (final e in rawPks) {
+          final pk = e is num ? e.toInt() : int.tryParse('$e');
+          if (pk != null && byPk.containsKey(pk) && used.add(pk)) {
+            grp.add(byPk[pk]!);
+          }
+        }
+        if (grp.isNotEmpty) groups.add(grp);
+      }
+      final clustered = groups.length; // groups the AI actually formed
+      // Never drop a story the AI missed (each becomes its own singleton).
+      for (final s in stories) {
+        if (!used.contains(s.story_pk)) groups.add([s]);
+      }
+      // ignore: avoid_print
+      print(
+        '[TaskGen] grouping formed $clustered cluster(s) + '
+        '${groups.length - clustered} leftover singleton(s) = '
+        '${groups.length} unit(s) from ${stories.length} stories',
+      );
+      // Only worth it if it actually reduced the unit count.
+      if (groups.isEmpty || groups.length >= stories.length) return null;
+      return groups;
+    } catch (e) {
+      debugPrint('story grouping failed: $e');
+      return null;
+    }
+  }
+
+  /// Deterministic fallback grouping (no AI): the discovery interview already
+  /// nests related stories under a parent (an "Accounts" parent with admin/
+  /// customer children, etc.), so group each [buildable] story under its
+  /// TOP-LEVEL ancestor (the direct child of the templater root). Returns null
+  /// when the tree is flat (every story is top-level → no reduction), so the
+  /// caller falls through to the per-story path.
+  List<List<UserStory>>? _groupStoriesByTree(
+    List<UserStory> buildable,
+    List<UserStory> allStories,
+    int? rootPk,
+  ) {
+    final byPk = {for (final s in allStories) s.story_pk: s};
+    int topAncestor(UserStory s) {
+      var cur = s;
+      // Walk up until the parent is the templater root (or missing/cycle).
+      final seen = <int>{};
+      while (cur.parent_story_fk != null &&
+          cur.parent_story_fk != rootPk &&
+          seen.add(cur.story_pk)) {
+        final p = byPk[cur.parent_story_fk];
+        if (p == null) break;
+        cur = p;
+      }
+      return cur.story_pk;
+    }
+
+    final byTop = <int, List<UserStory>>{};
+    final order = <int>[];
+    for (final s in buildable) {
+      final top = topAncestor(s);
+      byTop
+          .putIfAbsent(top, () {
+            order.add(top);
+            return <UserStory>[];
+          })
+          .add(s);
+    }
+    // No grouping if flat (no reduction), collapsed to one, or one mega-group
+    // holds the majority (a degenerate tree — e.g. everything under one node).
+    final biggest = byTop.values.fold<int>(
+      0,
+      (m, g) => g.length > m ? g.length : m,
+    );
+    if (byTop.length < 2 ||
+        byTop.length >= buildable.length ||
+        biggest * 10 > buildable.length * 7) {
+      return null;
+    }
+    // Emit groups with the top-level story first (its rep title names the area).
+    final groups = <List<UserStory>>[];
+    for (final top in order) {
+      final members = byTop[top]!;
+      members.sort((a, c) {
+        if (a.story_pk == top) return -1; // rep first
+        if (c.story_pk == top) return 1;
+        return a.orderIndex.compareTo(c.orderIndex);
+      });
+      groups.add(members);
+    }
+    // ignore: avoid_print
+    print(
+      '[TaskGen] tree-grouped ${buildable.length} stories → '
+      '${groups.length} subtree area(s) (AI clustering unavailable)',
+    );
+    return groups;
+  }
+
+  /// Like [_tasksForStory] but for a GROUP of related stories: folds ALL of them
+  /// into ONE prompt and asks for the FEWEST consolidated tasks (typically one
+  /// per layer covering the whole area) — no context is lost because every
+  /// story's narrative + acceptance criteria are included.
+  Future<List<Map<String, dynamic>>> _tasksForGroup(
+    NexusDatabase db,
+    ({InferenceBackend backend, String model})? resolved,
+    String profile,
+    List<UserStory> group,
+  ) async {
+    if (resolved == null) return const [];
+    final b = StringBuffer()
+      ..writeln(
+        'FEATURE AREA — build these related user stories TOGETHER as one '
+        'cohesive, consolidated set of tasks:',
+      );
+    for (final s in group) {
+      b.writeln('\n— STORY: ${s.title}');
+      if (s.narrative.trim().isNotEmpty) b.writeln('  ${s.narrative.trim()}');
+      final ac = (s.acceptanceCriteria ?? '').trim();
+      if (ac.isNotEmpty) b.writeln('  Acceptance:\n$ac');
+      final notes = await db.getNotesForStory(s.story_pk);
+      for (final n in notes) {
+        b.writeln('  Note: ${n.body.trim()}');
+      }
+    }
+    b.writeln('\n$profile');
+    const sys =
+        'You are a tech lead turning a FEATURE AREA (several related user stories) '
+        'into the FEWEST tasks that fully build it. CONSOLIDATE: produce roughly '
+        'ONE task per layer for the WHOLE area — e.g. one db task covering ALL the '
+        'area\'s tables, one server task covering ALL its endpoints, one client '
+        'task covering ALL its screens — NOT one task per story. Fold every '
+        'story\'s requirements into these consolidated tasks so nothing is lost. '
+        'Only split a layer further if it is genuinely too big for one focused '
+        'session. Each task DESCRIPTION names the exact stack artifact(s) to build '
+        'and MUST cover every story\'s needs for that layer; each task\'s '
+        'acceptance_criteria is a testable bullet list spanning ALL those stories. '
+        'Use ONLY the baseline stack. Return ONLY a JSON array (no prose, no '
+        'fences): [{"title","description","acceptance_criteria","layer":"client"|'
+        '"server"|"db"|"other"}].';
+    try {
+      final raw = await scopedComplete(
+        backend: resolved.backend,
+        model: resolved.model,
+        system: sys,
+        user: b.toString(),
+        maxTokens: 1600,
+      );
+      return parseJsonObjectArray(raw);
+    } catch (e) {
+      debugPrint('group task-gen failed: $e');
       return const [];
     }
   }
@@ -363,7 +810,6 @@ class TaskGenerator extends ChangeNotifier {
   }
 }
 
-final taskGeneratorProvider =
-    ChangeNotifierProvider.family<TaskGenerator, int>(
-      (ref, projectId) => TaskGenerator(ref, projectId),
-    );
+final taskGeneratorProvider = ChangeNotifierProvider.family<TaskGenerator, int>(
+  (ref, projectId) => TaskGenerator(ref, projectId),
+);
