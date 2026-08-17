@@ -251,6 +251,7 @@ class ProjectOrchestrator {
   // against a pathological infinite loop.
   static const int _maxStagnantRounds = 6;
   static const int _absoluteMaxTestingRounds = 40;
+
   /// After CI goes green, the FINAL PASS verifies every requested feature is
   /// actually implemented + hooked up. It keeps fixing+re-verifying as long as
   /// it's making PROGRESS (fewer unwired features each pass); it only gives up
@@ -258,25 +259,32 @@ class ProjectOrchestrator {
   /// passes (same philosophy as the CI loop — not a hard cap). The outer
   /// [_absoluteMaxTestingRounds] is the ultimate backstop.
   static const int _maxFinalPassStagnant = 5;
+
   /// Turn budget for the read-only Final Pass reviewer that traces each feature's
   /// wiring in the code before giving its verdict.
   static const int _maxFinalPassTurns = 14;
+
   /// Per-CI-run failpoint payload cap handed to the fixer — generous so e.g. 100
   /// failures all go in ONE pass (fix them all, THEN re-run CI; don't test after
   /// every point).
   static const int _maxFixErrorChars = 24000;
+
   /// The fix agent's per-invocation turn budget — high enough to work across many
   /// files in a single pass before the next CI run.
   static const int _maxFixAgentTurns = 24;
+
   /// Running guard so only one TESTING phase runs at a time (mirrors _templating).
   bool _testing = false;
+
   /// Live phase flag + detail mirrored into [orchestratorStatusProvider] so the
   /// top-bar shows a yellow "Testing" stage while it runs.
   bool _testingActive = false;
   String? _testingDetail;
+
   /// Done-set signature the testing loop exhausted its rounds on, so we don't
   /// immediately re-enter the (slow) loop for the same unchanged red state.
   String? _testingExhaustedSig;
+
   /// FINAL PASS progress tracking (persists across testing re-entries): the
   /// unwired-feature count from the previous pass, and how many consecutive
   /// passes have FAILED to reduce it. Keep going while the count drops; give up
@@ -322,13 +330,15 @@ class ProjectOrchestrator {
   /// back (NOT penalized — a stall isn't its fault), the slot frees, and the pump
   /// moves on. Generous so a slow-but-working turn under load is never killed.
   static const Duration _turnIdleTimeout = Duration(minutes: 4);
+
   /// HARD wall-clock cap on a single agent turn, regardless of stream activity.
   /// The idle timeout resets on every SSE event, so a backend that dribbles
   /// keep-alives (or streams token-by-token forever on a bloated context) can
   /// hang a turn indefinitely without ever tripping the idle guard — observed as
   /// the Final Pass fixer freezing for 18min. This cap fires no matter what, so a
   /// stuck turn is aborted (and retried) instead of wedging the phase.
-  static const Duration _turnWallClock = Duration(minutes: 8);
+  static const Duration _turnWallClock = Duration(minutes: 5);
+
   /// Safety valve for the shared git lane: a single materialize/commit/merge
   /// that hangs would wedge the lane (and so freeze EVERY task's git step) until
   /// the app restarts. Cap how long any one lane op may hold the mutex so the
@@ -442,7 +452,9 @@ class ProjectOrchestrator {
       await _db.setProjectOrchestrationState(projectId, 'running');
       if (!_disposed) unawaited(_pump());
     } catch (e) {
-      debugPrint('[Orchestrator p$projectId] auto-start testing check failed: $e');
+      debugPrint(
+        '[Orchestrator p$projectId] auto-start testing check failed: $e',
+      );
     }
   }
 
@@ -468,7 +480,8 @@ class ProjectOrchestrator {
     var spawnedFixWork = false;
     try {
       final project = await _db.getProjectById(projectId);
-      if (project == null || !_isActiveState(project.orchestrationState)) return;
+      if (project == null || !_isActiveState(project.orchestrationState))
+        return;
       if (!isWithinWorkingHours(project)) return;
 
       // Honour the connection-cap backoff: a recent 429 means every slot the plan
@@ -557,14 +570,15 @@ class ProjectOrchestrator {
           ),
         );
       }
-      ref.read(orchestratorStatusProvider(projectId).notifier).state =
-          OrchestratorStatus(
-            workerSlots: workerSlots,
-            activeStages: _active.length,
-            waiting: waiting,
-            testing: _testingActive,
-            testingDetail: _testingDetail,
-          );
+      ref
+          .read(orchestratorStatusProvider(projectId).notifier)
+          .state = OrchestratorStatus(
+        workerSlots: workerSlots,
+        activeStages: _active.length,
+        waiting: waiting,
+        testing: _testingActive,
+        testingDetail: _testingDetail,
+      );
     } catch (_) {
       // Status is best-effort telemetry; never let it disturb the pump.
     }
@@ -1052,52 +1066,58 @@ class ProjectOrchestrator {
         }
 
         try {
-          await for (final _ in session.runTurn(
-            kickoff,
-            // Coders need to read → edit → commit → submit; 4 rounds often isn't
-            // enough to finish in one turn, so give the worker more room before
-            // the turn's forced no-tools wrap-up (which can't submit).
-            maxToolRounds: 8,
-            // Persist the worker's full trace (tool calls + args + results) per
-            // task so it can be exported from Account → Export Tracking — but
-            // ONLY when the user has toggled worker capture on (it's a lot of
-            // data). Gated before the expensive jsonEncode so OFF costs nothing.
-            onTrace: (messages) {
-              // Reading a provider after the orchestrator was disposed throws —
-              // skip the capture in that case.
-              if (_disposed || !ref.read(workerCaptureProvider)) return;
-              unawaited(
-                _db.upsertTrainingTrace(
-                  projectPk: projectId,
-                  aiKind: 'worker',
-                  conversationId: 'worker:$projectId:${task.task_pk}',
-                  messagesJson: jsonEncode(messages),
-                ),
-              );
-            },
-            onToolResult: (r) {
-              sawToolActivity = true;
-              // The session emits this exact note when the backend rejected
-              // tool-calling and re-ran the round WITHOUT tools — a worker can
-              // never submit in that state.
-              if (r.contains('rejected tool-calling')) toolsRejected = true;
-              debugPrint(
-                '[Orchestrator p$projectId] task ${task.task_pk} turn $turn '
-                'tool → ${r.length > 140 ? '${r.substring(0, 140)}…' : r}',
-              );
-            },
-          ).timeout(_turnIdleTimeout)) {
-            // Drain the stream; tool effects are applied inside runTurn.
-          }
+          // _drainTurn (NOT stream.timeout): enforces BOTH the idle timeout AND
+          // a hard wall-clock cap, so a backend that trickles keep-alives but
+          // never completes can't freeze the worker forever (it did — a stalled
+          // call hung the whole build for an hour because plain .timeout resets
+          // on every keep-alive).
+          await _drainTurn(
+            session.runTurn(
+              kickoff,
+              // Coders need to read → edit → commit → submit; 4 rounds often
+              // isn't enough to finish in one turn, so give the worker more room
+              // before the turn's forced no-tools wrap-up (which can't submit).
+              maxToolRounds: 8,
+              // Persist the worker's full trace (tool calls + args + results) per
+              // task so it can be exported from Account → Export Tracking — but
+              // ONLY when the user toggled worker capture on (it's a lot of
+              // data). Gated before the expensive jsonEncode so OFF costs nothing.
+              onTrace: (messages) {
+                // Reading a provider after the orchestrator was disposed throws
+                // — skip the capture in that case.
+                if (_disposed || !ref.read(workerCaptureProvider)) return;
+                unawaited(
+                  _db.upsertTrainingTrace(
+                    projectPk: projectId,
+                    aiKind: 'worker',
+                    conversationId: 'worker:$projectId:${task.task_pk}',
+                    messagesJson: jsonEncode(messages),
+                  ),
+                );
+              },
+              onToolResult: (r) {
+                sawToolActivity = true;
+                // The session emits this exact note when the backend rejected
+                // tool-calling and re-ran the round WITHOUT tools — a worker can
+                // never submit in that state.
+                if (r.contains('rejected tool-calling')) toolsRejected = true;
+                debugPrint(
+                  '[Orchestrator p$projectId] task ${task.task_pk} turn $turn '
+                  'tool → ${r.length > 140 ? '${r.substring(0, 140)}…' : r}',
+                );
+              },
+            ),
+          );
         } catch (e) {
           if (e is TimeoutException) {
-            // The turn stalled — a backend that took the connection but never
-            // streamed. NOT the task's fault: undo the attempt and yield back so
-            // the slot frees and the pump moves on (instead of hanging forever).
+            // The turn stalled — idle (no stream for _turnIdleTimeout) OR it blew
+            // the hard wall-clock cap (_turnWallClock) while trickling keep-alives
+            // but never completing. NOT the task's fault: undo the attempt and
+            // yield back so the slot frees and the pump moves on.
             _undoAttempt(task.task_pk);
             debugPrint(
-              '[Orchestrator p$projectId] task ${task.task_pk}: turn $turn stalled '
-              '(no stream for ${_turnIdleTimeout.inMinutes}m) — aborting, yielding back.',
+              '[Orchestrator p$projectId] task ${task.task_pk}: turn $turn '
+              'timed out ($e) — aborting, yielding back.',
             );
           } else if (_isNotTaskFault(e)) {
             // 429 backpressure or a transient 5xx/closed/network — NOT a failure.
@@ -1262,11 +1282,12 @@ class ProjectOrchestrator {
       }
     } catch (_) {}
     try {
-      final files = (await tree.walk())
-          .where((f) => !f.isDirectory)
-          .map((f) => f.path)
-          .toList()
-        ..sort();
+      final files =
+          (await tree.walk())
+              .where((f) => !f.isDirectory)
+              .map((f) => f.path)
+              .toList()
+            ..sort();
       if (files.isNotEmpty) {
         b.writeln(
           '\n=== CURRENT PROJECT FILES (already on your branch — read what you '
@@ -1281,14 +1302,16 @@ class ProjectOrchestrator {
         }
       }
     } catch (_) {}
-    b.write('''
+    b.write(
+      '''
 
 === RULES ===
 - FULLY IMPLEMENT your file(s): a working, wired feature — NOT just compiling. No TODO/FIXME/UnimplementedError/"coming soon"/placeholder bodies (Review scans for these and bounces the task).
 - WIRE IT IN: if your feature must be reachable, make the SMALLEST additive change to the shared entry/router so the app reaches it — an orphaned widget/service is incomplete.
 - STAY IN YOUR LANE: implement ONLY your task's file(s); other tasks own theirs. To use another component, READ its declared contract/interface and code to its EXACT members — don't recreate it or call members it doesn't declare.
 - SHARED GLUE IS COMPLETE — the scaffold already declared the DB schema, main/entry, router/nav, DI container, barrels, and manifest/deps. Code AGAINST them; do NOT edit them (editing collides with siblings → Blocked on merge). Only if your entry is genuinely MISSING, add your ONE line additively — never rewrite the file.
-- Do NOT hand-write generated files (`*.g.dart`/`*.freezed.dart`/`*.mocks.dart`): write the SOURCE with its `part '...g.dart';` directive and let codegen run (deps go in dev_dependencies).''');
+- Do NOT hand-write generated files (`*.g.dart`/`*.freezed.dart`/`*.mocks.dart`): write the SOURCE with its `part '...g.dart';` directive and let codegen run (deps go in dev_dependencies).''',
+    );
     return b.toString().trimRight();
   }
 
@@ -1318,9 +1341,28 @@ class ProjectOrchestrator {
   bool _isScannableCodeFile(String path) {
     final p = path.toLowerCase();
     const exts = [
-      '.dart', '.ts', '.tsx', '.js', '.jsx', '.py', '.go', '.rs',
-      '.cs', '.java', '.kt', '.kts', '.swift', '.cpp', '.cc', '.c', '.h',
-      '.hpp', '.rb', '.php', '.vue', '.svelte',
+      '.dart',
+      '.ts',
+      '.tsx',
+      '.js',
+      '.jsx',
+      '.py',
+      '.go',
+      '.rs',
+      '.cs',
+      '.java',
+      '.kt',
+      '.kts',
+      '.swift',
+      '.cpp',
+      '.cc',
+      '.c',
+      '.h',
+      '.hpp',
+      '.rb',
+      '.php',
+      '.vue',
+      '.svelte',
     ];
     return exts.any(p.endsWith);
   }
@@ -1426,13 +1468,27 @@ class ProjectOrchestrator {
   bool _isGeneratedOrVendor(String path) {
     final p = path.toLowerCase();
     const genSuffixes = [
-      '.g.dart', '.freezed.dart', '.mocks.dart', '.gr.dart', '.config.dart',
-      '.pb.dart', '.pbjson.dart', '.pbenum.dart', '.gen.dart', '.d.ts',
+      '.g.dart',
+      '.freezed.dart',
+      '.mocks.dart',
+      '.gr.dart',
+      '.config.dart',
+      '.pb.dart',
+      '.pbjson.dart',
+      '.pbenum.dart',
+      '.gen.dart',
+      '.d.ts',
     ];
     if (genSuffixes.any(p.endsWith)) return true;
     const vendorDirs = [
-      '/generated/', '/.dart_tool/', '/build/', '/node_modules/', '/vendor/',
-      '/.git/', '/ios/pods/', '/android/.gradle/',
+      '/generated/',
+      '/.dart_tool/',
+      '/build/',
+      '/node_modules/',
+      '/vendor/',
+      '/.git/',
+      '/ios/pods/',
+      '/android/.gradle/',
     ];
     return vendorDirs.any(p.contains);
   }
@@ -1481,7 +1537,9 @@ class ProjectOrchestrator {
         }
       }
     } catch (e) {
-      debugPrint('[Orchestrator p$projectId] whole-tree stub scan skipped ($e).');
+      debugPrint(
+        '[Orchestrator p$projectId] whole-tree stub scan skipped ($e).',
+      );
       return '';
     }
     return findings.join('\n');
@@ -1510,9 +1568,9 @@ class ProjectOrchestrator {
       await _db.attachTaskBuildFailure(
         task.task_pk,
         'REJECTED — this task was submitted with UNIMPLEMENTED stubs. Every '
-            'feature must be FULLY implemented, never left as a TODO, placeholder, '
-            'empty body, or UnimplementedError. Implement these for real (and '
-            'remove the markers):\n\n$stubs',
+        'feature must be FULLY implemented, never left as a TODO, placeholder, '
+        'empty body, or UnimplementedError. Implement these for real (and '
+        'remove the markers):\n\n$stubs',
       );
       debugPrint(
         '[Orchestrator p$projectId] task ${task.task_pk}: REVIEW REJECTED — left '
@@ -1627,15 +1685,19 @@ class ProjectOrchestrator {
       );
 
       var kickoff = prompts.render(OrchestratorPromptField.verifyKickoff, vars);
-      for (var turn = 0;
-          turn < _maxFunctionalVerifyTurns && !_disposed;
-          turn++) {
+      for (
+        var turn = 0;
+        turn < _maxFunctionalVerifyTurns && !_disposed;
+        turn++
+      ) {
         if (!await _stillRunning()) return;
         try {
-          await for (final _ in session.runTurn(kickoff).timeout(_turnIdleTimeout)) {}
+          await _drainTurn(session.runTurn(kickoff)); // idle + wall-clock cap
         } catch (e) {
           if (e is TimeoutException || _isNotTaskFault(e)) {
-            _undoAttempt(task.task_pk); // stall/backpressure/transient — don't penalize
+            _undoAttempt(
+              task.task_pk,
+            ); // stall/backpressure/transient — don't penalize
           } else {
             debugPrint(
               '[Orchestrator p$projectId] task ${task.task_pk}: functional verify turn $turn failed: $e',
@@ -1732,7 +1794,10 @@ class ProjectOrchestrator {
         return (passed: status == CiStatus.success, runPk: runPk);
       }
     }
-    return (passed: false, runPk: runPk); // timed out / disposed → fail the gate
+    return (
+      passed: false,
+      runPk: runPk,
+    ); // timed out / disposed → fail the gate
   }
 
   // ── Build stage ───────────────────────────────────────────────────────
@@ -2151,10 +2216,12 @@ class ProjectOrchestrator {
     for (var turn = 0; turn < _maxTurnsPerStage && !_disposed; turn++) {
       if (!await _stillRunning()) return;
       try {
-        await for (final _ in session.runTurn(kickoff).timeout(_turnIdleTimeout)) {}
+        await _drainTurn(session.runTurn(kickoff)); // idle + wall-clock cap
       } catch (e) {
         if (e is TimeoutException || _isNotTaskFault(e)) {
-          _undoAttempt(task.task_pk); // stall/backpressure/transient — don't penalize
+          _undoAttempt(
+            task.task_pk,
+          ); // stall/backpressure/transient — don't penalize
         } else {
           debugPrint(
             '[Orchestrator p$projectId] task ${task.task_pk}: merge turn $turn failed: $e',
@@ -2212,8 +2279,10 @@ class ProjectOrchestrator {
         if (_templating) return false;
         _templating = true;
         // ignore: avoid_print
-        print('[Templater] gate open → kicking off templating for project '
-            '$projectId (status="${project.templateStatus}")');
+        print(
+          '[Templater] gate open → kicking off templating for project '
+          '$projectId (status="${project.templateStatus}")',
+        );
         unawaited(
           _runTemplatingPhase(project).whenComplete(() {
             _templating = false;
@@ -2239,7 +2308,9 @@ class ProjectOrchestrator {
       print('[Templater] scaffolder returned: $scaffolded');
       if (!scaffolded) {
         await _db.setProjectTemplateStatus(projectId, 'failed');
-        debugPrint('[Orchestrator p$projectId] templater could not scaffold; gated.');
+        debugPrint(
+          '[Orchestrator p$projectId] templater could not scaffold; gated.',
+        );
         return;
       }
       // Guarantee a deterministic CI gate exists so per-task review and the
@@ -2276,7 +2347,9 @@ class ProjectOrchestrator {
     // Group key = each task's topmost story ancestor (its epic), so epic-mates
     // cluster. Tasks with no story are "loose" (null) and pack freely.
     final stories = await _db.getUserStoriesForProject(projectId);
-    final parentOf = <int, int?>{for (final s in stories) s.story_pk: s.parent_story_fk};
+    final parentOf = <int, int?>{
+      for (final s in stories) s.story_pk: s.parent_story_fk,
+    };
     int? epicOf(int? storyPk) {
       if (storyPk == null) return null;
       var cur = storyPk;
@@ -2316,17 +2389,22 @@ class ProjectOrchestrator {
     // code-tuned), not the Coordinator (whose model is the interview/discovery
     // collection, which just chats instead of creating files). Fall back to the
     // Coordinator only if no worker persona exists.
-    final persona = await _findPersonaForRole(AgentRole.sdeGeneralist) ??
+    final persona =
+        await _findPersonaForRole(AgentRole.sdeGeneralist) ??
         await _findPersonaForRole(AgentRole.coordinator);
     if (persona == null) {
       // ignore: avoid_print
-      print('[Templater] NO generalist/Coordinator persona — cannot scaffold (failed/gated).');
+      print(
+        '[Templater] NO generalist/Coordinator persona — cannot scaffold (failed/gated).',
+      );
       return false;
     }
     final resolved = await _resolveBackend(persona);
     if (resolved == null) {
       // ignore: avoid_print
-      print('[Templater] no inference backend for ${persona.name} — cannot scaffold.');
+      print(
+        '[Templater] no inference backend for ${persona.name} — cannot scaffold.',
+      );
       return false;
     }
     final handles = await _resolveWorkspaceHandles();
@@ -2352,8 +2430,10 @@ class ProjectOrchestrator {
     final existingFiles = (await ws.walk()).where((f) => !f.isDirectory).length;
     if (existingHead != null && existingFiles > 0) {
       // ignore: avoid_print
-      print('[Templater] scaffold already present (head=$existingHead, '
-          '$existingFiles file(s)) — skipping re-scaffold.');
+      print(
+        '[Templater] scaffold already present (head=$existingHead, '
+        '$existingFiles file(s)) — skipping re-scaffold.',
+      );
       return true;
     }
     // RETRY after an interrupted run: the agent had written a scaffold but a 502
@@ -2361,14 +2441,18 @@ class ProjectOrchestrator {
     // redo the whole thing — commit what's there and accept.
     if (existingHead == null && existingFiles >= 2) {
       try {
-        await ref.read(gitLaneProvider(projectId)).run(
-          () => git.commitAll(message: 'chore: scaffold base project'),
-          timeout: _laneOpTimeout,
-        );
+        await ref
+            .read(gitLaneProvider(projectId))
+            .run(
+              () => git.commitAll(message: 'chore: scaffold base project'),
+              timeout: _laneOpTimeout,
+            );
         if ((await git.headOid()) != null) {
           // ignore: avoid_print
-          print('[Templater] committed $existingFiles uncommitted scaffold '
-              'file(s) from a prior run — scaffold accepted.');
+          print(
+            '[Templater] committed $existingFiles uncommitted scaffold '
+            'file(s) from a prior run — scaffold accepted.',
+          );
           ref.read(workspaceRevisionProvider(projectId).notifier).state++;
           return true;
         }
@@ -2382,8 +2466,10 @@ class ProjectOrchestrator {
     // doing work, so we only count it scaffolded once a NEW commit lands.
     final beforeHead = await git.headOid();
     // ignore: avoid_print
-    print('[Templater] running scaffolder agent "${persona.name}" on main '
-        '(beforeHead=${beforeHead ?? "unborn"}).');
+    print(
+      '[Templater] running scaffolder agent "${persona.name}" on main '
+      '(beforeHead=${beforeHead ?? "unborn"}).',
+    );
 
     final tasks = await _db.getTasksForProject(projectId);
     final taskList = tasks.map((t) => '- ${t.title}').join('\n');
@@ -2426,12 +2512,18 @@ class ProjectOrchestrator {
         vars,
       ),
       enableThinking: resolveEnableThinking(
-        agent: personaThinkingMode(persona.configJson, personaName: persona.name),
+        agent: personaThinkingMode(
+          persona.configJson,
+          personaName: persona.name,
+        ),
         task: ThinkingMode.off,
       ),
     );
 
-    var kickoff = prompts.render(OrchestratorPromptField.templaterKickoff, vars);
+    var kickoff = prompts.render(
+      OrchestratorPromptField.templaterKickoff,
+      vars,
+    );
     const maxTransientRetries = 10;
     var transientRetries = 0;
     // Manual turn counter so a TRANSIENT failure (502/stall/backpressure) can
@@ -2449,14 +2541,18 @@ class ProjectOrchestrator {
             onToolResult: (r) {
               toolCalls++;
               // ignore: avoid_print
-              print('[Templater] tool#$toolCalls: '
-                  '${r.length > 140 ? "${r.substring(0, 140)}…" : r}');
+              print(
+                '[Templater] tool#$toolCalls: '
+                '${r.length > 140 ? "${r.substring(0, 140)}…" : r}',
+              );
             },
           ),
         );
       } catch (e) {
         if (e is! TimeoutException && !_isNotTaskFault(e)) {
-          debugPrint('[Orchestrator p$projectId] templater turn $turn failed: $e');
+          debugPrint(
+            '[Orchestrator p$projectId] templater turn $turn failed: $e',
+          );
           break; // fall through to the salvage commit below
         }
         transient = true; // 502 / stall / backpressure
@@ -2465,8 +2561,10 @@ class ProjectOrchestrator {
         transientRetries++;
         if (transientRetries > maxTransientRetries) break;
         // ignore: avoid_print
-        print('[Templater] transient error (retry $transientRetries/'
-            '$maxTransientRetries) — not burning a turn.');
+        print(
+          '[Templater] transient error (retry $transientRetries/'
+          '$maxTransientRetries) — not burning a turn.',
+        );
         await Future<void>.delayed(const Duration(seconds: 4));
         continue; // retry same turn without incrementing
       }
@@ -2474,9 +2572,11 @@ class ProjectOrchestrator {
       final head = await git.headOid();
       final wsFiles = (await ws.walk()).where((f) => !f.isDirectory).length;
       // ignore: avoid_print
-      print('[Templater] turn $turn: $toolCalls tool call(s); '
-          'workspace has $wsFiles file(s); head=${head ?? "unborn"} '
-          '(beforeHead=${beforeHead ?? "unborn"}).');
+      print(
+        '[Templater] turn $turn: $toolCalls tool call(s); '
+        'workspace has $wsFiles file(s); head=${head ?? "unborn"} '
+        '(beforeHead=${beforeHead ?? "unborn"}).',
+      );
       if (head != beforeHead && wsFiles > 0) {
         // ignore: avoid_print
         print('[Templater] NEW commit + $wsFiles file(s) — scaffold accepted.');
@@ -2497,19 +2597,25 @@ class ProjectOrchestrator {
     final leftover = (await ws.walk()).where((f) => !f.isDirectory).length;
     if (leftover >= 2 && (await git.headOid()) == beforeHead) {
       try {
-        await ref.read(gitLaneProvider(projectId)).run(
-          () => git.commitAll(message: 'chore: scaffold base project'),
-          timeout: _laneOpTimeout,
-        );
+        await ref
+            .read(gitLaneProvider(projectId))
+            .run(
+              () => git.commitAll(message: 'chore: scaffold base project'),
+              timeout: _laneOpTimeout,
+            );
         if ((await git.headOid()) != beforeHead) {
           // ignore: avoid_print
-          print('[Templater] salvaged $leftover uncommitted file(s) with a safety '
-              'commit — scaffold accepted.');
+          print(
+            '[Templater] salvaged $leftover uncommitted file(s) with a safety '
+            'commit — scaffold accepted.',
+          );
           ref.read(workspaceRevisionProvider(projectId).notifier).state++;
           return true;
         }
       } catch (e) {
-        debugPrint('[Orchestrator p$projectId] templater salvage commit failed: $e');
+        debugPrint(
+          '[Orchestrator p$projectId] templater salvage commit failed: $e',
+        );
       }
     }
     // ignore: avoid_print
@@ -2554,7 +2660,9 @@ class ProjectOrchestrator {
         );
       }
     } catch (e) {
-      debugPrint('[Orchestrator p$projectId] templater base-spec build failed: $e');
+      debugPrint(
+        '[Orchestrator p$projectId] templater base-spec build failed: $e',
+      );
     }
     return buf.toString().trim();
   }
@@ -2593,7 +2701,8 @@ class ProjectOrchestrator {
       imageTag: 'base:latest',
       triggeredBy: 'templater',
     );
-    return outcome?.passed ?? true; // infra unavailable → don't block templating
+    return outcome?.passed ??
+        true; // infra unavailable → don't block templating
   }
 
   /// Runtime-lib import marker → the dev-dependency that GENERATES its code. A
@@ -2759,7 +2868,9 @@ class ProjectOrchestrator {
       // app. Rewrite it to run build_runner before analyze. Otherwise leave an
       // existing gate untouched.
       final needsCodegen =
-          existing != null && info.codegen && !existing.contains('build_runner');
+          existing != null &&
+          info.codegen &&
+          !existing.contains('build_runner');
       if (existing != null && !needsCodegen) return;
       final yaml = _defaultCiYaml(
         kind,
@@ -2807,7 +2918,16 @@ class ProjectOrchestrator {
       if (has(['flutter'])) return 'flutter';
       if (has(['dart'])) return 'dart';
       if (has(['c#', 'csharp', '.net', 'dotnet', 'asp.net'])) return 'dotnet';
-      if (has(['node', 'javascript', 'typescript', 'react', 'next', 'vue', 'angular', 'express'])) {
+      if (has([
+        'node',
+        'javascript',
+        'typescript',
+        'react',
+        'next',
+        'vue',
+        'angular',
+        'express',
+      ])) {
         return 'node';
       }
       if (has(['python', 'django', 'flask', 'fastapi'])) return 'python';
@@ -2842,26 +2962,33 @@ class ProjectOrchestrator {
     // warnings still fail). The orchestrator's `_ciRedIsInfoOnly` is the belt-
     // and-suspenders equivalent for projects whose CI YAML predates this.
     final steps = switch (kind) {
-      'flutter' => '      - run: ${pfx}flutter pub get\n'
-          '$gen'
-          '      - run: ${pfx}flutter analyze --no-fatal-infos\n'
-          '      - run: ${pfx}flutter test',
-      'dart' => '      - run: ${pfx}dart pub get\n'
-          '$gen'
-          '      - run: ${pfx}dart analyze\n'
-          '      - run: ${pfx}dart test',
-      'dotnet' => '      - run: ${pfx}dotnet restore\n'
-          '      - run: ${pfx}dotnet build --no-restore\n'
-          '      - run: ${pfx}dotnet test --no-build',
-      'node' => '      - run: ${pfx}npm ci\n'
-          '      - run: ${pfx}npm run build --if-present\n'
-          '      - run: ${pfx}npm test --if-present',
-      'python' => '      - run: ${pfx}pip install -r requirements.txt\n'
-          '      - run: ${pfx}python -m pytest',
-      'go' => '      - run: ${pfx}go build ./...\n'
-          '      - run: ${pfx}go test ./...',
-      'rust' => '      - run: ${pfx}cargo build\n'
-          '      - run: ${pfx}cargo test',
+      'flutter' =>
+        '      - run: ${pfx}flutter pub get\n'
+            '$gen'
+            '      - run: ${pfx}flutter analyze --no-fatal-infos\n'
+            '      - run: ${pfx}flutter test',
+      'dart' =>
+        '      - run: ${pfx}dart pub get\n'
+            '$gen'
+            '      - run: ${pfx}dart analyze\n'
+            '      - run: ${pfx}dart test',
+      'dotnet' =>
+        '      - run: ${pfx}dotnet restore\n'
+            '      - run: ${pfx}dotnet build --no-restore\n'
+            '      - run: ${pfx}dotnet test --no-build',
+      'node' =>
+        '      - run: ${pfx}npm ci\n'
+            '      - run: ${pfx}npm run build --if-present\n'
+            '      - run: ${pfx}npm test --if-present',
+      'python' =>
+        '      - run: ${pfx}pip install -r requirements.txt\n'
+            '      - run: ${pfx}python -m pytest',
+      'go' =>
+        '      - run: ${pfx}go build ./...\n'
+            '      - run: ${pfx}go test ./...',
+      'rust' =>
+        '      - run: ${pfx}cargo build\n'
+            '      - run: ${pfx}cargo test',
       _ => '      - run: echo "No build configured for this stack"',
     };
     return 'name: CI\n'
@@ -2972,7 +3099,8 @@ class ProjectOrchestrator {
           t.status == TaskStatus.inProgress ||
           t.status == TaskStatus.review,
     );
-    if (open.isNotEmpty) return false; // work still in flight — not finished yet
+    if (open.isNotEmpty)
+      return false; // work still in flight — not finished yet
     // A BLOCKED task = unresolved work: NEVER start end-of-project testing on an
     // incomplete project. Blocked must be cleared first (self-healed or by the
     // human) — testing against a project with a missing/failed feature just
@@ -2982,7 +3110,8 @@ class ProjectOrchestrator {
     if (done.isEmpty) return false; // nothing built — leave it
     // Skip if this exact completed state already passed (or exhausted) testing —
     // don't re-run the slow loop every tick on a settled project.
-    final sig = '${done.length}:'
+    final sig =
+        '${done.length}:'
         '${done.map((t) => t.updatedAt.millisecondsSinceEpoch).fold<int>(0, (a, b) => a > b ? a : b)}';
     if (sig == _finalScanPassedSig || sig == _testingExhaustedSig) return false;
     // Need a gate to scan against; if none exists there's nothing to enforce.
@@ -3120,7 +3249,10 @@ class ProjectOrchestrator {
           '${prog.verified.length} feature(s) already confirmed — re-checking the '
           'rest + stubs + screenshot…',
         );
-        final scan = await _runFinalPass(project, alreadyVerified: prog.verified);
+        final scan = await _runFinalPass(
+          project,
+          alreadyVerified: prog.verified,
+        );
         if (scan.nowVerified.isNotEmpty) {
           prog.verified.addAll(scan.nowVerified);
           await saveFinalizeProgress(projectId, prog);
@@ -3197,7 +3329,9 @@ class ProjectOrchestrator {
           'disposed mid-flight) — will resume on re-mount.',
         );
       } else {
-        debugPrint('[Orchestrator p$projectId] FINALIZE phase errored: $e\n$st');
+        debugPrint(
+          '[Orchestrator p$projectId] FINALIZE phase errored: $e\n$st',
+        );
       }
     } finally {
       _setTesting(false, null);
@@ -3273,7 +3407,8 @@ class ProjectOrchestrator {
         workflowPath: _defaultCiPath,
         triggeredBy: 'testing',
       );
-      if (outcome == null) return null; // infra down — retry on a later pump/tick
+      if (outcome == null)
+        return null; // infra down — retry on a later pump/tick
       if (outcome.passed) return true;
 
       // Info-lint tolerance: `flutter analyze` exits non-zero on ANY issue, so a
@@ -3498,7 +3633,10 @@ class ProjectOrchestrator {
       fixMode: true, // file/git read tools — we instruct it to only read
       systemPromptOverride: systemPrompt,
       enableThinking: resolveEnableThinking(
-        agent: personaThinkingMode(persona.configJson, personaName: persona.name),
+        agent: personaThinkingMode(
+          persona.configJson,
+          personaName: persona.name,
+        ),
         task: ThinkingMode.off,
       ),
     );
@@ -3526,7 +3664,9 @@ class ProjectOrchestrator {
         );
       } catch (e) {
         if (e is! TimeoutException && !_isNotTaskFault(e)) {
-          debugPrint('[Orchestrator p$projectId] final-pass turn $turn failed: $e');
+          debugPrint(
+            '[Orchestrator p$projectId] final-pass turn $turn failed: $e',
+          );
           break;
         }
         transient = true;
@@ -3569,7 +3709,9 @@ class ProjectOrchestrator {
       if (iss != null) {
         final pk = int.tryParse(iss.group(1)!);
         if (pk != null) issued.add(pk);
-        issueLines.add(line.startsWith('-') || line.startsWith('*') ? line : '- $line');
+        issueLines.add(
+          line.startsWith('-') || line.startsWith('*') ? line : '- $line',
+        );
         continue;
       }
       final ok = okRe.firstMatch(line);
@@ -3578,13 +3720,14 @@ class ProjectOrchestrator {
         if (pk != null && reviewed.contains(pk)) verified.add(pk);
       }
     }
-    verified.removeAll(issued); // an ISSUE always wins over an OK for the same pk
+    verified.removeAll(
+      issued,
+    ); // an ISSUE always wins over an OK for the same pk
     if (issueLines.isEmpty && text.contains('FINALPASS_OK')) {
       verified.addAll(reviewed); // clean sweep of the reviewed scope
     }
     return (issues: issueLines.join('\n'), verified: verified);
   }
-
 
   /// Best-effort vision check: build the project as web, screenshot the running
   /// app headlessly, and ask the (vision-capable) model whether it renders a real
@@ -3647,14 +3790,17 @@ class ProjectOrchestrator {
             maxTokens: 800,
           )
           .timeout(_turnIdleTimeout);
-      final text = (resp.choices.isNotEmpty
+      final text =
+          (resp.choices.isNotEmpty
               ? resp.choices.first.message.content
               : null) ??
           '';
       if (text.contains('VISUAL_OK')) return '';
       return text.trim();
     } catch (e) {
-      debugPrint('[Orchestrator p$projectId] final-pass vision call failed: $e');
+      debugPrint(
+        '[Orchestrator p$projectId] final-pass vision call failed: $e',
+      );
       return '';
     }
   }
@@ -3675,7 +3821,8 @@ class ProjectOrchestrator {
     // entrypoint and wires EVERY feature in one pass. Implies [functional].
     bool linkAll = false,
   }) async {
-    final persona = await _findPersonaForRole(AgentRole.sdeGeneralist) ??
+    final persona =
+        await _findPersonaForRole(AgentRole.sdeGeneralist) ??
         await _findPersonaForRole(AgentRole.coordinator);
     if (persona == null) return false;
     final resolved = await _resolveBackend(persona);
@@ -3693,11 +3840,12 @@ class ProjectOrchestrator {
     final beforeHead = await git.headOid();
 
     final baseline = await buildProjectBaseline(_db, projectId);
-    final fileTree = (await ws.walk())
-        .where((f) => !f.isDirectory)
-        .map((f) => f.path)
-        .toList()
-      ..sort();
+    final fileTree =
+        (await ws.walk())
+            .where((f) => !f.isDirectory)
+            .map((f) => f.path)
+            .toList()
+          ..sort();
     final filesBlock = fileTree.take(300).join('\n');
     final systemPrompt = StringBuffer()
       ..writeln(baseline)
@@ -3810,7 +3958,10 @@ class ProjectOrchestrator {
       fixMode: true,
       systemPromptOverride: systemPrompt.toString(),
       enableThinking: resolveEnableThinking(
-        agent: personaThinkingMode(persona.configJson, personaName: persona.name),
+        agent: personaThinkingMode(
+          persona.configJson,
+          personaName: persona.name,
+        ),
         task: ThinkingMode.off,
       ),
     );
@@ -3946,14 +4097,15 @@ class ProjectOrchestrator {
     if (_disposed) return;
     try {
       final cur = ref.read(orchestratorStatusProvider(projectId));
-      ref.read(orchestratorStatusProvider(projectId).notifier).state =
-          OrchestratorStatus(
-            workerSlots: cur.workerSlots,
-            activeStages: cur.activeStages,
-            waiting: cur.waiting,
-            testing: active,
-            testingDetail: detail,
-          );
+      ref
+          .read(orchestratorStatusProvider(projectId).notifier)
+          .state = OrchestratorStatus(
+        workerSlots: cur.workerSlots,
+        activeStages: cur.activeStages,
+        waiting: cur.waiting,
+        testing: active,
+        testingDetail: detail,
+      );
     } catch (_) {}
   }
 
@@ -4225,7 +4377,8 @@ class ProjectOrchestrator {
   /// True while the project is still active (running or editing) — used to bail
   /// out of a multi-turn agent stage promptly when the human pauses/stops.
   Future<bool> _stillRunning() async {
-    if (_disposed) return false; // torn-down orchestrator: never touch _db (ref)
+    if (_disposed)
+      return false; // torn-down orchestrator: never touch _db (ref)
     final project = await _db.getProjectById(projectId);
     return _isActiveState(project?.orchestrationState);
   }
@@ -4401,8 +4554,8 @@ final orchestratorStatusProvider =
 /// orchestrator). Switching to another project disposes this one, so the old
 /// project stops spawning agents and stops competing for the connection budget —
 /// it self-starts again (and resumes if still `running`) when you refocus it.
-final projectOrchestratorProvider =
-    Provider.autoDispose.family<ProjectOrchestrator, int>((ref, projectId) {
+final projectOrchestratorProvider = Provider.autoDispose
+    .family<ProjectOrchestrator, int>((ref, projectId) {
       final orchestrator = ProjectOrchestrator(ref, projectId)..start();
       ref.onDispose(orchestrator.dispose);
       return orchestrator;

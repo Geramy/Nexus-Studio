@@ -152,10 +152,15 @@ class TaskGenerator extends ChangeNotifier {
       // isn't worth it or the AI is unavailable.
       // Deterministic title-keyword clustering first (reliable — the routed
       // model won't emit the clustering JSON), then the story-tree structure as
-      // a fallback for genuinely nested trees.
-      final groups =
+      // a fallback for genuinely nested trees. Oversized groups are split so no
+      // single task balloons to a monster (a 9-story group ran 34 rounds, hung,
+      // and serialised everything behind it).
+      final rawGroups =
           _groupStoriesByKeyword(buildable) ??
           _groupStoriesByTree(buildable, stories, templaterRootPk);
+      final groups = rawGroups == null
+          ? null
+          : _splitOversizedGroups(rawGroups, _maxStoriesPerGroup);
       if (groups != null) {
         // ignore: avoid_print
         print(
@@ -554,6 +559,42 @@ class TaskGenerator extends ChangeNotifier {
       '${groups.length} theme(s) (biggest area=$biggest)',
     );
     return groups;
+  }
+
+  /// Max stories a single group may cover before it's split — keeps grouped
+  /// tasks from ballooning into monster sessions (a 9-story group ran 34 rounds
+  /// and hung). Still well below the 33-per-project fan-out.
+  static const int _maxStoriesPerGroup = 5;
+
+  /// Split any group larger than [maxSize] into order-preserving sub-groups of at
+  /// most [maxSize], so grouping can't create a task too big to finish in one
+  /// session. (Two sub-groups of the same area WILL touch overlapping files, but
+  /// the footprint gate serialises them and the resolver-then-redo path handles
+  /// any merge conflict — far better than one task that hangs the pipeline.)
+  List<List<UserStory>> _splitOversizedGroups(
+    List<List<UserStory>> groups,
+    int maxSize,
+  ) {
+    var split = false;
+    final out = <List<UserStory>>[];
+    for (final g in groups) {
+      if (g.length <= maxSize) {
+        out.add(g);
+        continue;
+      }
+      split = true;
+      for (var i = 0; i < g.length; i += maxSize) {
+        out.add(g.sublist(i, i + maxSize > g.length ? g.length : i + maxSize));
+      }
+    }
+    if (split) {
+      // ignore: avoid_print
+      print(
+        '[TaskGen] split oversized group(s): ${groups.length} → '
+        '${out.length} units (cap $maxSize/group)',
+      );
+    }
+    return out;
   }
 
   /// AI clustering — kept for when the backend can reliably return the JSON
