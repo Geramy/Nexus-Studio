@@ -66,6 +66,10 @@ class _PersonaEditorState extends ConsumerState<PersonaEditor> {
   /// Project Manager defaults to Off, every other agent to Unset.
   ThinkingMode _thinkingMode = ThinkingMode.unset;
 
+  /// Per-agent thinking LEVEL (reasoning_effort), sent to the model verbatim.
+  /// Agents without an explicit level run at Low for now.
+  ThinkingLevel _thinkingLevel = kDefaultThinkingLevel;
+
   @override
   void initState() {
     super.initState();
@@ -116,6 +120,7 @@ class _PersonaEditorState extends ConsumerState<PersonaEditor> {
           row.configJson,
           personaName: row.name,
         );
+        _thinkingLevel = personaThinkingLevel(row.configJson);
         final saved = AgentToolPermissions.fromConfigJson(row.configJson);
         for (final t in kCoordinatorToolSpecs) {
           _toolPerms[t.name] = saved.permFor(t.name);
@@ -191,6 +196,51 @@ class _PersonaEditorState extends ConsumerState<PersonaEditor> {
               labelText: 'System Prompt / Core Instructions',
               border: OutlineInputBorder(),
             ),
+          ),
+          Gap.md,
+
+          // Thinking level (reasoning_effort): graded per agent, sent as-is.
+          Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Thinking level',
+                      style: TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                    Text(
+                      'Reasoning effort sent to the model as-is '
+                      '(reasoning_effort — never clamped). Agents without an '
+                      'explicit level run at Low.',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: context.nx.textMuted,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: AppSpacing.md),
+              SizedBox(
+                width: 140,
+                child: DropdownButtonFormField<ThinkingLevel>(
+                  initialValue: _thinkingLevel,
+                  isExpanded: true,
+                  isDense: true,
+                  decoration:
+                      const InputDecoration(border: OutlineInputBorder()),
+                  items: [
+                    for (final l in ThinkingLevel.values)
+                      DropdownMenuItem(value: l, child: Text(l.label)),
+                  ],
+                  onChanged: (v) => setState(
+                    () => _thinkingLevel = v ?? kDefaultThinkingLevel,
+                  ),
+                ),
+              ),
+            ],
           ),
           Gap.md,
 
@@ -913,14 +963,18 @@ class _PersonaEditorState extends ConsumerState<PersonaEditor> {
               visionModel: Value(resolved.vision),
               llmModel: Value(resolved.llm),
               ttsVoice: Value(_safeStr(selectedVoice)),
-              // Persist tool-safety permissions (merged into existing configJson).
+              // Persist tool-safety permissions + thinking mode/level (merged
+              // into existing configJson).
               configJson: Value(
-                writeThinkingModeIntoConfigJson(
-                  AgentToolPermissions.writeIntoConfigJson(
-                    _existingConfigJson,
-                    _toolPerms,
+                writeThinkingLevelIntoConfigJson(
+                  writeThinkingModeIntoConfigJson(
+                    AgentToolPermissions.writeIntoConfigJson(
+                      _existingConfigJson,
+                      _toolPerms,
+                    ),
+                    _thinkingMode,
                   ),
-                  _thinkingMode,
+                  _thinkingLevel,
                 ),
               ),
               updatedAt: Value(DateTime.now()),

@@ -97,6 +97,7 @@ class _ProjectOrchestrationControlsState
         projectName: proj?.name ?? 'Project',
         model: resolved.model,
         enableThinking: resolved.enableThinking,
+        reasoningEffort: resolved.reasoningEffort,
         workspace: ws,
         git: git,
         scaffold: (proj?.projectType ?? '') == 'application-development',

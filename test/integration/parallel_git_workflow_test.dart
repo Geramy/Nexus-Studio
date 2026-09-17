@@ -41,6 +41,7 @@ void main() {
         // Root each task branch on main and hydrate its tree (orchestrator setup).
         await git.createBranchAt('task/1', base: 'main');
         await git.createBranchAt('task/2', base: 'main');
+        expect(await git.branchHasCommitsNotIn('task/1', 'main'), isFalse);
         await git.materializeInto('task/1', t1);
         await git.materializeInto('task/2', t2);
         expect(await t1.readString('/README.md'), 'base');
@@ -58,6 +59,7 @@ void main() {
           git.commitFrom(t1, branch: 'task/1', message: 'feat: A'),
           git.commitFrom(t2, branch: 'task/2', message: 'feat: B'),
         ]);
+        expect(await git.branchHasCommitsNotIn('task/1', 'main'), isTrue);
 
         // ISOLATION: task/1 has a.dart and not b.dart; task/2 the reverse.
         final v1 = await VhdWorkspace.open('${dir.path}/v1.nxtprj');
@@ -72,6 +74,12 @@ void main() {
         // MERGE both task branches into main (deterministic, non-overlapping).
         await git.checkoutBranch('main');
         final m1 = await git.merge('task/1');
+        expect(
+          await git.branchHasCommitsNotIn('task/1', 'main'),
+          isFalse,
+          reason:
+              'a merged or stale-behind branch has no recoverable task work',
+        );
         final m2 = await git.merge('task/2');
         expect(m1.outcome, isNot(MergeOutcome.conflicts));
         expect(m2.outcome, isNot(MergeOutcome.conflicts));

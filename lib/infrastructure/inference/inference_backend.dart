@@ -30,6 +30,11 @@ abstract class InferenceBackend {
   /// This matches the `providerType` (or future `implementationType`) column in the DB.
   String get implementationType;
 
+  /// Whether `cache_prompt` is isolated safely for this backend. Remote routers
+  /// may multiplex sessions across shared model slots; enabling an unkeyed KV
+  /// cache there can leak stale prompt state into unrelated requests.
+  bool get allowsPromptKvCache => false;
+
   /// High-level chat (non-streaming).
   Future<ChatCompletionResponse> createChatCompletion({
     required String model,
@@ -101,8 +106,9 @@ abstract class InferenceBackend {
     String? model,
     String size = '1024x1024',
     String responseFormat = 'b64_json',
-  }) =>
-      throw UnimplementedError('Image editing is not supported by this backend.');
+  }) => throw UnimplementedError(
+    'Image editing is not supported by this backend.',
+  );
 }
 
 // -----------------------------------------------------------------------------

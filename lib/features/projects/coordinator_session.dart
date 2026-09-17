@@ -2,9 +2,10 @@
 // Author: Geramy Loveless <support@nexus-projects.ai>
 // Licensed under the Sustainable Use License. See LICENSE.md.
 
+import 'dart:async';
 import 'dart:convert';
 
-import 'package:flutter/foundation.dart' show debugPrint;
+import 'package:flutter/foundation.dart' show debugPrint, visibleForTesting;
 
 import 'package:nexus_projects_client/infrastructure/database/nexus_database.dart';
 // Backward-compat types (InferenceClient = InferenceBackend).
@@ -24,6 +25,46 @@ import 'package:nexus_projects_client/infrastructure/workspace/git/nxtprj_git_en
 import 'package:nexus_projects_client/infrastructure/build/build_service.dart';
 import 'package:nexus_projects_client/core/agents/loop_guard.dart';
 import 'package:nexus_projects_client/features/projects/orchestration/orchestrator_prompts.dart';
+
+/// Replaces autonomous-worker arguments that the orchestrator already knows.
+///
+/// Routed models occasionally return a valid tool name with an unrelated task
+/// id, host path, or an omitted bookkeeping string. Those values are assignment
+/// metadata, not model decisions, so allowing them to reach the executor only
+/// wastes a tool round. Implementation payloads are deliberately left alone:
+/// missing file content or edit text must still fail validation.
+@visibleForTesting
+Map<String, dynamic> normalizeAutonomousWorkerToolArguments({
+  required String toolName,
+  required Map<String, dynamic> arguments,
+  required int? workTaskId,
+  required Set<String> workerRequiredFiles,
+}) {
+  final normalized = Map<String, dynamic>.from(arguments);
+
+  if (workerRequiredFiles.length == 1 &&
+      const {'write_file', 'edit_file'}.contains(toolName)) {
+    normalized['path'] = workerRequiredFiles.single;
+    normalized.remove('file_path');
+  }
+
+  if (toolName == 'git_commit' &&
+      (normalized['message']?.toString().trim().isEmpty ?? true)) {
+    normalized['message'] = workTaskId == null
+        ? 'Implement assigned task'
+        : 'Implement task #$workTaskId';
+  }
+
+  if (toolName == 'submit_for_completion' && workTaskId != null) {
+    normalized['task_id'] = workTaskId;
+    if (normalized['summary']?.toString().trim().isEmpty ?? true) {
+      normalized['summary'] =
+          'Implemented and committed changes for assigned task #$workTaskId.';
+    }
+  }
+
+  return normalized;
+}
 
 /// Manages a conversation with a Project's Coordinator AI (the "main brain").
 /// Now supports real tool execution against the live DB so the AI can adjust
@@ -86,6 +127,18 @@ class ProjectCoordinatorSession {
   final String? workBranch;
   final AsyncLock? gitLane;
 
+  /// Task identity and Templater-owned file scope for autonomous workers. When
+  /// present, writes/commits/submission are tied to the assigned task instead of
+  /// trusting model-supplied paths or ids.
+  final int? workTaskId;
+  final Set<String> workerWriteRoots;
+  final Set<String> workerRequiredFiles;
+
+  /// Identity and code paths for a bounded functional-verification session.
+  /// Its tools are phased from start, through code reads, to a required verdict.
+  final int? verificationTaskId;
+  final Set<String> verificationReadFiles;
+
   /// Orchestrator file-claim guard (workers only): true if this task may edit the
   /// given path, false if another task currently holds it. Plumbed to the tool
   /// executor so same-file work is queued instead of producing merge conflicts.
@@ -100,6 +153,16 @@ class ProjectCoordinatorSession {
   final List<Map<String, dynamic>> _fullTrace = [];
   final StringBuffer _reasonBuf = StringBuffer();
 
+  /// Activity from every backend event inside [runTurn], including the
+  /// intermediate tool-call finishes that the public response stream consumes
+  /// internally. The orchestrator watches this so a worker that is actively
+  /// reading, editing, committing, and submitting is not mistaken for an idle
+  /// request merely because those internal finishes are not rendered in chat.
+  final StreamController<void> _turnActivity = StreamController<void>.broadcast(
+    sync: true,
+  );
+  Stream<void> get turnActivity => _turnActivity.stream;
+
   /// Anti-runaway guards for the (often local/GGUF) coordinator + discovery
   /// model. Without a repeat penalty a weak model can loop on its own reasoning
   /// forever ("I'll add the root story. Then I'll ask the question. Let's do
@@ -108,7 +171,7 @@ class ProjectCoordinatorSession {
   /// hard backstop that bounds any round that still runs away (the turn then
   /// ends with no tool call and the existing anti-stall nudge re-prompts it).
   static const double _kRepeatPenalty = 1.15;
-  static const int _kMaxCompletionTokens = 8192;
+  static const int _kMaxCompletionTokens = 16384;
 
   /// Detects when the coordinator agent gets stuck repeating the same tool call
   /// (same name + args) across rounds/turns and escalates warn → block so the
@@ -133,11 +196,17 @@ class ProjectCoordinatorSession {
     this.buildService,
     this.systemPromptOverride,
     this.enableThinking,
+    this.reasoningEffort,
     this.leanTools = true,
     this.onPlanningComplete,
     this.onPlanReview,
     this.workBranch,
     this.gitLane,
+    this.workTaskId,
+    this.workerWriteRoots = const {},
+    this.workerRequiredFiles = const {},
+    this.verificationTaskId,
+    this.verificationReadFiles = const {},
     this.fileClaim,
     this.discoveryMode = false,
     this.scaffoldMode = false,
@@ -206,10 +275,32 @@ class ProjectCoordinatorSession {
   /// caller from the agent's (and, later, the task's) ThinkingMode.
   final bool? enableThinking;
 
+  /// Effective thinking LEVEL for this session's requests (e.g. 'low'), sent
+  /// verbatim as `reasoning_effort` — no clamping. Resolved by the caller from
+  /// the agent's [ThinkingLevel]. Null omits the parameter (model default).
+  final String? reasoningEffort;
+
   /// The model id actually sent to the backend.
   String get _effectiveModel => (model != null && model!.trim().isNotEmpty)
       ? model!.trim()
       : kDefaultOmniCollection;
+
+  Map<String, dynamic> get _promptCacheExtra => {
+    // Be explicit for shared routers: omitting the field leaves their default
+    // ambiguous, while false guarantees this request cannot reuse a stale slot.
+    'cache_prompt': client.allowsPromptKvCache,
+    // Agent's thinking level, sent as-is (identity mapping, never clamped).
+    if (reasoningEffort != null && reasoningEffort!.isNotEmpty)
+      'reasoning_effort': reasoningEffort,
+  };
+
+  double get _temperature =>
+      (workBranch != null ||
+          verificationTaskId != null ||
+          scaffoldMode ||
+          fixMode)
+      ? 0.1
+      : 0.7;
 
   List<Map<String, dynamic>> get history => List.unmodifiable(_history);
 
@@ -221,14 +312,16 @@ class ProjectCoordinatorSession {
   /// Log the SIZE of the wire prompt about to be sent (chars → ~tokens) so a
   /// run's log reveals how much context each turn re-sends and where the volume
   /// concentrates. Estimate (chars/4); the server-reported figure (when a
-  /// non-streaming call returns usage) is logged by [_logServerUsage].
+  /// non-streaming call returns usage) is logged by [_logServerUsage]. Timestamped
+  /// so the log can measure per-round wall time directly.
   void _logWirePrompt(List<Map<String, dynamic>> messages) {
     var chars = 0;
     for (final m in messages) {
       chars += (m['content']?.toString().length ?? 0);
     }
+    final ts = DateTime.now().toIso8601String().substring(11, 19);
     debugPrint(
-      '[tok] agent="$agentName" turn=${_tokTurn++} '
+      '[tok] $ts agent="$agentName" turn=${_tokTurn++} '
       'prompt~=${chars ~/ 4} tok ($chars chars, ${messages.length} msgs)',
     );
   }
@@ -246,9 +339,9 @@ class ProjectCoordinatorSession {
   /// A full OpenAI-shape conversation trace (system + history) for the training
   /// sink. [sys] is the system prompt used this turn.
   List<Map<String, dynamic>> _traceMessages(String sys) => [
-        {'role': 'system', 'content': sys},
-        ..._fullTrace,
-      ];
+    {'role': 'system', 'content': sys},
+    ..._fullTrace,
+  ];
 
   /// Drop tools this agent is DENIED so the model only ever sees a schema it may
   /// actually call. Each agent's permissions are unique (worker, verifier, PM,
@@ -460,9 +553,9 @@ class ProjectCoordinatorSession {
       model: _effectiveModel,
       messages: messages,
       tools: effectiveTools,
-      temperature: 0.7,
+      temperature: _temperature,
       enableThinking: enableThinking,
-      extra: const {'cache_prompt': true},
+      extra: _promptCacheExtra,
     );
     _logServerUsage(response.usage);
 
@@ -514,11 +607,11 @@ class ProjectCoordinatorSession {
       model: _effectiveModel,
       messages: messages,
       tools: effectiveTools,
-      temperature: 0.7,
+      temperature: _temperature,
       repeatPenalty: _kRepeatPenalty,
       maxCompletionTokens: _kMaxCompletionTokens,
       enableThinking: enableThinking,
-      extra: const {'cache_prompt': true},
+      extra: _promptCacheExtra,
     );
   }
 
@@ -561,17 +654,57 @@ class ProjectCoordinatorSession {
     // the general project chat (PLANS/ exists from the start of planning).
     final allTools = discoveryMode
         ? CoordinatorTools.buildToolSchemas(discoveryOnly: true)
+        : verificationTaskId != null
+        ? CoordinatorTools.buildToolSchemas(verificationOnly: true)
         : fixMode
         ? CoordinatorTools.buildToolSchemas(fixOnly: true)
         : scaffoldMode
         ? CoordinatorTools.buildToolSchemas(scaffoldOnly: true)
         : editorMode
         ? CoordinatorTools.buildToolSchemas(editorOnly: true)
+        : workBranch != null
+        ? CoordinatorTools.buildToolSchemas(workerOnly: true)
         : CoordinatorTools.buildToolSchemas(
             includePlanTools: planStore != null,
             includePlannerComplete: onPlanningComplete != null,
             includePlannerReview: onPlanReview != null,
           );
+    String normalizedWorkerPath(String raw) {
+      var path = raw.trim().replaceAll('\\', '/');
+      if (path.isEmpty) return '';
+      if (!path.startsWith('/')) path = '/$path';
+      while (path.contains('//')) {
+        path = path.replaceAll('//', '/');
+      }
+      return path;
+    }
+
+    final workerReadablePaths = <String>{};
+    if ((workBranch != null || verificationTaskId != null) &&
+        workspace != null) {
+      try {
+        workerReadablePaths.addAll(
+          (await workspace!.walk())
+              .where((entry) => !entry.isDirectory)
+              .map((entry) => normalizedWorkerPath(entry.path)),
+        );
+      } catch (_) {}
+    }
+    final workerReadFallbacks = <String>[
+      if (workerReadablePaths.contains('/WORK_TEMPLATE.md'))
+        '/WORK_TEMPLATE.md',
+      ...workerRequiredFiles.where(workerReadablePaths.contains),
+      if (workerReadablePaths.contains('/lib/core/game_contracts.dart'))
+        '/lib/core/game_contracts.dart',
+      if (workerReadablePaths.contains('/lib/main.dart')) '/lib/main.dart',
+      ...(workerReadablePaths.toList()..sort()),
+    ];
+    final verificationReadFallbacks = <String>[
+      ...verificationReadFiles.where(workerReadablePaths.contains),
+      if (workerReadablePaths.contains('/lib/core/game_contracts.dart') &&
+          !verificationReadFiles.contains('/lib/core/game_contracts.dart'))
+        '/lib/core/game_contracts.dart',
+    ];
     final executor = db != null
         ? CoordinatorToolExecutor(
             db: db!,
@@ -593,6 +726,10 @@ class ProjectCoordinatorSession {
             onImage: onImage,
             workBranch: workBranch,
             gitLane: gitLane,
+            workTaskId: workTaskId,
+            workerWriteRoots: workerWriteRoots,
+            workerRequiredFiles: workerRequiredFiles,
+            verificationTaskId: verificationTaskId,
             claimFile: fileClaim,
             editorMode: editorMode,
           )
@@ -612,6 +749,120 @@ class ProjectCoordinatorSession {
     // turn; if not (and it only announced), we poke it to make the change.
     var editorActed = false;
     var editorNudges = 0;
+    // Autonomous worker turns use a small, deterministic action funnel. Weak
+    // tool-calling models otherwise keep choosing read/list operations forever,
+    // even when tool use is required. Three reads are enough to ground the task;
+    // then it must edit, commit, and submit. Counts live for this runTurn, whose
+    // eight internal rounds fit that complete sequence.
+    var workerReadActions = 0;
+    var workerWriteActions = 0;
+    var workerCommitted = false;
+    var workerProtocolFailures = 0;
+    final workerReadPaths = <String>{};
+    var verificationStarted = false;
+    var verificationReadActions = 0;
+    var verificationFinished = false;
+    final verificationReadPaths = <String>{};
+    final verificationReadGoal = verificationReadFallbacks.length >= 2
+        ? 2
+        : verificationReadFallbacks.length;
+    List<Map<String, dynamic>> workerPhaseTools(
+      List<Map<String, dynamic>> available,
+    ) {
+      Set<String> names;
+      if (workerCommitted) {
+        names = const {'submit_for_completion'};
+      } else if (workerReadActions < 3) {
+        names = const {'read_file'};
+      } else if (workerWriteActions == 0) {
+        names = const {
+          'write_file',
+          'edit_file',
+          'generate_image',
+          'edit_image',
+        };
+      } else if (workerWriteActions >= 3) {
+        names = const {'git_commit'};
+      } else {
+        names = const {
+          'write_file',
+          'edit_file',
+          'generate_image',
+          'edit_image',
+          'git_commit',
+        };
+      }
+      final selected = available
+          .where((tool) {
+            final function = tool['function'];
+            final name = function is Map ? function['name'] : null;
+            return name is String && names.contains(name);
+          })
+          // Schema literals contain narrowly inferred nested map types. Clone
+          // through JSON before adding an enum so every nested value remains
+          // safely dynamic.
+          .map(
+            (tool) =>
+                (jsonDecode(jsonEncode(tool)) as Map).cast<String, dynamic>(),
+          )
+          .toList();
+      // The Templater gives ordinary code tasks one authoritative starter.
+      // Put that path in the JSON schema as an enum so the Router cannot invent
+      // host paths from stale/off-domain context while choosing a write tool.
+      if (workerRequiredFiles.isNotEmpty) {
+        final paths = workerRequiredFiles.toList()..sort();
+        for (final tool in selected) {
+          final function = tool['function'];
+          if (function is! Map ||
+              !const {'write_file', 'edit_file'}.contains(function['name'])) {
+            continue;
+          }
+          final parameters = function['parameters'];
+          if (parameters is! Map) continue;
+          final properties = parameters['properties'];
+          if (properties is! Map) continue;
+          final path = properties['path'];
+          if (path is! Map) continue;
+          path['enum'] = paths;
+          path['description'] =
+              'Use exactly the Templater-owned task file: ${paths.join(', ')}';
+        }
+      }
+      return selected;
+    }
+
+    bool workerToolSucceeded(String name, String result) => switch (name) {
+      'read_file' => result.startsWith('File "'),
+      'read_file_chunk' => result.startsWith('"') && result.contains(' lines '),
+      'search_directory' ||
+      'search_file_content' => !result.toLowerCase().contains('failed'),
+      'write_file' =>
+        result.startsWith('Updated file "') ||
+            result.startsWith('Created file "'),
+      'edit_file' => result.startsWith('Edited "'),
+      'generate_image' || 'edit_image' =>
+        result.startsWith('Generated ') || result.startsWith('Edited '),
+      'git_commit' => result.startsWith('Committed'),
+      'submit_for_completion' => result.startsWith('Submitted task'),
+      _ => false,
+    };
+
+    String verificationExpectedTool() {
+      if (!verificationStarted) return 'run_verification';
+      if (verificationReadActions < verificationReadGoal) return 'read_file';
+      return 'submit_verdict';
+    }
+
+    List<Map<String, dynamic>> verificationPhaseTools(
+      List<Map<String, dynamic>> available,
+    ) {
+      final expected = verificationExpectedTool();
+      return available.where((tool) {
+        final function = tool['function'];
+        return function is Map && function['name'] == expected;
+      }).toList();
+    }
+
     try {
       for (var round = 0; round < maxToolRounds; round++) {
         // Rebuilt each round so a request_tools unlock takes effect immediately.
@@ -621,9 +872,18 @@ class ProjectCoordinatorSession {
         // verbatim (no lean gating / request_tools) so they stay inside their
         // narrow job — the editor gets its file/git/build/CI set offered up front
         // so it edits without a "request tools" dance.
-        final tools = (discoveryMode || scaffoldMode || fixMode || editorMode)
+        var tools =
+            (discoveryMode ||
+                scaffoldMode ||
+                fixMode ||
+                editorMode ||
+                verificationTaskId != null)
             ? allTools
             : _effectiveTools(allTools);
+        if (workBranch != null) tools = workerPhaseTools(tools);
+        if (verificationTaskId != null) {
+          tools = verificationPhaseTools(tools);
+        }
         final sys = await _buildSystemPrompt(
           currentPlanContext: currentPlanContext,
         );
@@ -647,17 +907,21 @@ class ProjectCoordinatorSession {
           tools,
           onToolsDropped: (d) => toolsDropped = d,
         )) {
+          _turnActivity.add(null);
           if (ev is ChatContentDelta) {
             buf.write(ev.text);
             if (inlineToolText) continue;
             final lead = buf.toString().trimLeft();
-            if (lead.startsWith('<tool_call') || lead.startsWith('<function=')) {
+            if (lead.startsWith('<tool_call') ||
+                lead.startsWith('<function=')) {
               inlineToolText = true;
               continue;
             }
             yield ev; // forward live (do NOT also re-yield the full content below)
           } else if (ev is ChatReasoningDelta) {
-            _reasonBuf.write(ev.text); // capture thoughts for the training trace
+            _reasonBuf.write(
+              ev.text,
+            ); // capture thoughts for the training trace
             yield ev; // forward thinking tokens live; not part of the answer text
           } else if (ev is ChatStreamFinish) {
             toolCalls = ev.toolCalls;
@@ -769,6 +1033,13 @@ class ProjectCoordinatorSession {
 
         // Execute each tool call, append results, then loop for the spoken answer.
         executedTool = true;
+        var workerSubmitted = false;
+        final offeredToolNames = tools
+            .map((tool) => tool['function'])
+            .whereType<Map>()
+            .map((function) => function['name'])
+            .whereType<String>()
+            .toSet();
         for (final call in toolCalls) {
           Map<String, dynamic> args = {};
           try {
@@ -776,6 +1047,97 @@ class ProjectCoordinatorSession {
             if (raw.startsWith('{'))
               args = (jsonDecode(raw) as Map).cast<String, dynamic>();
           } catch (_) {}
+
+          // Inline-call recovery must obey the same phase boundary as native
+          // tool calls. Previously a no-tools/off-domain Router response could
+          // name any real tool and the recovery path would execute it even when
+          // that tool was never offered in this round.
+          if (!offeredToolNames.contains(call.function.name)) {
+            final expected = offeredToolNames.toList()..sort();
+            final result =
+                'Tool ${call.function.name} rejected: it is not available in '
+                'this phase. Call one of: ${expected.join(', ')}.';
+            onToolResult?.call(result);
+            _history.add({
+              'role': 'tool',
+              'tool_call_id': call.id,
+              'content': result,
+            });
+            _fullTrace.add({
+              'role': 'tool',
+              'tool_call_id': call.id,
+              'content': result,
+            });
+            if (workBranch != null && ++workerProtocolFailures >= 3) {
+              throw StateError(
+                'Worker repeatedly returned off-phase tool calls; rotating its '
+                'Router dispatch instead of spending the full turn.',
+              );
+            }
+            continue;
+          }
+
+          // Tool-only workers are sometimes served a stale/off-domain model
+          // response with paths from another environment. Ground the first
+          // three reads deterministically in the real template, owned starter,
+          // and shared contract. Failed reads do not advance this sequence.
+          if (workBranch != null &&
+              workerReadActions < 3 &&
+              const {
+                'read_file',
+                'read_file_chunk',
+              }.contains(call.function.name) &&
+              workerReadFallbacks.isNotEmpty) {
+            final unread = workerReadFallbacks.where(
+              (path) => !workerReadPaths.contains(path),
+            );
+            args['path'] = unread.isEmpty
+                ? workerReadFallbacks.first
+                : unread.first;
+          }
+
+          if (workBranch != null) {
+            args = normalizeAutonomousWorkerToolArguments(
+              toolName: call.function.name,
+              arguments: args,
+              workTaskId: workTaskId,
+              workerRequiredFiles: workerRequiredFiles,
+            );
+          }
+
+          if (verificationTaskId != null) {
+            if (call.function.name == 'run_verification' ||
+                call.function.name == 'submit_verdict') {
+              args['task_id'] = verificationTaskId;
+            } else if (call.function.name == 'read_file' &&
+                verificationReadFallbacks.isNotEmpty) {
+              final unread = verificationReadFallbacks.where(
+                (path) => !verificationReadPaths.contains(path),
+              );
+              args['path'] = unread.isEmpty
+                  ? verificationReadFallbacks.first
+                  : unread.first;
+            }
+
+            final expected = verificationExpectedTool();
+            if (call.function.name != expected) {
+              final result =
+                  'Verification step rejected: call $expected now; '
+                  '${call.function.name} is not available at this stage.';
+              onToolResult?.call(result);
+              _history.add({
+                'role': 'tool',
+                'tool_call_id': call.id,
+                'content': result,
+              });
+              _fullTrace.add({
+                'role': 'tool',
+                'tool_call_id': call.id,
+                'content': result,
+              });
+              continue;
+            }
+          }
 
           // Progressive tool disclosure: unlock a gated group for the rest of
           // the conversation. Handled here (session state), not the executor.
@@ -844,6 +1206,58 @@ class ProjectCoordinatorSession {
               name: call.function.name,
               args: args,
             );
+            if (workBranch != null &&
+                call.function.name == 'submit_for_completion' &&
+                result.startsWith('Submitted task')) {
+              workerSubmitted = true;
+            }
+            if (workBranch != null &&
+                workerToolSucceeded(call.function.name, result)) {
+              if (const {
+                'read_file',
+                'read_file_chunk',
+                'search_directory',
+                'search_file_content',
+              }.contains(call.function.name)) {
+                workerReadActions++;
+                workerReadPaths.add(
+                  normalizedWorkerPath(
+                    (args['path'] ?? args['file_path'] ?? '').toString(),
+                  ),
+                );
+              }
+              if (const {
+                'write_file',
+                'edit_file',
+                'generate_image',
+                'edit_image',
+              }.contains(call.function.name)) {
+                workerWriteActions++;
+                final written = normalizedWorkerPath(
+                  (args['path'] ?? args['file_path'] ?? '').toString(),
+                );
+                if (written.isNotEmpty) workerReadablePaths.add(written);
+              }
+              if (call.function.name == 'git_commit') {
+                workerCommitted = true;
+              }
+            }
+            if (verificationTaskId != null) {
+              if (call.function.name == 'run_verification' &&
+                  result.startsWith('Verifying task')) {
+                verificationStarted = true;
+              } else if (call.function.name == 'read_file' &&
+                  result.startsWith('File "')) {
+                verificationReadActions++;
+                verificationReadPaths.add(
+                  normalizedWorkerPath((args['path'] ?? '').toString()),
+                );
+              } else if (call.function.name == 'submit_verdict' &&
+                  (result.startsWith('Verdict PASS recorded') ||
+                      result.startsWith('Verdict FAIL recorded'))) {
+                verificationFinished = true;
+              }
+            }
             // A real write happened this turn → the editor acted (suppresses the
             // "you only described it" nudge).
             if (_isEditWriteTool(call.function.name)) editorActed = true;
@@ -870,6 +1284,27 @@ class ProjectCoordinatorSession {
             'tool_call_id': call.id,
             'content': body,
           });
+          if (workBranch != null &&
+              result.contains("outside this task's owned scope") &&
+              ++workerProtocolFailures >= 3) {
+            throw StateError(
+              'Worker repeatedly returned off-scope file paths; rotating its '
+              'Router dispatch instead of spending the full turn.',
+            );
+          }
+          if (verificationFinished) break;
+        }
+        // Submission is the worker's terminal action. A required-tool worker
+        // must not be forced into another round after the task has moved to
+        // Review, where it could only repeat work or touch more files.
+        if (workerSubmitted || verificationFinished) {
+          onTrace?.call(_traceMessages(lastSys));
+          yield const ChatStreamFinish(
+            finishReason: 'stop',
+            toolCalls: [],
+            contentSoFar: '',
+          );
+          return;
         }
       }
     } catch (e) {
@@ -882,6 +1317,19 @@ class ProjectCoordinatorSession {
       }
       _reasonBuf.clear();
       rethrow;
+    }
+
+    // The outer templater loop validates the real workspace after each batch of
+    // tool rounds. It does not consume a spoken answer, so avoid an extra
+    // no-tools request that can hang and cannot advance the scaffold.
+    if (scaffoldMode || workBranch != null || verificationTaskId != null) {
+      if (executedTool) onTrace?.call(_traceMessages(lastSys));
+      yield const ChatStreamFinish(
+        finishReason: 'length',
+        toolCalls: [],
+        contentSoFar: '',
+      );
+      return;
     }
 
     // Hit the round cap with tool work still pending. Don't end the turn on
@@ -935,7 +1383,9 @@ class ProjectCoordinatorSession {
         await _runRecoveredCalls(wrapRecovered, executor, onToolResult);
         wrapStr = _stripInlineToolCalls(wrapStr);
         if (wrapStr.isEmpty) {
-          wrapStr = discoveryMode ? 'Updated the story tree.' : 'Applied the changes.';
+          wrapStr = discoveryMode
+              ? 'Updated the story tree.'
+              : 'Applied the changes.';
         }
         yield ChatContentDelta(wrapStr);
       } else if (wrapInlineText) {
@@ -1020,14 +1470,17 @@ class ProjectCoordinatorSession {
     // (dedupe), because the newest copy already carries the current contents.
     final latestReadOf = <String, int>{};
     for (final i in toolIdx) {
-      final match = _fileReadRe.firstMatch((msgs[i]['content'] ?? '').toString());
+      final match = _fileReadRe.firstMatch(
+        (msgs[i]['content'] ?? '').toString(),
+      );
       if (match != null) latestReadOf[match.group(1)!] = i;
     }
     // Everything before this index is "old" and eligible for elision.
     final keepFrom = toolIdx.length <= _keepFullToolResults
         ? 0
         : toolIdx[toolIdx.length - _keepFullToolResults];
-    if (toolIdx.length <= _keepFullToolResults && latestReadOf.length == toolIdx.length) {
+    if (toolIdx.length <= _keepFullToolResults &&
+        latestReadOf.length == toolIdx.length) {
       return msgs; // nothing old AND no duplicate reads → nothing to compact
     }
     final out = <Map<String, dynamic>>[];
@@ -1042,7 +1495,9 @@ class ProjectCoordinatorSession {
             fileMatch != null && latestReadOf[fileMatch.group(1)] != i;
         if ((i < keepFrom || supersededDup) &&
             content.length > _elideToolResultOver) {
-          final what = fileMatch != null ? '"${fileMatch.group(1)}"' : 'a resource';
+          final what = fileMatch != null
+              ? '"${fileMatch.group(1)}"'
+              : 'a resource';
           out.add({
             ...m,
             'content':
@@ -1233,14 +1688,14 @@ class ProjectCoordinatorSession {
           model: _effectiveModel,
           messages: messages,
           tools: tools,
-          temperature: 0.7,
+          temperature: _temperature,
           repeatPenalty: _kRepeatPenalty,
           maxCompletionTokens: _kMaxCompletionTokens,
           enableThinking: enableThinking,
           // Reuse the server KV cache for the stable prefix (system + prior
           // turns) instead of re-prefilling the whole context every turn — the
           // dominant build-time cost. Harmless on backends that ignore it.
-          extra: const {'cache_prompt': true},
+          extra: _roundExtra(tools),
         )) {
           emitted = true;
           yield ev;
@@ -1331,11 +1786,11 @@ class ProjectCoordinatorSession {
       model: _effectiveModel,
       messages: messages,
       tools: tools,
-      temperature: 0.7,
+      temperature: _temperature,
       repeatPenalty: _kRepeatPenalty,
       maxCompletionTokens: _kMaxCompletionTokens,
       enableThinking: enableThinking,
-      extra: const {'cache_prompt': true},
+      extra: _roundExtra(tools),
     );
     _logServerUsage(resp.usage);
     final msg = resp.choices.isNotEmpty ? resp.choices.first.message : null;
@@ -1347,6 +1802,19 @@ class ProjectCoordinatorSession {
       contentSoFar: content,
     );
   }
+
+  /// Scaffolding and autonomous worker turns cannot make progress through prose:
+  /// both must act on the workspace (and workers must eventually submit). Make
+  /// their tool use explicit so an auto-tool model cannot burn every turn merely
+  /// describing work. Interactive and review conversations retain automatic
+  /// tool choice.
+  Map<String, dynamic> _roundExtra(List<Map<String, dynamic>>? tools) => {
+    ..._promptCacheExtra,
+    if ((scaffoldMode || workBranch != null || verificationTaskId != null) &&
+        tools != null &&
+        tools.isNotEmpty)
+      'tool_choice': 'required',
+  };
 
   /// Executes a batch of tool calls (from ChatStreamFinish) against the live DB.
   /// Returns human-readable results for each. Appends tool messages to history
@@ -1378,6 +1846,10 @@ class ProjectCoordinatorSession {
       buildService: buildService,
       workBranch: workBranch,
       gitLane: gitLane,
+      workTaskId: workTaskId,
+      workerWriteRoots: workerWriteRoots,
+      workerRequiredFiles: workerRequiredFiles,
+      verificationTaskId: verificationTaskId,
       claimFile: fileClaim,
       editorMode: editorMode,
     );

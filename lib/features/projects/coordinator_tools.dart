@@ -41,33 +41,65 @@ class CoordinatorTools {
   /// orchestration tools so the scaffolder can't wander off (e.g. into
   /// generate_image) — its only job is to lay down a compiling base + stubs.
   static const Set<String> _scaffoldToolNames = {
-    // Files
-    'list_files', 'read_file', 'read_file_chunk', 'list_directory',
-    'search_directory', 'search_file_content', 'create_file', 'edit_file',
-    'write_file', 'create_directory', 'move_path',
-    // Git
-    'git_status', 'git_log', 'git_branches', 'git_create_branch', 'git_commit',
-    'git_checkout_branch',
-    // Build / CI
-    'scaffold_ci_workflow', 'run_workflow', 'list_ci_runs', 'get_ci_run',
-    'build_docker_image',
+    // This phase starts from a known-empty workspace and receives the complete
+    // baseline/task map in its prompt. Giving the routed coding model read and
+    // Git choices made it inspect imaginary host paths and create empty commits
+    // instead of scaffolding. It authors files; the phase validates and commits.
+    'write_file',
+  };
+
+  /// Autonomous task workers already receive their task, branch, file tree and
+  /// WORK_TEMPLATE in the orchestrator prompt. Keep their menu to the actions
+  /// that can advance that task; project/task administration and branch
+  /// switching only distract the model or are denied by its role policy.
+  static const Set<String> _workerToolNames = {
+    'read_file',
+    'read_file_chunk',
+    'search_directory',
+    'search_file_content',
+    'write_file',
+    'edit_file',
+    'git_status',
+    'git_log',
+    'git_commit',
+    'submit_for_completion',
+    'generate_image',
+    'edit_image',
+  };
+
+  /// A verifier has one bounded job: load the submitted task, inspect the
+  /// implementation named by its template, and record a verdict. Keeping this
+  /// list separate prevents a small review model from wandering into project
+  /// administration, Git, CI, or write tools and then ending without a verdict.
+  static const Set<String> _verificationToolNames = {
+    'run_verification',
+    'read_file',
+    'submit_verdict',
   };
 
   /// The end-of-project TESTING fix agent's toolset: file + git ONLY (the
   /// scaffold set minus the CI/build tools). The phase re-runs CI itself, and the
   /// generalist persona it runs as DENIES the CI tools — so offering them only
   /// tempts the model into a blocked call. Keep it to read/edit/write + commit.
-  static final Set<String> _fixToolNames = _scaffoldToolNames
-      .where(
-        (n) => !const {
-          'scaffold_ci_workflow',
-          'run_workflow',
-          'list_ci_runs',
-          'get_ci_run',
-          'build_docker_image',
-        }.contains(n),
-      )
-      .toSet();
+  static const Set<String> _fixToolNames = {
+    'list_files',
+    'read_file',
+    'read_file_chunk',
+    'list_directory',
+    'search_directory',
+    'search_file_content',
+    'create_file',
+    'edit_file',
+    'write_file',
+    'create_directory',
+    'move_path',
+    'git_status',
+    'git_log',
+    'git_branches',
+    'git_create_branch',
+    'git_commit',
+    'git_checkout_branch',
+  };
 
   /// The post-completion EDITOR's toolset: a PURE DELEGATOR. Deliberately has NO
   /// code read/edit/write tools — the editor turns each request into tasks and
@@ -78,11 +110,22 @@ class CoordinatorTools {
   /// visibility to report progress. (The human reads/edits code in the IDE panes
   /// beside the chat.)
   static const Set<String> _editorToolNames = {
-    'list_tasks', 'list_open_tasks', 'get_task', 'create_task', 'update_task',
-    'update_task_status', 'set_task_dates', 'set_task_build_config',
-    'assign_agent_to_task', 'list_agents', 'start_delegated_build',
-    'review_submission', 'approve_task', 'reject_task',
-    'list_ci_runs', 'get_ci_run',
+    'list_tasks',
+    'list_open_tasks',
+    'get_task',
+    'create_task',
+    'update_task',
+    'update_task_status',
+    'set_task_dates',
+    'set_task_build_config',
+    'assign_agent_to_task',
+    'list_agents',
+    'start_delegated_build',
+    'review_submission',
+    'approve_task',
+    'reject_task',
+    'list_ci_runs',
+    'get_ci_run',
   };
 
   static List<Map<String, dynamic>> buildToolSchemas({
@@ -92,6 +135,8 @@ class CoordinatorTools {
     bool includeStoryTools = false,
     bool discoveryOnly = false,
     bool scaffoldOnly = false,
+    bool workerOnly = false,
+    bool verificationOnly = false,
     bool fixOnly = false,
     bool editorOnly = false,
   }) {
@@ -105,8 +150,16 @@ class CoordinatorTools {
     // same file/git/build/CI set as the scaffolder (it edits the built app and
     // must be able to verify/build + run CI), just no story/task-orchestration
     // tools it has no use for.
-    if (scaffoldOnly || fixOnly || editorOnly) {
-      final allow = fixOnly
+    if (scaffoldOnly ||
+        workerOnly ||
+        verificationOnly ||
+        fixOnly ||
+        editorOnly) {
+      final allow = workerOnly
+          ? _workerToolNames
+          : verificationOnly
+          ? _verificationToolNames
+          : fixOnly
           ? _fixToolNames
           : editorOnly
           ? _editorToolNames
@@ -1069,7 +1122,7 @@ class CoordinatorTools {
                 'description': 'The observed proof that justifies the verdict.',
               },
             },
-            'required': ['task_id', 'verdict'],
+            'required': ['task_id', 'verdict', 'evidence'],
           },
         },
       },
@@ -1175,10 +1228,7 @@ class CoordinatorTools {
           'parameters': {
             'type': 'object',
             'properties': {
-              'path': {
-                'type': 'string',
-                'description': 'Workspace file path.',
-              },
+              'path': {'type': 'string', 'description': 'Workspace file path.'},
               'query': {'type': 'string', 'description': 'The text to find.'},
             },
             'required': ['path', 'query'],
@@ -1194,10 +1244,7 @@ class CoordinatorTools {
           'parameters': {
             'type': 'object',
             'properties': {
-              'path': {
-                'type': 'string',
-                'description': 'Workspace file path.',
-              },
+              'path': {'type': 'string', 'description': 'Workspace file path.'},
               'start_line': {
                 'type': 'integer',
                 'description': 'First line to read (1-based).',
@@ -1343,7 +1390,8 @@ class CoordinatorTools {
             },
             'parent_story_id': {
               'type': 'string',
-              'description': 'Optional parent to add the drafted stories under.',
+              'description':
+                  'Optional parent to add the drafted stories under.',
             },
           },
           'required': ['text'],
@@ -1430,7 +1478,8 @@ class CoordinatorTools {
             'story_id': {'type': 'string'},
             'parent_story_id': {
               'type': 'string',
-              'description': 'New parent id, or "null"/empty to make it a root.',
+              'description':
+                  'New parent id, or "null"/empty to make it a root.',
             },
             'order_index': {'type': 'integer'},
           },
@@ -1685,6 +1734,20 @@ class CoordinatorToolExecutor {
   final String? workBranch;
   final AsyncLock? gitLane;
 
+  /// Assigned task identity and Templater-owned mutation scope. Autonomous
+  /// workers may read the whole tree, but they may only change their owned roots,
+  /// must touch the required starter, and may only submit their assigned task.
+  final int? workTaskId;
+  final Set<String> workerWriteRoots;
+  final Set<String> workerRequiredFiles;
+  final Set<String> _workerTouchedPaths = {};
+  bool _workerCommittedScopedWork = false;
+
+  /// Assigned task identity for an isolated functional review. The model may
+  /// omit or hallucinate an id; both verifier state-changing tools are pinned
+  /// to this value so one review can never mutate another task.
+  final int? verificationTaskId;
+
   /// File-claim guard for orchestrated workers: returns true if THIS task may
   /// edit [path] (it's free or already ours), false if another task holds it.
   /// The orchestrator owns the lock table and holds a file from first edit until
@@ -1717,6 +1780,10 @@ class CoordinatorToolExecutor {
     this.onImage,
     this.workBranch,
     this.gitLane,
+    this.workTaskId,
+    this.workerWriteRoots = const {},
+    this.workerRequiredFiles = const {},
+    this.verificationTaskId,
     this.claimFile,
     this.editorMode = false,
   });
@@ -1733,6 +1800,43 @@ class CoordinatorToolExecutor {
         'conflict) and is queued. Do NOT keep trying to edit it — work on a '
         'different file if you can; this task will automatically resume and '
         'redo against the latest code once the other task finishes.';
+  }
+
+  String _normalizedWorkerPath(String raw) {
+    var path = raw.trim().replaceAll('\\', '/');
+    if (path.isEmpty) return '';
+    if (!path.startsWith('/')) path = '/$path';
+    while (path.contains('//')) {
+      path = path.replaceAll('//', '/');
+    }
+    return path;
+  }
+
+  String? _workerScopeBlocked(String operation, String path) {
+    if (!_isolatedTask || workerWriteRoots.isEmpty) return null;
+    final normalized = _normalizedWorkerPath(path);
+    final inScope = workerWriteRoots.any(
+      (root) => normalized == root || normalized.startsWith('$root/'),
+    );
+    if (inScope) return null;
+    final required = workerRequiredFiles.isEmpty
+        ? ''
+        : ' The required starter is ${workerRequiredFiles.join(', ')}.';
+    return '$operation failed: "$normalized" is outside this task\'s owned '
+        'scope (${workerWriteRoots.join(', ')}). Read shared files if needed, '
+        'but only write inside the owned scope from WORK_TEMPLATE.md.$required';
+  }
+
+  void _recordWorkerEdit(String path) {
+    if (_isolatedTask) {
+      _workerTouchedPaths.add(_normalizedWorkerPath(path));
+    }
+  }
+
+  bool get _workerTouchedRequiredFile {
+    if (_workerTouchedPaths.isEmpty) return false;
+    if (workerRequiredFiles.isEmpty) return true;
+    return _workerTouchedPaths.any(workerRequiredFiles.contains);
   }
 
   /// True when running as an orchestrated worker on an isolated task tree.
@@ -1996,7 +2100,8 @@ class CoordinatorToolExecutor {
   /// the main discovery session.
   Future<String> _draftStoriesFromText(Map<String, dynamic> args) async {
     final text = (args['text'] as String? ?? '').trim();
-    if (text.isEmpty) return 'draft_stories_from_text failed: text is required.';
+    if (text.isEmpty)
+      return 'draft_stories_from_text failed: text is required.';
     final parentId = _asInt(args['parent_story_id']);
     if (parentId != null && await db.getUserStoryById(parentId) == null) {
       return 'draft_stories_from_text failed: parent story #$parentId not found.';
@@ -2105,11 +2210,11 @@ class CoordinatorToolExecutor {
     final summary =
         'Drafted $made user stor${made == 1 ? 'y' : 'ies'} '
         '${usedAi ? '(rephrased + nested into a tree)' : '(split straight from '
-              'your text — titles are literal, so tidy/rephrase + nest them with '
-              'update_user_story and move_user_story)'}'
+                  'your text — titles are literal, so tidy/rephrase + nest them with '
+                  'update_user_story and move_user_story)'}'
         '${parentId != null ? ' under #$parentId' : ''}'
         '${skipped > 0 ? ' (skipped $skipped duplicate'
-              '${skipped == 1 ? '' : 's'} already on the tree)' : ''}. '
+                  '${skipped == 1 ? '' : 's'} already on the tree)' : ''}. '
         'Check the shape with list_user_stories; fix any nesting with '
         'move_user_story if needed.';
 
@@ -2185,7 +2290,12 @@ class CoordinatorToolExecutor {
       final words = seg.split(RegExp(r'\s+'));
       final title = (words.length <= 9 ? seg : '${words.take(9).join(' ')}…')
           .replaceAll(RegExp(r'[.!?;,]+$'), '');
-      items.add({'title': title, 'description': seg, 'note': '', 'parent': null});
+      items.add({
+        'title': title,
+        'description': seg,
+        'note': '',
+        'parent': null,
+      });
       if (items.length >= 8) break; // bound the batch like the AI path (3–8)
     }
     return items;
@@ -2341,7 +2451,9 @@ class CoordinatorToolExecutor {
         acceptanceCriteria: s('acceptance_criteria') != null
             ? Value(s('acceptance_criteria'))
             : const Value.absent(),
-        status: s('status') != null ? Value(s('status')!) : const Value.absent(),
+        status: s('status') != null
+            ? Value(s('status')!)
+            : const Value.absent(),
       ),
     );
     return 'Updated user story #$id.';
@@ -2646,7 +2758,8 @@ class CoordinatorToolExecutor {
 
   Future<String> _editImage(Map<String, dynamic> args) async {
     final prompt = (args['prompt'] as String? ?? '').trim();
-    if (prompt.isEmpty) return 'edit_image needs a prompt describing the change.';
+    if (prompt.isEmpty)
+      return 'edit_image needs a prompt describing the change.';
     final size = (args['size'] as String?) ?? '1024x1024';
     if (inference == null) {
       return 'Image editing is not available (no inference backend).';
@@ -3123,11 +3236,14 @@ class CoordinatorToolExecutor {
     final content = args['content'] as String?;
     if (path.isEmpty || content == null)
       return 'write_file failed: path and content are required.';
+    final scope = _workerScopeBlocked('write_file', path);
+    if (scope != null) return scope;
     final busy = _fileBusy(path);
     if (busy != null) return busy;
     try {
       final existed = await workspace!.exists(path);
       await workspace!.writeString(path, content);
+      _recordWorkerEdit(path);
       return '${existed ? 'Updated' : 'Created'} file "$path" (${content.length} chars).';
     } catch (e) {
       return 'write_file failed for "$path": $e';
@@ -3353,6 +3469,8 @@ class CoordinatorToolExecutor {
     if (path.isEmpty || oldText == null || newText == null) {
       return 'edit_file failed: path, old_text and new_text are required.';
     }
+    final scope = _workerScopeBlocked('edit_file', path);
+    if (scope != null) return scope;
     final busy = _fileBusy(path);
     if (busy != null) return busy;
     try {
@@ -3365,6 +3483,7 @@ class CoordinatorToolExecutor {
       }
       final updated = content.replaceFirst(oldText, newText);
       await workspace!.writeString(path, updated);
+      _recordWorkerEdit(path);
       return 'Edited "$path" (replaced first occurrence of old_text).';
     } catch (e) {
       return 'edit_file failed for "$path": $e';
@@ -3445,10 +3564,35 @@ class CoordinatorToolExecutor {
   static bool _looksBinaryPath(String p) {
     final lower = p.toLowerCase();
     const bin = [
-      '.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.bmp', '.svg',
-      '.ttf', '.otf', '.woff', '.woff2', '.mp3', '.wav', '.ogg', '.mp4',
-      '.mov', '.zip', '.gz', '.jar', '.so', '.dll', '.exe', '.wasm', '.bin',
-      '.pdf', '.keystore', '.jks', '.p12',
+      '.png',
+      '.jpg',
+      '.jpeg',
+      '.gif',
+      '.webp',
+      '.ico',
+      '.bmp',
+      '.svg',
+      '.ttf',
+      '.otf',
+      '.woff',
+      '.woff2',
+      '.mp3',
+      '.wav',
+      '.ogg',
+      '.mp4',
+      '.mov',
+      '.zip',
+      '.gz',
+      '.jar',
+      '.so',
+      '.dll',
+      '.exe',
+      '.wasm',
+      '.bin',
+      '.pdf',
+      '.keystore',
+      '.jks',
+      '.p12',
     ];
     return bin.any(lower.endsWith);
   }
@@ -3497,6 +3641,13 @@ class CoordinatorToolExecutor {
     if (git == null) return 'Git is unavailable in this context.';
     final message = (args['message'] as String? ?? '').trim();
     if (message.isEmpty) return 'git_commit failed: message is required.';
+    if (_isolatedTask && !_workerTouchedRequiredFile) {
+      final required = workerRequiredFiles.isEmpty
+          ? 'a file in the task-owned scope'
+          : workerRequiredFiles.join(', ');
+      return 'git_commit failed: this worker has not successfully changed '
+          '$required. Implement the assigned feature there before committing.';
+    }
 
     // GUARD: never commit unresolved conflict markers — they turn a source file
     // into un-parseable garbage the moment they land in history (observed: a
@@ -3505,7 +3656,10 @@ class CoordinatorToolExecutor {
     // resolving. Scans only the paths being committed (or all changed files).
     final rawPathsForScan = args['paths'];
     final scanPaths = (rawPathsForScan is List)
-        ? rawPathsForScan.map((e) => '$e'.trim()).where((e) => e.isNotEmpty).toList()
+        ? rawPathsForScan
+              .map((e) => '$e'.trim())
+              .where((e) => e.isNotEmpty)
+              .toList()
         : const <String>[];
     final marked = await _conflictMarkedFiles(
       onlyPaths: scanPaths.isEmpty ? null : scanPaths,
@@ -3531,6 +3685,7 @@ class CoordinatorToolExecutor {
           ),
         );
         final shortOid = oid.length >= 8 ? oid.substring(0, 8) : oid;
+        _workerCommittedScopedWork = true;
         return 'Committed your working tree to "$workBranch" as $shortOid: "$message".';
       } catch (e) {
         return 'git_commit failed: $e';
@@ -3687,8 +3842,19 @@ class CoordinatorToolExecutor {
   }
 
   Future<String> _submitForCompletion(Map<String, dynamic> args) async {
-    final id = _asInt(args['task_id']);
+    final requestedId = _asInt(args['task_id']);
+    if (workTaskId != null &&
+        requestedId != null &&
+        requestedId != workTaskId) {
+      return 'submit_for_completion failed: this worker is assigned only to '
+          'task $workTaskId, not task $requestedId.';
+    }
+    final id = workTaskId ?? requestedId;
     if (id == null) return 'submit_for_completion failed: task_id is required.';
+    if (_isolatedTask && !_workerCommittedScopedWork) {
+      return 'submit_for_completion failed: commit the implemented task-owned '
+          'starter file before submitting task $id.';
+    }
     final t = await db.getTaskById(id);
     if (t == null) return 'Task $id not found.';
     final summary = (args['summary'] as String? ?? '').trim();
@@ -3697,7 +3863,8 @@ class CoordinatorToolExecutor {
     final submission = <String, dynamic>{
       'summary': summary,
       'evidence': (args['evidence'] as String? ?? '').trim(),
-      'branch': (args['branch'] as String? ?? t.workBranch ?? '').trim(),
+      'branch': (workBranch ?? args['branch'] as String? ?? t.workBranch ?? '')
+          .trim(),
       'submittedBy': agentName,
       'submittedAt': DateTime.now().toIso8601String(),
     };
@@ -3709,7 +3876,14 @@ class CoordinatorToolExecutor {
   }
 
   Future<String> _runVerification(Map<String, dynamic> args) async {
-    final id = _asInt(args['task_id']);
+    final requestedId = _asInt(args['task_id']);
+    if (verificationTaskId != null &&
+        requestedId != null &&
+        requestedId != verificationTaskId) {
+      return 'run_verification failed: this verifier is assigned only to task '
+          '$verificationTaskId, not task $requestedId.';
+    }
+    final id = verificationTaskId ?? requestedId;
     if (id == null) return 'run_verification failed: task_id is required.';
     final t = await db.getTaskById(id);
     if (t == null) return 'Task $id not found.';
@@ -3731,7 +3905,14 @@ class CoordinatorToolExecutor {
   }
 
   Future<String> _submitVerdict(Map<String, dynamic> args) async {
-    final id = _asInt(args['task_id']);
+    final requestedId = _asInt(args['task_id']);
+    if (verificationTaskId != null &&
+        requestedId != null &&
+        requestedId != verificationTaskId) {
+      return 'submit_verdict failed: this verifier is assigned only to task '
+          '$verificationTaskId, not task $requestedId.';
+    }
+    final id = verificationTaskId ?? requestedId;
     if (id == null) return 'submit_verdict failed: task_id is required.';
     final t = await db.getTaskById(id);
     if (t == null) return 'Task $id not found.';

@@ -47,6 +47,7 @@ class ProjectPlanningRun {
     required this.projectName,
     this.model,
     this.enableThinking,
+    this.reasoningEffort,
     this.brief = '',
     this.chatSessionPk,
     this.onProgress,
@@ -65,6 +66,10 @@ class ProjectPlanningRun {
   final String projectName;
   final String? model;
   final bool? enableThinking;
+
+  /// Effective thinking level (e.g. 'low'), sent verbatim as `reasoning_effort`
+  /// on every planning session. Null omits the parameter.
+  final String? reasoningEffort;
 
   /// Workspace + git handles for the scaffolding phase. When [scaffold] is true
   /// and these are present, the run writes a base project skeleton to disk and
@@ -179,6 +184,7 @@ class ProjectPlanningRun {
       chatSessionPk: chatSessionPk,
       systemPromptOverride: plannerSystemPrompt(projectName),
       enableThinking: enableThinking,
+      reasoningEffort: reasoningEffort,
       onPlanningComplete: () => done = true,
     );
 
@@ -238,6 +244,7 @@ class ProjectPlanningRun {
         chatSessionPk: chatSessionPk,
         systemPromptOverride: engineerReviewSystemPrompt(projectName, eng.name),
         enableThinking: enableThinking,
+        reasoningEffort: reasoningEffort,
         onPlanReview: (ok, g) {
           approved = ok;
           gapText = g;
@@ -304,6 +311,7 @@ class ProjectPlanningRun {
       confirmAsk: (_, _) async => true,
       systemPromptOverride: scaffolderSystemPrompt(projectName),
       enableThinking: enableThinking,
+      reasoningEffort: reasoningEffort,
     );
 
     for (var i = 0; i < maxScaffoldRounds; i++) {

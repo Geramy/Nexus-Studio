@@ -80,6 +80,10 @@ class SummaryService {
         },
       ],
       temperature: 0.4,
+      // Agent's thinking level, sent verbatim (no clamping).
+      extra: resolved.reasoningEffort != null
+          ? {'reasoning_effort': resolved.reasoningEffort}
+          : null,
     );
 
     final summary = resp.choices.isNotEmpty

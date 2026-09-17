@@ -30,6 +30,7 @@ class ResolvedInference {
     this.ttsVoice,
     this.imageModel,
     this.enableThinking,
+    this.reasoningEffort,
   });
   final InferenceBackend backend;
   final String model;
@@ -39,6 +40,10 @@ class ResolvedInference {
 
   /// Effective enable_thinking for the project agent (null omits the param).
   final bool? enableThinking;
+
+  /// Effective thinking LEVEL for the project agent (e.g. 'low'), sent
+  /// verbatim as `reasoning_effort` (null omits the param).
+  final String? reasoningEffort;
 
   /// Per-modality models for voice "call mode" in the Setup interview. Null
   /// falls back to the server/default at the audio endpoints.
@@ -185,7 +190,7 @@ final projectInferenceProvider = FutureProvider.family<ResolvedInference?, ({int
     name: chosen.name,
     baseUrl: chosen.baseUrl,
     apiKey: chosen.apiKey,
-    providerType: 'lemonade',
+    providerType: chosen.providerType,
     selectedModel: chosen.selectedModel,
     availableModels: models,
   );
@@ -204,5 +209,8 @@ final projectInferenceProvider = FutureProvider.family<ResolvedInference?, ({int
         personaName: persona?.name as String?,
       ),
     ),
+    // Agent's thinking level, sent verbatim as `reasoning_effort` (no
+    // clamping). Agents without an explicit level run at Low for now.
+    reasoningEffort: personaReasoningEffort(persona?.configJson as String?),
   );
 });

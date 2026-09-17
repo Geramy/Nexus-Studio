@@ -70,7 +70,8 @@ extension OrchestratorPromptFieldX on OrchestratorPromptField {
     OrchestratorPromptField.mergeFraming => 'Merge — task framing',
     OrchestratorPromptField.mergeKickoff => 'Merge — first message',
     OrchestratorPromptField.mergeContinue => 'Merge — continue message',
-    OrchestratorPromptField.templaterFraming => 'Templater — base/scaffold framing',
+    OrchestratorPromptField.templaterFraming =>
+      'Templater — base/scaffold framing',
     OrchestratorPromptField.templaterKickoff => 'Templater — first message',
     OrchestratorPromptField.discoverySystem =>
       'Discovery — system prompt (user-story interview)',
@@ -129,14 +130,13 @@ Work branch: "{branch}" — every commit you make must land on this branch.
 
 Build this task with the project's stack from the PROJECT BASELINE above — use its languages, frameworks, databases, libraries, and services (and only those). Implement the task end-to-end, then commit to your branch with git_commit.
 
-WORK EFFICIENTLY — each step re-processes your WHOLE context, so do the MOST per step and finish in as FEW steps as possible:
-- BATCH your tool calls: issue MULTIPLE at once in a SINGLE step. Read ALL the files you need together (several read_file calls in one step), then write ALL your files together, then commit. Do NOT go one file per step — that multiplies the cost. Aim for: read-everything → write-everything → commit → submit, in a handful of steps.
+WORK EFFICIENTLY — follow the single tool phase offered on each round: read the grounded files, implement the exact required starter inside your assigned scope, commit, then submit. Never invent a path; the authoritative scope and starter are written below this task brief.
 - Read ONLY files THIS task touches; don't re-list dirs or re-read files already in context (they're still here). After a create/edit it's SAVED — don't read it back. Don't read_file a path not in CURRENT PROJECT FILES (it just fails). If a file is "held by another task", don't retry — edit something else. Trust your commit once git_log shows it; don't re-commit.
 - Do NOT run build/analyze/CI yourself — it runs ONCE at project end. If this task was bounced, its Description has the FULL error list — fix EVERY error in one pass before resubmitting.
 
 FINISH: the MOMENT your work is committed, call submit_for_completion (task_id={taskId}, concise summary, evidence) — that's the ONLY way it leaves "In Progress". Don't keep polishing after; unsubmitted work is wasted. Push/merge are the Coordinator's job.''',
   OrchestratorPromptField.workerKickoff:
-      'Begin implementing your assigned task (#{taskId}) now. Work in as FEW steps as possible — batch your file reads together, then write all your files, then commit. As soon as it is committed, call submit_for_completion — do not keep working past that.',
+      'Begin implementing your assigned task (#{taskId}) now. Follow the one tool offered each round. After the grounded reads, write the complete implementation to the exact required starter in your authoritative scope, commit it, then call submit_for_completion.',
   OrchestratorPromptField.workerContinue:
       'Continue — but converge. If the task is already implemented and committed to "{branch}", call submit_for_completion NOW (task_id={taskId}, summary, evidence) — do NOT re-read files or re-explore. Otherwise make the next concrete edit toward done. Do not repeat a tool call you already made.',
   OrchestratorPromptField.verifyFraming: '''
@@ -149,9 +149,9 @@ Work is on branch "{branch}" (already checked out).
 Do NOT run the build, analyze, or CI — the project's tests run once at the end, not per task. Your ONLY job is a QUICK confirmation, by READING the changed code, that the FUNCTIONAL behavior described in the verification above actually works: trace the behavior through the code. Converge fast — this is a spot-check, not a re-implementation, and not a code review.
 On a FAIL, submit_verdict's `evidence` MUST state the concrete behavior that is wrong (what you expected vs what the code actually does) so the worker can fix exactly that — not a vague "it failed".''',
   OrchestratorPromptField.verifyKickoff:
-      'Functionally review task #{taskId} by reading the changed code — do NOT run the build/CI/analyze (tests run at project end). Call run_verification, confirm the behavior, then submit_verdict with task_id={taskId}, passed=true|false, and evidence.',
+      'Functionally review task #{taskId} by reading the changed code — do NOT run the build/CI/analyze (tests run at project end). Follow the one tool offered each round: call run_verification, read the implementation, then call submit_verdict with task_id={taskId}, verdict="pass" or "fail", and evidence.',
   OrchestratorPromptField.verifyContinue:
-      'Finish the functional review of task #{taskId}: confirm the behavior from the code and call submit_verdict (passed=false with the concrete behavioral failure if it is wrong). Do NOT run the build.',
+      'Finish the functional review of task #{taskId}: confirm the behavior from the code and call submit_verdict with verdict="pass" or verdict="fail" plus the concrete behavioral failure. Do NOT run the build.',
   OrchestratorPromptField.mergeFraming: '''
 === TASK TO INTEGRATE ===
 Task #{taskId}: {title}
@@ -180,7 +180,7 @@ You are on branch "{branch}" (main); every task branches off it, so it MUST comp
 
 {baseSpec}
 
-YOUR JOB IS EXACTLY THESE THREE THINGS, then commit and stop:
+YOUR JOB IS EXACTLY THESE THREE THINGS, then stop; the app validates and commits:
 1. ENVIRONMENT — create the conventional project skeleton for the stack: the manifest that declares the requested packages/libraries (e.g. pubspec.yaml / package.json / a .csproj / CMakeLists.txt / requirements.txt — whatever the BASELINE language uses), the entry-point / main runner file, a `.gitignore`, and the standard source-folder layout. It must build/analyze with nothing implemented.
 2. CONTRACTS + STUBS + WIRING — in this order:
    (a) CONTRACTS FIRST (the most important thing you do). Identify every SHARED component that MORE THAN ONE task depends on — data models, repositories, services, API/DB clients, DAOs, state/providers, the route/nav table. For EACH, declare its COMPLETE public interface NOW: EVERY method / getter / field the dependent tasks below will call, with full, correct, typed signatures (an abstract class or interface, or a fully-typed class header with method signatures + `// TODO` bodies). DERIVE the member set from what the tasks NEED — read the task list and enumerate: e.g. a task that "lists/filters exercises" implies the repository contract needs `listExercises()`, `getById()`, `add()`, `update()`, `delete()`, `byGroup()`, … so declare them ALL up front. Over-declare rather than under-declare. These interfaces are the CONTRACT every task codes against, so a caller and the implementer can never diverge — this is what prevents the "the service calls 48 methods the repository never declared" merge blow-up.
@@ -196,9 +196,9 @@ RULES:
 - CONTRACTS ARE COMPLETE + FROZEN. A shared interface must be EXHAUSTIVE the first time (list every member any task will need, fully typed) so tasks never have to change it. Downstream, a task that IMPLEMENTS a contracted component satisfies its FULL declared interface; a task that USES one calls ONLY its declared members. Getting the contracts complete now is worth more than the stubs.
 - CODE GENERATION: if the stack uses a codegen library (drift, freezed, json_serializable, riverpod generator, retrofit, …), the manifest MUST include `build_runner` AND the matching generator (e.g. `drift_dev` for drift, `freezed`+`json_serializable`) in dev_dependencies. Declare generated code via a `part '…g.dart';` / `part '…freezed.dart';` directive in the SOURCE and let the build run codegen — NEVER hand-write a `*.g.dart` / `*.freezed.dart` file (a hand-faked one causes hundreds of type-mismatch errors).
 - Do NOT implement features, write real logic, write tests, or generate images. Your only tools are file/git/CI — use them only for the three things above.
-- When the environment + stubs + schema are in place and it compiles, COMMIT with git_commit (message like "chore: scaffold base project"). Then STOP — a CI check runs automatically and the task agents take over from there.''',
+- When the environment + stubs + schema are in place, STOP. The app validates the required artifacts, commits them to main, runs the base CI check, and then starts the task agents.''',
   OrchestratorPromptField.templaterKickoff:
-      'Scaffold the base project on branch "{branch}" now — the THREE things: (1) the environment/manifest + main runner, (2) a stub file per task, (3) the DB schema if there is a database — then commit. Boilerplate + stubs only; it must compile.',
+      'Scaffold the base project on branch "{branch}" now — the THREE things: (1) the environment/manifest + main runner, (2) a stub file per task, (3) the DB schema if there is a database. Write every required file; the app validates and commits them. Boilerplate + stubs only; it must compile.',
   OrchestratorPromptField.discoverySystem: '''
 You are the project Coordinator running the post-setup DISCOVERY interview for "{projectName}". Setup is done and NO tasks exist yet. Your job is to draw out the FULL idea and capture it as a well-structured USER-STORY TREE before any work begins.
 

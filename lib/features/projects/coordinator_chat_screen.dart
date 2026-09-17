@@ -349,7 +349,7 @@ class _ProjectCoordinatorChatScreenState
         name: chosen.name,
         baseUrl: chosen.baseUrl,
         apiKey: chosen.apiKey,
-        providerType: 'lemonade',
+        providerType: chosen.providerType,
         selectedModel: chosen.selectedModel,
         availableModels: models,
       );
@@ -453,6 +453,11 @@ class _ProjectCoordinatorChatScreenState
                   personaName: persona?.name,
                 ),
               ),
+        // Per-agent thinking level, sent verbatim as `reasoning_effort` (no
+        // clamping). Discovery keeps its forced thinking-off behavior.
+        reasoningEffort: widget.discoveryMode
+            ? null
+            : personaReasoningEffort(persona?.configJson),
         leanTools: ref.read(leanContextProvider),
         discoveryMode: widget.discoveryMode,
         editorMode: widget.editorMode,

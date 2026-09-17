@@ -5,7 +5,6 @@
 /// Adapter that makes the rich ported `LemonadeApiClient` implement the
 /// common `InferenceBackend` interface.
 
-
 import 'package:http/http.dart' as http;
 
 import '../inference/inference_backend.dart' as iface;
@@ -49,6 +48,8 @@ class LemonadeBackend implements iface.InferenceBackend {
   String get name => _row.name;
   @override
   String get implementationType => 'lemonade';
+  @override
+  bool get allowsPromptKvCache => _row.providerType.toLowerCase() == 'lemonade';
 
   // ── Chat (non-streaming) via new endpoints ────────────────────────
 

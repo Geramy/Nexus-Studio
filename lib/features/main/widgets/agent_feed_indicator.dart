@@ -3,7 +3,7 @@
 // Licensed under the Sustainable Use License. See LICENSE.md.
 
 /// A compact, LIVE agent-activity readout for the top bar: which agent is
-/// running, the task it's on, and its state (working / complete / stopped).
+/// running, the task it's on, and its state (working / complete / idle).
 /// Driven straight off the project's task stream, so it updates as the
 /// orchestrator picks up, advances, and finishes work — no polling.
 ///
@@ -34,7 +34,7 @@ import 'package:nexus_projects_client/features/projects/task_workflow.dart';
 /// (null = auto: first working). Auto-falls back if that worker leaves the feed.
 final focusedWorkerProvider = StateProvider.family<int?, int>((ref, _) => null);
 
-enum _AgentState { working, complete, stopped, templating, testing, waiting }
+enum _AgentState { working, complete, idle, templating, testing, waiting }
 
 class _AgentActivity {
   const _AgentActivity(this.taskPk, this.agent, this.task, this.state);
@@ -140,7 +140,7 @@ class AgentFeedIndicator extends ConsumerWidget {
                 first.title,
                 first.status == TaskStatus.done
                     ? _AgentState.complete
-                    : _AgentState.stopped,
+                    : _AgentState.idle,
               ),
             ];
     }
@@ -497,7 +497,7 @@ class AgentFeedIndicator extends ConsumerWidget {
   static String _label(_AgentState s) => switch (s) {
     _AgentState.working => 'working',
     _AgentState.complete => 'complete',
-    _AgentState.stopped => 'stopped',
+    _AgentState.idle => 'idle',
     _AgentState.templating => 'templating',
     _AgentState.testing => 'testing',
     _AgentState.waiting => 'waiting (file held)',
@@ -507,7 +507,7 @@ class AgentFeedIndicator extends ConsumerWidget {
   static Color _dotColor(_AgentState s) => switch (s) {
     _AgentState.working => const Color(0xFFEF6C00),
     _AgentState.complete => const Color(0xFF2E7D32),
-    _AgentState.stopped => const Color(0xFFC62828),
+    _AgentState.idle => const Color(0xFF616161),
     _AgentState.templating => const Color(0xFFF9A825), // yellow
     _AgentState.testing => const Color(0xFFF9A825), // yellow
     _AgentState.waiting => const Color(0xFF1565C0), // blue
@@ -535,10 +535,10 @@ class AgentFeedIndicator extends ConsumerWidget {
         return dark
             ? (bg: const Color(0xFFE65100), fg: white)
             : (bg: const Color(0xFFFFE0B2), fg: black);
-      case _AgentState.stopped:
+      case _AgentState.idle:
         return dark
-            ? (bg: const Color(0xFFC62828), fg: white)
-            : (bg: const Color(0xFFFFCDD2), fg: black);
+            ? (bg: const Color(0xFF616161), fg: white)
+            : (bg: const Color(0xFFE0E0E0), fg: black);
       case _AgentState.templating:
         // Yellow — the Templater is scaffolding the base project before workers.
         return dark

@@ -30,6 +30,7 @@ class SetupSession {
     required this.flow,
     this.maxToolRounds = 12,
     this.enableThinking,
+    this.reasoningEffort,
     this.leanContext = true,
   });
 
@@ -52,6 +53,11 @@ class SetupSession {
   /// Effective enable_thinking for this session (null omits the param). Resolved
   /// from the project agent's ThinkingMode.
   final bool? enableThinking;
+
+  /// Effective thinking level (e.g. 'low'), sent verbatim as `reasoning_effort`
+  /// on every request. Resolved from the project agent's [ThinkingLevel].
+  /// Null omits the parameter.
+  final String? reasoningEffort;
 
   /// Working LLM context — TRIMMED each turn to the recent window and CLEARED at
   /// the interview→refine boundary. The board (DB) is the durable state, so we
@@ -265,11 +271,22 @@ How to work:
         // round and across turns — which is exactly what llama.cpp/Lemonade
         // prefix-caching reuses. The volatile board state is appended at the TAIL
         // (after history) so it never invalidates that cached prefix.
+        //
+        // NOTE: the tail notes MUST NOT be role "system" — the server only
+        // accepts a system message at index 0 and rejects any other system
+        // message with 400 "system message must be at the beginning". They are
+        // sent as framed user-role notes instead (the model treats a trailing
+        // note the same as instructions; it still generates the next step).
         final messages = <Map<String, dynamic>>[
           {'role': 'system', 'content': _systemPrompt()},
           ...(leanContext ? _recentHistory() : _history),
           if (stateSummary.isNotEmpty)
-            {'role': 'system', 'content': stateSummary},
+            {
+              'role': 'user',
+              'content':
+                  '(Context note, not a user answer — do not respond to it ' 
+                  'directly; just keep it in mind:)$stateSummary',
+            },
         ];
         // Deterministic "ask THIS one topic next" instruction (interview only) so
         // the host walks the topics in order instead of jumping ahead / batching.
@@ -277,7 +294,11 @@ How to work:
         if (phase == SetupPhase.interview) {
           final next = await executor.nextTopicInstruction(flow.stages);
           if (next.isNotEmpty) {
-            messages.add({'role': 'system', 'content': next});
+            messages.add({
+              'role': 'user',
+              'content':
+                  '(Instruction for your next step — follow it now: $next)',
+            });
           }
         }
         final tools = phase == SetupPhase.refine
@@ -491,9 +512,9 @@ How to work:
   /// A full OpenAI-shape conversation trace (system + history) for the training
   /// sink — captured at turn end when the model used a tool.
   List<Map<String, dynamic>> _traceMessages() => [
-        {'role': 'system', 'content': _systemPrompt()},
-        ..._fullTrace,
-      ];
+    {'role': 'system', 'content': _systemPrompt()},
+    ..._fullTrace,
+  ];
 
   /// Calls the model with a bounded retry so a transient inference failure
   /// (dropped socket, 5xx, throttle) self-heals instead of surfacing an error
@@ -516,10 +537,13 @@ How to work:
           repeatPenalty: 1.15,
           maxCompletionTokens: 8192,
           enableThinking: enableThinking,
-          // Ask the server (llama.cpp / Lemonade) to reuse the KV cache for the
-          // identical [system + tools] prefix we now hold stable across rounds
-          // and turns. Harmless on backends that ignore it.
-          extra: const {'cache_prompt': true},
+          // Only self-managed Lemonade has an isolated prompt cache. A routed
+          // backend may multiplex unrelated sessions onto shared model slots.
+          extra: {
+            'cache_prompt': client.allowsPromptKvCache,
+            // Agent's thinking level, sent as-is (never clamped).
+            if (reasoningEffort != null) 'reasoning_effort': reasoningEffort,
+          },
         );
       } catch (e) {
         lastError = e;

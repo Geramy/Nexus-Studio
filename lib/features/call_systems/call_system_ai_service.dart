@@ -83,6 +83,10 @@ Keep it focused and valid.''';
       ],
       temperature: 0.4,
       enableThinking: resolved.enableThinking,
+      // Agent's thinking level, sent verbatim (no clamping).
+      extra: resolved.reasoningEffort != null
+          ? {'reasoning_effort': resolved.reasoningEffort}
+          : null,
     );
     final content = resp.choices.isNotEmpty
         ? (resp.choices.first.message.content ?? '')

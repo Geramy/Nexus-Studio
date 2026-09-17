@@ -18,10 +18,18 @@ class CiRunCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final runLabel = switch (run.triggeredBy?.toLowerCase()) {
+      'templater' => 'Scaffold validation',
+      'testing' => 'Final project tests',
+      'editor' => 'Edit validation',
+      _ => run.name,
+    };
     final subtitleParts = <String>[
       run.kind,
       run.backend,
       if (run.branch != null && run.branch!.isNotEmpty) run.branch!,
+      if (run.triggeredBy != null && run.triggeredBy!.isNotEmpty)
+        'triggered by ${run.triggeredBy}',
       _relativeTime(run.createdAt),
     ];
     return Card(
@@ -33,7 +41,7 @@ class CiRunCard extends StatelessWidget {
           children: [
             Expanded(
               child: Text(
-                run.name,
+                runLabel,
                 style: const TextStyle(fontWeight: FontWeight.w600),
               ),
             ),

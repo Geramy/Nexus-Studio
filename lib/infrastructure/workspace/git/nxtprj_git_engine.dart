@@ -822,6 +822,18 @@ class NxtprjGitEngine {
         .toList();
   }
 
+  /// Whether [branch] contains at least one commit that is not already reachable
+  /// from [base]. A branch whose tip is merely an older ancestor of [base] has no
+  /// task work to recover, even though the two tip OIDs differ.
+  Future<bool> branchHasCommitsNotIn(String branch, String base) async {
+    final branchHex = _resolveOid('refs/heads/${branch.trim()}');
+    final baseHex = _resolveOid('refs/heads/${base.trim()}');
+    if (branchHex == null || baseHex == null || branchHex == baseHex) {
+      return false;
+    }
+    return _mergeBase(branchHex, baseHex) != branchHex;
+  }
+
   /// Create a new branch at the current HEAD commit. Optionally switch to it.
   /// Throws if HEAD is unborn (no commit to branch from) or the name is invalid
   /// or already exists.

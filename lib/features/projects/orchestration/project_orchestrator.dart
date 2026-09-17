@@ -17,7 +17,7 @@ import 'package:nexus_projects_client/infrastructure/build/web_preview.dart'
 import 'package:nexus_projects_client/infrastructure/inference/inference_backend.dart'
     show ChatContentDelta, ChatStreamEvent;
 import 'package:nexus_projects_client/infrastructure/inference/inference_backend_factory.dart'
-    show backendForServer;
+    show backendForServer, resetInferenceConnections;
 import 'package:nexus_projects_client/infrastructure/inference/routed_server.dart'
     show isRoutedProviderType;
 import 'package:nexus_projects_client/infrastructure/inference/inference_client.dart'
@@ -54,6 +54,94 @@ import 'package:nexus_projects_client/features/projects/project_baseline.dart'
 import 'package:nexus_projects_client/features/projects/project_working_hours.dart';
 import 'package:nexus_projects_client/features/projects/task_workflow.dart';
 
+/// Deterministic review guard for edits that erase an existing implementation.
+/// A task may simplify code, but replacing a real source file with nothing or a
+/// tiny shell is almost always a failed worker response and must not be merged.
+@visibleForTesting
+String? taskReviewStructuralProblem({
+  required String path,
+  required String? baseContent,
+  required String taskContent,
+}) {
+  final after = taskContent.trim();
+  if (after.isEmpty) return '$path: file was emptied';
+
+  final before = baseContent?.trim() ?? '';
+  if (before.length >= 240 &&
+      after.length < 160 &&
+      after.length * 100 < before.length * 45) {
+    return '$path: implementation collapsed from ${before.length} to '
+        '${after.length} non-whitespace characters';
+  }
+  return null;
+}
+
+/// Dependency rank used by the deterministic Flutter Templater. Foundations
+/// and independent leaf features intentionally share a rank so worker slots can
+/// run them concurrently; the persisted milestone indices compress unused ranks.
+@visibleForTesting
+int flutterTaskDependencyRankForTitle(String title) {
+  final text = title.toLowerCase();
+  bool has(List<String> terms) => terms.any(text.contains);
+  if (has([
+    'physics',
+    'input',
+    'foundation',
+    'contract',
+    'schema',
+    'setup',
+    'pipe',
+    'generation',
+    'engine',
+    'service',
+    'repository',
+  ])) {
+    return 0;
+  }
+  if (has(['core', 'game loop', 'runtime'])) return 1;
+  if (has([
+    'select',
+    'navigation',
+    'settings',
+    'screen',
+    'level',
+    'difficulty',
+    'tier',
+    'progression',
+  ])) {
+    return 0;
+  }
+  if (has(['ui', 'view', 'page'])) {
+    return 2;
+  }
+  if (has(['menu', 'flow'])) return 3;
+  return 1;
+}
+
+/// A settled task releases its milestone barrier. Blocked remains an unresolved
+/// final result, but it must not prevent unrelated later tasks from running.
+@visibleForTesting
+bool taskStatusSettlesMilestone(String status) =>
+    status == TaskStatus.done || status == TaskStatus.blocked;
+
+/// A saved task commit may bypass the worker only when it belongs to an
+/// interrupted FIRST implementation that has never failed a review/build gate.
+/// Once feedback exists, the old commit is the thing that failed and must be
+/// repaired even if a timeout temporarily returned the task to `queued`.
+@visibleForTesting
+bool taskCanRecoverCommittedSubmission({
+  required String executionStatus,
+  required String? description,
+  required bool branchAheadOfBase,
+}) {
+  if (executionStatus != TaskExecStatus.queued || !branchAheadOfBase) {
+    return false;
+  }
+  final detail = description ?? '';
+  return !detail.contains('[Verification FAILED') &&
+      !detail.contains(NexusDatabase.buildFailureMarker);
+}
+
 /// Live driver for a project's autonomous task pipeline.
 ///
 /// It watches the project's `orchestrationState` (Start/Pause/Stop) and the
@@ -78,7 +166,8 @@ import 'package:nexus_projects_client/features/projects/task_workflow.dart';
 /// Coordinator persona exists for the client, the task is left in place.
 ///
 /// One orchestrator exists per project (via [projectOrchestratorProvider]); it
-/// processes tasks sequentially to avoid agents fighting over the workspace.
+/// runs independent tasks concurrently in isolated worktrees and serializes the
+/// shared git operations that join their results.
 class ProjectOrchestrator {
   final Ref ref;
   final int projectId;
@@ -102,6 +191,22 @@ class ProjectOrchestrator {
   /// Per-task worker attempt counts, to cap retries on a task that keeps
   /// failing to submit rather than spinning forever.
   final Map<int, int> _attempts = {};
+
+  /// Review retries are counted separately from implementation attempts. A
+  /// normal implement -> verify -> merge path must consume one implementation
+  /// attempt, while a verifier that never returns a verdict remains bounded.
+  final Map<int, int> _reviewFailures = {};
+
+  /// Before final project testing, tasks that exhausted their first worker
+  /// budget get one automatic fresh retry sweep. A second Blocked result remains
+  /// visible for manual review, preventing an infinite retry loop.
+  bool _blockedRecoverySweepDone = false;
+
+  /// Fresh Router namespace for this orchestrator process. A task id is stable
+  /// forever, so it cannot also identify a new inference dispatch safely.
+  final String _routingRunId = DateTime.now().microsecondsSinceEpoch
+      .toRadixString(36);
+  int _routingDispatch = 0;
 
   /// Cooldown after a task PARKS (it wanted a file another task holds). A park
   /// deliberately does NOT count as an attempt (it's waiting, not failing), so
@@ -194,7 +299,17 @@ class ProjectOrchestrator {
   /// Seed [taskPk]'s footprint with the files its text declares (idempotent —
   /// unions into any already-learned set). No-op if nothing parses.
   void _seedDeclaredFootprint(Task t) {
-    final text = '${t.title}\n${t.description ?? ''}';
+    // Failure notes name files the task only READS, especially shared contracts.
+    // Treating those paths as declared writes serializes unrelated retry work.
+    var description = t.description ?? '';
+    for (final marker in const [
+      '[Verification FAILED',
+      NexusDatabase.buildFailureMarker,
+    ]) {
+      final at = description.indexOf(marker);
+      if (at >= 0) description = description.substring(0, at);
+    }
+    final text = '${t.title}\n$description';
     Set<String>? fp;
     for (final m in _declaredPathRe.allMatches(text)) {
       (fp ??= (_taskFootprint[t.task_pk] ??= <String>{})).add(
@@ -230,6 +345,10 @@ class ProjectOrchestrator {
   /// stages keep running, and the task that 429'd goes back to the board (it is
   /// NOT counted as a failure or Blocked; it's pure backpressure).
   DateTime? _connBackoffUntil;
+  DateTime? _lastConnCapAt;
+  int _consecutiveConnCaps = 0;
+  DateTime? _lastHungCancelAt;
+  int _consecutiveHungCancels = 0;
 
   /// Signature of the completed-task set the last GREEN end-of-project scan ran
   /// against, so a passed project isn't re-scanned every tick — only when the
@@ -296,8 +415,8 @@ class ProjectOrchestrator {
   // Per-task retry budget within ONE run before a task is surfaced as Blocked.
   // Kept generous so a couple of transient hiccups (a flaky worker turn, a
   // momentary backend blip) don't strand otherwise-workable tasks — blocking is
-  // a "needs a human look" signal, not a hair-trigger. (Re)starting the loop
-  // clears this and requeues blocked tasks, so it's never a permanent dead end.
+  // a "needs a human look" signal, not a hair-trigger. Restarting clears the
+  // in-memory budget; a persisted Blocked task still requires an explicit retry.
   static const int _maxAttemptsPerTask = 5;
 
   /// Connections kept free for the interactive Coordinator (the story-maker you
@@ -322,6 +441,7 @@ class ProjectOrchestrator {
   /// and the end-of-project scan.
   static const String _defaultCiPath = '/.github/workflows/ci.yml';
   static const Duration _connBackoff = Duration(seconds: 20);
+  static const Duration _connCapRecoveryWindow = Duration(minutes: 2);
 
   /// Idle-timeout watchdog for a single agent turn: if the model/stream produces
   /// NO event for this long, the turn is considered stalled (a backend that
@@ -338,6 +458,15 @@ class ProjectOrchestrator {
   /// the Final Pass fixer freezing for 18min. This cap fires no matter what, so a
   /// stuck turn is aborted (and retried) instead of wedging the phase.
   static const Duration _turnWallClock = Duration(minutes: 5);
+
+  /// Code-writing turns emit complete source files inside tool arguments, and a
+  /// routed round can legitimately take 3-5min of pure generation (observed on
+  /// the NXS-PJX-Chat pool). A read → edit → (re-edit) → commit → submit worker
+  /// needs FOUR such rounds per dispatch, so 10m was cutting every turn off
+  /// right before submission — the task then re-dispatched, re-read, and lost
+  /// the cycle (task 776 spun on this for two days). 20m fits a full slow cycle
+  /// while the 4-min idle guard still catches dead streams early.
+  static const Duration _workerTurnWallClock = Duration(minutes: 20);
 
   /// Safety valve for the shared git lane: a single materialize/commit/merge
   /// that hangs would wedge the lane (and so freeze EVERY task's git step) until
@@ -397,16 +526,15 @@ class ProjectOrchestrator {
   void start() {
     // Clear any leftover per-task working-tree disks from a previous crash.
     unawaited(pruneTaskDisks(projectId));
-    // A new run starts every task with a clean retry budget, and any task that
-    // was Blocked in a previous run gets another chance — so pressing Start
-    // always actually starts the work instead of immediately re-surfacing a
-    // board full of Blocked tasks the user can't get past.
+    // Retry budgets belong to this process run. Blocked tasks stay visible until
+    // the final pre-test recovery sweep (or an explicit retry) gives them one
+    // fresh budget; they are never silently retried on an ordinary project load.
     _attempts.clear();
+    _reviewFailures.clear();
     _parkedUntil.clear();
     _redoHint.clear();
     _finalPassPrevCount = null;
     _finalPassStagnant = 0;
-    unawaited(_db.requeueBlockedTasks(projectId));
     // Reconcile tasks orphaned mid-run by a crash/quit: our in-memory _active
     // set is empty on a fresh start, so any task still marked `running` in the
     // DB would never be re-picked. Return them to the board.
@@ -509,7 +637,7 @@ class ProjectOrchestrator {
         unawaited(_runStage(task, stage));
       }
       await _surfaceStalledTasks();
-      advancedMilestone = await _maybeAdvanceMilestone(project, workerCap);
+      advancedMilestone = await _maybeAdvanceMilestone(project);
       spawnedFixWork = await _maybeFinalizeProject(project);
       await _publishSlotStatus(workerCap);
     } finally {
@@ -619,14 +747,16 @@ class ProjectOrchestrator {
         // line). Only block tasks still TRYING to pass: on the board (todo), or
         // stuck getting a verdict / re-driving a conflict (submitted / verifying
         // / merging).
-        final stalled =
-            t.status == TaskStatus.todo ||
-            (t.status == TaskStatus.review &&
-                (t.executionStatus == TaskExecStatus.submitted ||
-                    t.executionStatus == TaskExecStatus.verifying ||
-                    t.executionStatus == TaskExecStatus.merging));
-        if ((_attempts[t.task_pk] ?? 0) >= _maxAttemptsPerTask &&
-            stalled &&
+        final implementationStalled =
+            t.status == TaskStatus.todo &&
+            (_attempts[t.task_pk] ?? 0) >= _maxAttemptsPerTask;
+        final reviewStalled =
+            t.status == TaskStatus.review &&
+            (t.executionStatus == TaskExecStatus.submitted ||
+                t.executionStatus == TaskExecStatus.verifying ||
+                t.executionStatus == TaskExecStatus.merging) &&
+            (_reviewFailures[t.task_pk] ?? 0) >= _maxAttemptsPerTask;
+        if ((implementationStalled || reviewStalled) &&
             !_active.contains(t.task_pk)) {
           debugPrint(
             '[Orchestrator p$projectId] task ${t.task_pk} (${t.status}/'
@@ -639,6 +769,7 @@ class ProjectOrchestrator {
           // (already ≥ cap) makes it re-block on the very next pump without ever
           // running again.
           _attempts.remove(t.task_pk);
+          _reviewFailures.remove(t.task_pk);
         }
       }
 
@@ -696,12 +827,9 @@ class ProjectOrchestrator {
     }
   }
 
-  /// Pick the single next task + stage to act on. Work is one-at-a-time (all
-  /// agents share one git working tree), but instead of strict priority we use a
-  /// smooth weighted round-robin across the four stages, weighted by each
-  /// stage's backlog — so verify/build/merge are never starved by a long
-  /// implement queue, while busier stages ("more to do") still get
-  /// proportionally more turns.
+  /// Pick the next task + stage for one available worker slot. Separate tasks
+  /// use isolated working trees, so [_pump] may call this repeatedly and run
+  /// several agents at once up to the server's concurrency cap.
   Future<(Task?, _Stage?)> _nextPipelineWork() async {
     final tasks = await _db.getTasksForProject(projectId);
     // Only the currently-open milestone batch is assignable for fresh implement
@@ -727,7 +855,13 @@ class ProjectOrchestrator {
 
     // A Review task whose retry budget is spent is NOT re-picked here — it's
     // surfaced to Blocked by _surfaceStalledTasks instead of looping forever.
-    bool live(Task t) => (_attempts[t.task_pk] ?? 0) < _maxAttemptsPerTask;
+    bool live(Task t) {
+      if ((_reviewFailures[t.task_pk] ?? 0) >= _maxAttemptsPerTask) {
+        return false;
+      }
+      final until = _parkedUntil[t.task_pk];
+      return until == null || !DateTime.now().isBefore(until);
+    }
 
     addPool(_Stage.implement, _assignableTasks(tasks, currentMilestone));
     // The verify + build gates are SKIPPED entirely in the Editor fast lane; a
@@ -909,9 +1043,7 @@ class ProjectOrchestrator {
     // (no branch yet) is rooted on its base; a rework after a real merge conflict
     // or failed gate (exec idle/failed) re-roots onto the CURRENT target so the
     // redo rebases cleanly.
-    final branchExists = (await th.git.branches()).contains(branch);
-    final preserveWork =
-        branchExists && task.executionStatus == TaskExecStatus.queued;
+    var preserveWork = false;
     // Root the task branch / hydrate its tree, serialized through the lane (the
     // shared object/ref DB is single-isolate). This runs OUTSIDE the turn loop,
     // so the SSE watchdog doesn't cover it — guard it with the lane timeout so a
@@ -919,6 +1051,15 @@ class ProjectOrchestrator {
     // other task's git op) until restart.
     try {
       await th.lane.run(() async {
+        final branchExists = (await th.git.branches()).contains(branch);
+        final branchHasTaskCommits =
+            branchExists && await th.git.branchHasCommitsNotIn(branch, base);
+        // Keep real task commits after interruption, failed review, or an
+        // automatic Blocked retry. A merge-conflict redo deliberately starts on
+        // the latest target. A pre-created branch merely behind main contains no
+        // recoverable task work and must not be submitted as if it did.
+        preserveWork =
+            branchHasTaskCommits && !_redoHint.containsKey(task.task_pk);
         if (preserveWork) {
           await th.git.materializeInto(branch, th.tree);
         } else {
@@ -954,9 +1095,10 @@ class ProjectOrchestrator {
     // can read `submitted`.
     var parked = false;
     var submitted = false;
-    // Whether this run was granted at least one file to edit — i.e. it may have
-    // produced uncommitted changes worth checkpointing if it then parks.
-    var madeEdit = false;
+    // Successful task-owned writes must survive a later Router stall. This is
+    // set only after the mutation succeeds; every non-submitting exit saves it
+    // to the task branch as a WIP commit.
+    var uncheckpointedEdit = false;
     bool claim(String path) {
       final p = _normFile(path);
       // Learn this task's footprint whether the claim is granted or denied — a
@@ -965,11 +1107,35 @@ class ProjectOrchestrator {
       final owner = _fileOwners[p];
       if (owner == null || owner == task.task_pk) {
         _fileOwners[p] = task.task_pk;
-        madeEdit = true;
         return true;
       }
       parked = true;
       return false;
+    }
+
+    Future<void> checkpointUncommitted(String reason) async {
+      if (!uncheckpointedEdit) return;
+      try {
+        final oid = await th.lane.run(
+          () => th.git.commitFrom(
+            th.tree,
+            branch: branch,
+            message: 'wip: checkpoint $reason (task #${task.task_pk})',
+          ),
+          timeout: _laneOpTimeout,
+        );
+        uncheckpointedEdit = false;
+        final shortOid = oid.length >= 8 ? oid.substring(0, 8) : oid;
+        debugPrint(
+          '[Orchestrator p$projectId] task ${task.task_pk}: preserved '
+          'uncommitted worker edits as WIP $shortOid ($reason).',
+        );
+      } catch (e) {
+        debugPrint(
+          '[Orchestrator p$projectId] task ${task.task_pk}: could not '
+          'checkpoint worker edits after $reason: $e',
+        );
+      }
     }
 
     try {
@@ -979,6 +1145,49 @@ class ProjectOrchestrator {
       // file tree + stay-in-your-lane rules) so parallel tasks build on each other
       // instead of each silo re-creating and overwriting shared files.
       final projectContext = await _buildWorkerProjectContext(task, th.tree);
+      final workerScope = await _workerTemplateScope(task, th.tree);
+      if (workerScope.writeRoots.isNotEmpty) {
+        debugPrint(
+          '[Orchestrator p$projectId] task ${task.task_pk}: write scope '
+          '${workerScope.writeRoots.join(', ')}; required '
+          '${workerScope.requiredFiles.join(', ')}.',
+        );
+      }
+      final scopeInstruction = workerScope.writeRoots.isEmpty
+          ? ''
+          : '''
+
+=== AUTHORITATIVE FILE SCOPE ===
+Write ONLY inside: ${workerScope.writeRoots.join(', ')}
+You MUST implement this starter before committing: ${workerScope.requiredFiles.join(', ')}
+Paths from any other repository, operating system, task, or prior conversation are invalid. When a write tool is offered, use the exact required starter path above and supply complete Dart implementation content for THIS task.''';
+
+      // A worker may have written useful code and then lost the Router before
+      // commit/submit. Both its own commit and our WIP safety checkpoint are
+      // durable task-owned work. Submit either one to the normal structural and
+      // functional review gates instead of forcing another generation round;
+      // incomplete WIP is rejected there with concrete evidence and regenerated.
+      final branchLog = preserveWork
+          ? await th.git.log(limit: 1, from: branch)
+          : const <
+              ({String oid, String message, DateTime when, String author})
+            >[];
+      final baseLog = preserveWork
+          ? await th.git.log(limit: 1, from: base)
+          : const <
+              ({String oid, String message, DateTime when, String author})
+            >[];
+      final branchAheadOfBase =
+          branchLog.isNotEmpty &&
+          (baseLog.isEmpty || branchLog.first.oid != baseLog.first.oid);
+      final recoverCommittedSubmission = taskCanRecoverCommittedSubmission(
+        executionStatus: task.executionStatus,
+        description: task.description,
+        branchAheadOfBase: branchAheadOfBase,
+      );
+      final recoveredWip =
+          recoverCommittedSubmission &&
+          branchLog.first.message.trimLeft().toLowerCase().startsWith('wip:');
 
       // One conversation PER AGENT: reuse this worker's dedicated session so all
       // of its tasks land in a single ongoing thread (the person can follow the
@@ -988,11 +1197,43 @@ class ProjectOrchestrator {
         agentFk,
         persona.name,
       );
-      _attempts[task.task_pk] = (_attempts[task.task_pk] ?? 0) + 1;
       // Picked up & preparing the workspace — the task stays on the Todo board
       // (exec `queued`). It only flips to "In Progress" once a worker turn truly
       // begins (below), so the column never shows work nobody is doing.
       await _db.markTaskQueued(task.task_pk);
+
+      if (recoverCommittedSubmission) {
+        await _db.markTaskRunning(
+          task.task_pk,
+          workerSessionPk: workerSessionPk,
+          workBranch: branch,
+        );
+        await _db.submitTaskForCompletion(
+          task.task_pk,
+          submissionJson: jsonEncode({
+            'summary': recoveredWip
+                ? 'Recovered checkpointed task work after an interrupted worker turn.'
+                : 'Recovered committed task work after an interrupted submission round.',
+            'evidence':
+                'Commit ${branchLog.first.oid} is preserved on $branch.',
+            'branch': branch,
+            'submittedBy': persona.name,
+            'submittedAt': DateTime.now().toIso8601String(),
+          }),
+        );
+        submitted = true;
+        debugPrint(
+          '[Orchestrator p$projectId] task ${task.task_pk}: recovered task-owned '
+          'work ${branchLog.first.oid.substring(0, 8)} and submitted it to the '
+          'review gates without another generation round.',
+        );
+        return;
+      }
+
+      // Count a real generation/repair round. Recovering an already-written
+      // commit above is only pipeline continuation and must not burn a worker
+      // attempt of its own.
+      _attempts[task.task_pk] = (_attempts[task.task_pk] ?? 0) + 1;
 
       final session = ProjectCoordinatorSession(
         client: resolved.client,
@@ -1014,13 +1255,17 @@ class ProjectOrchestrator {
         // snapshots it onto its branch under the lane.
         workBranch: branch,
         gitLane: th.lane,
+        workTaskId: task.task_pk,
+        workerWriteRoots: workerScope.writeRoots,
+        workerRequiredFiles: workerScope.requiredFiles,
         fileClaim: claim,
         // Autonomous coders need file/git/build tools directly — no progressive
         // disclosure (that's for the interactive PM chat).
         leanTools: false,
         systemPromptOverride:
             '${await _framedPrompt(role, OrchestratorPromptField.workerFraming, prompts, vars)}'
-            '\n\n$projectContext',
+            '$scopeInstruction\n\n$projectContext',
+        reasoningEffort: personaReasoningEffort(persona.configJson),
         enableThinking: resolveEnableThinking(
           agent: personaThinkingMode(
             persona.configJson,
@@ -1052,6 +1297,7 @@ class ProjectOrchestrator {
           debugPrint(
             '[Orchestrator p$projectId] task ${task.task_pk}: project not active, halting worker.',
           );
+          await checkpointUncommitted('before the project stopped');
           await _db.markTaskYieldedBack(task.task_pk);
           return;
         }
@@ -1097,6 +1343,13 @@ class ProjectOrchestrator {
               },
               onToolResult: (r) {
                 sawToolActivity = true;
+                if (r.startsWith('Updated file "') ||
+                    r.startsWith('Created file "') ||
+                    r.startsWith('Edited "')) {
+                  uncheckpointedEdit = true;
+                } else if (r.startsWith('Committed')) {
+                  uncheckpointedEdit = false;
+                }
                 // The session emits this exact note when the backend rejected
                 // tool-calling and re-ran the round WITHOUT tools — a worker can
                 // never submit in that state.
@@ -1107,14 +1360,46 @@ class ProjectOrchestrator {
                 );
               },
             ),
+            activity: session.turnActivity,
+            wallClock: _workerTurnWallClock,
           );
         } catch (e) {
+          // A backend response can cross the watchdog deadline just as its last
+          // tool finishes. `submit_for_completion` commits the state change
+          // before runTurn emits its terminal event, so always trust the DB over
+          // the stale timeout: never send an already-submitted task back to the
+          // worker (the duplicate retry can overwrite valid work).
+          final afterTurn = await _db.getTaskById(task.task_pk);
+          final progressed =
+              afterTurn != null &&
+              const {
+                TaskExecStatus.submitted,
+                TaskExecStatus.verifying,
+                TaskExecStatus.verified,
+                TaskExecStatus.building,
+                TaskExecStatus.built,
+                TaskExecStatus.merging,
+                TaskExecStatus.done,
+              }.contains(afterTurn.executionStatus);
+          if (progressed) {
+            submitted = afterTurn.status == TaskStatus.review;
+            debugPrint(
+              '[Orchestrator p$projectId] task ${task.task_pk}: turn ended after '
+              'submission (${afterTurn.executionStatus}); preserving pipeline state.',
+            );
+            return;
+          }
           if (e is TimeoutException) {
             // The turn stalled — idle (no stream for _turnIdleTimeout) OR it blew
             // the hard wall-clock cap (_turnWallClock) while trickling keep-alives
             // but never completing. NOT the task's fault: undo the attempt and
             // yield back so the slot frees and the pump moves on.
+            // A watchdog timeout is an interrupted inference request, regardless
+            // of whether it read or edited files first. Preserve any writes below
+            // and refund the round; only completed generation/repair rounds may
+            // exhaust the deliberate Blocked budget.
             _undoAttempt(task.task_pk);
+            _parkedUntil[task.task_pk] = DateTime.now().add(_parkCooldown);
             debugPrint(
               '[Orchestrator p$projectId] task ${task.task_pk}: turn $turn '
               'timed out ($e) — aborting, yielding back.',
@@ -1140,6 +1425,7 @@ class ProjectOrchestrator {
               '[Orchestrator p$projectId] task ${task.task_pk}: turn $turn failed: $e',
             );
           }
+          await checkpointUncommitted('after an interrupted inference turn');
           await _db.markTaskYieldedBack(task.task_pk);
           return;
         }
@@ -1157,6 +1443,10 @@ class ProjectOrchestrator {
           return;
         }
 
+        // A runTurn may reach its internal action cap after writing but before
+        // commit. Save that work before asking the Router for another turn.
+        await checkpointUncommitted('after an incomplete worker turn');
+
         // Parked: the worker needs a file another task holds. Don't burn an
         // attempt (it's waiting, not failing) — yield back and retry later; the
         // finally releases this task's own locks so it can't block others while
@@ -1164,23 +1454,7 @@ class ProjectOrchestrator {
         // edits onto the task branch so the resume continues from here (the
         // resume preserves the branch instead of re-rooting — see above).
         if (parked) {
-          if (madeEdit) {
-            try {
-              await th.lane.run(
-                () => th.git.commitFrom(
-                  th.tree,
-                  branch: branch,
-                  message:
-                      'wip: checkpoint before pausing for a held file (task #${task.task_pk})',
-                ),
-                timeout: _laneOpTimeout,
-              );
-            } catch (e) {
-              debugPrint(
-                '[Orchestrator p$projectId] task ${task.task_pk}: could not checkpoint parked work: $e',
-              );
-            }
-          }
+          await checkpointUncommitted('before pausing for a held file');
           _undoAttempt(task.task_pk);
           // Back off before this task is eligible again, so it doesn't instantly
           // re-dispatch and thrash against the file's owner (the busy-loop above).
@@ -1205,6 +1479,7 @@ class ProjectOrchestrator {
         '[Orchestrator p$projectId] task ${task.task_pk}: hit turn cap without '
         'submission (toolsRejected=$toolsRejected, usedTools=$sawToolActivity).',
       );
+      await checkpointUncommitted('after reaching the worker turn cap');
       await _db.markTaskYieldedBack(task.task_pk);
     } finally {
       // Unless this task SUBMITTED (and so should hold its files through merge),
@@ -1253,6 +1528,72 @@ class ProjectOrchestrator {
     acceptanceCriteria: task.acceptanceCriteria ?? '',
     verification: task.verification ?? '',
   );
+
+  /// Resolve the task-owned write root and required starter declared by the
+  /// Templater. An empty result preserves compatibility with older templates.
+  Future<({Set<String> writeRoots, Set<String> requiredFiles})>
+  _workerTemplateScope(Task task, Workspace tree) async {
+    final roots = <String>{};
+    final required = <String>{};
+    String normalized(String raw) {
+      var path = raw.trim().replaceAll('\\', '/');
+      if (path.isEmpty) return '';
+      if (!path.startsWith('/')) path = '/$path';
+      while (path.contains('//')) {
+        path = path.replaceAll('//', '/');
+      }
+      if (path.length > 1 && path.endsWith('/')) {
+        path = path.substring(0, path.length - 1);
+      }
+      return path;
+    }
+
+    try {
+      final lines = (await tree.readString('/WORK_TEMPLATE.md')).split('\n');
+      var inTask = false;
+      final header = RegExp('Task #${task.task_pk}\\b');
+      final owns = RegExp(r'^-\s*Owns:\s*`([^`]+)`', caseSensitive: false);
+      final starter = RegExp(
+        r'^-\s*Starter:\s*`([^`]+)`',
+        caseSensitive: false,
+      );
+      for (final raw in lines) {
+        final line = raw.trim();
+        if (line.startsWith('### ')) {
+          inTask = header.hasMatch(line);
+          continue;
+        }
+        if (!inTask) continue;
+        final ownMatch = owns.firstMatch(line);
+        if (ownMatch != null) roots.add(normalized(ownMatch.group(1)!));
+        final starterMatch = starter.firstMatch(line);
+        if (starterMatch != null) {
+          required.add(normalized(starterMatch.group(1)!));
+        }
+      }
+    } catch (_) {}
+
+    // Deterministic Flutter templates encode task ownership in the directory
+    // name. Recover it from the real tree if a hand-edited template omitted the
+    // metadata, while leaving non-templated projects unrestricted.
+    if (roots.isEmpty || required.isEmpty) {
+      try {
+        final marker = '/task_${task.task_pk}_';
+        for (final entry in await tree.walk()) {
+          if (entry.isDirectory) continue;
+          final path = normalized(entry.path);
+          final markerAt = path.indexOf(marker);
+          if (markerAt < 0) continue;
+          final slashAfter = path.indexOf('/', markerAt + marker.length);
+          if (slashAfter > 0) roots.add(path.substring(0, slashAfter));
+          if (path.endsWith('_page.dart')) required.add(path);
+        }
+      } catch (_) {}
+    }
+    roots.remove('');
+    required.remove('');
+    return (writeRoots: roots, requiredFiles: required);
+  }
 
   /// PROJECT-WIDE CONTEXT for a worker: the full task decomposition + the current
   /// file tree (from its own branch) + the "stay in your lane" rules. Without this
@@ -1306,10 +1647,12 @@ class ProjectOrchestrator {
       '''
 
 === RULES ===
+- WORK TEMPLATE: if /WORK_TEMPLATE.md exists, read it first and follow its
+  milestone dependencies, shared-contract ownership, and task-specific file map.
 - FULLY IMPLEMENT your file(s): a working, wired feature — NOT just compiling. No TODO/FIXME/UnimplementedError/"coming soon"/placeholder bodies (Review scans for these and bounces the task).
-- WIRE IT IN: if your feature must be reachable, make the SMALLEST additive change to the shared entry/router so the app reaches it — an orphaned widget/service is incomplete.
+- WIRE IT IN: the scaffold already routes to your declared Starter file. Keep that class/API intact and replace its placeholder with the complete feature; Review requires that owned starter to change before submission.
 - STAY IN YOUR LANE: implement ONLY your task's file(s); other tasks own theirs. To use another component, READ its declared contract/interface and code to its EXACT members — don't recreate it or call members it doesn't declare.
-- SHARED GLUE IS COMPLETE — the scaffold already declared the DB schema, main/entry, router/nav, DI container, barrels, and manifest/deps. Code AGAINST them; do NOT edit them (editing collides with siblings → Blocked on merge). Only if your entry is genuinely MISSING, add your ONE line additively — never rewrite the file.
+- SHARED GLUE IS COMPLETE — the scaffold already declared the DB schema, main/entry, router/nav, DI container, barrels, and manifest/deps. Code AGAINST them; do NOT edit them (the worker tools enforce your task-owned write scope).
 - Do NOT hand-write generated files (`*.g.dart`/`*.freezed.dart`/`*.mocks.dart`): write the SOURCE with its `part '...g.dart';` directive and let codegen run (deps go in dev_dependencies).''',
     );
     return b.toString().trimRight();
@@ -1334,7 +1677,8 @@ class ProjectOrchestrator {
   static final RegExp _stubMarkerRe = RegExp(
     r'\bTODO\b|\bFIXME\b|UnimplementedError|UnsupportedError'
     r'|not[\s_-]*yet[\s_-]*implemented|not[\s_-]*implemented'
-    r'|implement[\s_-]*(this|me|later)\b',
+    r'|implement[\s_-]*(this|me|later)\b|coming[\s_-]*soon'
+    r'|\bplaceholder\b',
     caseSensitive: false,
   );
 
@@ -1367,8 +1711,9 @@ class ProjectOrchestrator {
     return exts.any(p.endsWith);
   }
 
-  /// Scan the files THIS task touched (its footprint) for unimplemented-stub
-  /// markers, by OWNERSHIP: if the task CHANGED/added a file it owns that file, so
+  /// Scan the files THIS task touched (its footprint) for destructive shrinking
+  /// and unimplemented-stub markers. By OWNERSHIP, if the task CHANGED/added a
+  /// file it owns that file, so
   /// ANY stub in it is rejected (leaving your own deliverable a "— TODO" is the
   /// hole this closes); if the task did NOT change a footprint file (pure
   /// reference — e.g. a UI task reading a stubbed service another task owns), only
@@ -1377,7 +1722,7 @@ class ProjectOrchestrator {
   /// empty when clean, no footprint, or can't diff. NOTE: this is the EARLY,
   /// footprint-based catch; `_scanTreeForStubs` is the restart-proof whole-tree
   /// backstop that guarantees no stub survives to completion.
-  Future<String> _scanTaskForStubs(Task task, String branch) async {
+  Future<String> _scanTaskForReviewProblems(Task task, String branch) async {
     final footprint = _taskFootprint[task.task_pk];
     if (footprint == null || footprint.isEmpty) return '';
     final code = footprint.where(_isScannableCodeFile).toList();
@@ -1431,8 +1776,17 @@ class ProjectOrchestrator {
         final f = entry.key;
         final lines = entry.value;
         final baseContent = baseRaw[f];
+        final taskContent = lines.join('\n');
         final taskChangedFile =
-            baseContent == null || lines.join('\n') != baseContent;
+            baseContent == null || taskContent != baseContent;
+        if (taskChangedFile) {
+          final structural = taskReviewStructuralProblem(
+            path: f,
+            baseContent: baseContent,
+            taskContent: taskContent,
+          );
+          if (structural != null) findings.add(structural);
+        }
         final preExisting = (baseContent ?? '')
             .split('\n')
             .map((l) => l.trim())
@@ -1454,7 +1808,7 @@ class ProjectOrchestrator {
       return findings.join('\n');
     } catch (e) {
       debugPrint(
-        '[Orchestrator p$projectId] task ${task.task_pk}: stub scan skipped ($e).',
+        '[Orchestrator p$projectId] task ${task.task_pk}: content review scan skipped ($e).',
       );
       return '';
     } finally {
@@ -1545,6 +1899,42 @@ class ProjectOrchestrator {
     return findings.join('\n');
   }
 
+  /// The scaffold's always-green smoke/shell tests prove only that the harness
+  /// starts. Final project testing requires at least one additional test that
+  /// exercises generated feature code; otherwise a placeholder app can compile
+  /// and report "All tests passed" without testing any requested behavior.
+  Future<String> _featureTestCoverageProblem() async {
+    final kind = await _detectStackKind();
+    if (kind != 'flutter' && kind != 'dart') return '';
+    final ws = (await _resolveWorkspaceHandles()).ws;
+    if (ws == null) {
+      return 'Feature-test coverage could not be inspected because the workspace is unavailable.';
+    }
+    final tests = (await ws.walk())
+        .where(
+          (entry) =>
+              !entry.isDirectory &&
+              entry.path.toLowerCase().contains('/test/') &&
+              entry.path.toLowerCase().endsWith('_test.dart') &&
+              !entry.path.toLowerCase().endsWith('/nxs_smoke_test.dart'),
+        )
+        .toList();
+    for (final file in tests) {
+      final content = await ws.readString(file.path);
+      final generatedShellOnly =
+          content.contains('generated project shell loads') &&
+          RegExp(r'\btest(?:Widgets)?\s*\(').allMatches(content).length <= 1;
+      if (!generatedShellOnly &&
+          RegExp(r'\btest(?:Widgets)?\s*\(').hasMatch(content) &&
+          RegExp(r'\bexpect\s*\(').hasMatch(content)) {
+        return '';
+      }
+    }
+    return 'Only generated smoke/shell tests exist. Add focused feature tests '
+        'that exercise requested behavior and state transitions before the final '
+        'CI result can count as a project pass.';
+  }
+
   /// REVIEW. The project's CI/test gate is consolidated into a SINGLE end-of-
   /// project scan ([_maybeFinalizeProject]) — for a mostly-automated pipeline,
   /// testing once at the end is far faster than a full build per task. So per-task
@@ -1552,29 +1942,24 @@ class ProjectOrchestrator {
   /// short Verification Agent to confirm the described behavior; anything else
   /// passes immediately. Compile/test correctness is enforced once, at the end.
   Future<void> _runVerifyStage(Task task) async {
-    // Count this Review attempt against the retry budget so a task that can
-    // never get a verdict is surfaced to Blocked instead of cycling forever.
-    _attempts[task.task_pk] = (_attempts[task.task_pk] ?? 0) + 1;
     final branch = task.workBranch ?? 'task/${task.task_pk}';
 
-    // STUB GATE — a task is NOT done if it left the feature unimplemented behind a
-    // placeholder marker (an unfinished-work comment, empty body, or
-    // UnimplementedError). Compiling isn't the bar; implementing is. Reject such
-    // submissions here so they never become "done" and slip to the Final Pass (or
-    // ship). The worker re-does it for real.
-    final stubs = await _scanTaskForStubs(task, branch);
-    if (stubs.isNotEmpty) {
+    // CONTENT GATE — a task is NOT done if it erased an existing implementation
+    // or left the feature behind a placeholder marker. Compiling isn't the bar;
+    // implementing is. Reject these before they can merge into main.
+    final problems = await _scanTaskForReviewProblems(task, branch);
+    if (problems.isNotEmpty) {
       await _db.recordTaskVerdict(task.task_pk, passed: false);
       await _db.attachTaskBuildFailure(
         task.task_pk,
-        'REJECTED — this task was submitted with UNIMPLEMENTED stubs. Every '
-        'feature must be FULLY implemented, never left as a TODO, placeholder, '
-        'empty body, or UnimplementedError. Implement these for real (and '
-        'remove the markers):\n\n$stubs',
+        'REJECTED — this task submitted destructive or UNIMPLEMENTED code. '
+        'Every feature must be FULLY implemented; never empty or collapse an '
+        'existing source file, and never leave a TODO, placeholder, empty body, '
+        'or UnimplementedError. Repair these findings:\n\n$problems',
       );
       debugPrint(
-        '[Orchestrator p$projectId] task ${task.task_pk}: REVIEW REJECTED — left '
-        'unimplemented stubs; sent back to implement for real.',
+        '[Orchestrator p$projectId] task ${task.task_pk}: REVIEW REJECTED — '
+        'destructive or unimplemented edit; sent back to implement for real.',
       );
       return;
     }
@@ -1618,10 +2003,14 @@ class ProjectOrchestrator {
       debugPrint(
         '[Orchestrator p$projectId] task ${task.task_pk}: no inference server for verifier ${persona.name}.',
       );
+      _parkedUntil[task.task_pk] = DateTime.now().add(_parkCooldown);
       return;
     }
     final th = await _resolveTaskHandles(task.task_pk);
-    if (th == null) return;
+    if (th == null) {
+      _parkedUntil[task.task_pk] = DateTime.now().add(_parkCooldown);
+      return;
+    }
     // Hydrate an isolated tree with the submitted task branch so the verifier
     // reads the work without touching any other agent's tree. Guard the lane op
     // (a hang here would wedge the lane for every task) — on timeout/error yield
@@ -1641,13 +2030,14 @@ class ProjectOrchestrator {
       // so a transient freeze can't push a good task toward Blocked. The task is
       // still `submitted` (verifying isn't marked until below), so the verify
       // pool re-picks it next pump on the now self-healed lane.
-      _undoAttempt(task.task_pk);
+      _parkedUntil[task.task_pk] = DateTime.now().add(_parkCooldown);
       return;
     }
 
     try {
       final prompts = await _loadPrompts();
       final vars = _varsFor(task, branch);
+      final verificationScope = await _workerTemplateScope(task, th.tree);
       // Reuse the Verification Agent's single per-agent session (see worker).
       final sessionPk = await _db.getOrCreateAgentChatSession(
         projectId,
@@ -1669,12 +2059,15 @@ class ProjectOrchestrator {
         git: th.git,
         buildService: th.build,
         leanTools: false,
+        verificationTaskId: task.task_pk,
+        verificationReadFiles: verificationScope.requiredFiles,
         systemPromptOverride: await _framedPrompt(
           AgentRole.verificationAgent,
           OrchestratorPromptField.verifyFraming,
           prompts,
           vars,
         ),
+        reasoningEffort: personaReasoningEffort(persona.configJson),
         enableThinking: resolveEnableThinking(
           agent: personaThinkingMode(
             persona.configJson,
@@ -1692,13 +2085,21 @@ class ProjectOrchestrator {
       ) {
         if (!await _stillRunning()) return;
         try {
-          await _drainTurn(session.runTurn(kickoff)); // idle + wall-clock cap
+          await _drainTurn(
+            session.runTurn(
+              kickoff,
+              maxToolRounds: 6,
+              onToolResult: (result) =>
+                  debugPrint('[Verifier p$projectId t${task.task_pk}] $result'),
+            ),
+            activity: session.turnActivity,
+          ); // idle + wall-clock cap
         } catch (e) {
           if (e is TimeoutException || _isNotTaskFault(e)) {
-            _undoAttempt(
-              task.task_pk,
-            ); // stall/backpressure/transient — don't penalize
+            _parkedUntil[task.task_pk] = DateTime.now().add(_parkCooldown);
           } else {
+            _reviewFailures[task.task_pk] =
+                (_reviewFailures[task.task_pk] ?? 0) + 1;
             debugPrint(
               '[Orchestrator p$projectId] task ${task.task_pk}: functional verify turn $turn failed: $e',
             );
@@ -1715,6 +2116,7 @@ class ProjectOrchestrator {
               task.requiresBuild) {
             await _db.recordTaskBuildOutcome(task.task_pk, passed: true);
           }
+          _reviewFailures.remove(task.task_pk);
           debugPrint(
             '[Orchestrator p$projectId] task ${task.task_pk}: functional verdict recorded (${fresh.executionStatus}).',
           );
@@ -1725,6 +2127,8 @@ class ProjectOrchestrator {
       debugPrint(
         '[Orchestrator p$projectId] task ${task.task_pk}: functional verify hit turn cap without a verdict.',
       );
+      _reviewFailures[task.task_pk] = (_reviewFailures[task.task_pk] ?? 0) + 1;
+      _parkedUntil[task.task_pk] = DateTime.now().add(_parkCooldown);
     } finally {
       await _releaseTaskTree(task.task_pk);
     }
@@ -1808,7 +2212,6 @@ class ProjectOrchestrator {
   /// board on failure. The run is started with `taskPk: null` so BuildService's
   /// auto-approve-on-green rule doesn't fire — this stage owns the outcome.
   Future<void> _runBuildStage(Task task) async {
-    _attempts[task.task_pk] = (_attempts[task.task_pk] ?? 0) + 1;
     final project = await _db.getProjectById(projectId);
     if (project == null) return;
     final handles = await _resolveWorkspaceHandles();
@@ -2039,7 +2442,6 @@ class ProjectOrchestrator {
   /// role allowed to merge. If no Coordinator persona exists, the task is left
   /// awaiting a human merge.
   Future<void> _runMergeStage(Task task) async {
-    _attempts[task.task_pk] = (_attempts[task.task_pk] ?? 0) + 1;
     final handles = await _resolveWorkspaceHandles();
     final git = handles.git;
     final lane = ref.read(gitLaneProvider(projectId));
@@ -2086,7 +2488,6 @@ class ProjectOrchestrator {
         debugPrint(
           '[Orchestrator p$projectId] task ${task.task_pk}: auto-merge timed out ($e) — yielding back for retry.',
         );
-        _undoAttempt(task.task_pk);
         return;
       } catch (e) {
         debugPrint(
@@ -2108,7 +2509,6 @@ class ProjectOrchestrator {
     // has a clean base.
     final full = await _db.getTaskById(task.task_pk);
     if (full?.isEdit == true) {
-      _undoAttempt(task.task_pk);
       _markRedo(full!);
       await _db.reopenTask(task.task_pk);
       debugPrint(
@@ -2195,6 +2595,7 @@ class ProjectOrchestrator {
         prompts,
         vars,
       ),
+      reasoningEffort: personaReasoningEffort(persona.configJson),
       enableThinking: resolveEnableThinking(
         agent: personaThinkingMode(
           persona.configJson,
@@ -2216,13 +2617,12 @@ class ProjectOrchestrator {
     for (var turn = 0; turn < _maxTurnsPerStage && !_disposed; turn++) {
       if (!await _stillRunning()) return;
       try {
-        await _drainTurn(session.runTurn(kickoff)); // idle + wall-clock cap
+        await _drainTurn(
+          session.runTurn(kickoff),
+          activity: session.turnActivity,
+        ); // idle + wall-clock cap
       } catch (e) {
-        if (e is TimeoutException || _isNotTaskFault(e)) {
-          _undoAttempt(
-            task.task_pk,
-          ); // stall/backpressure/transient — don't penalize
-        } else {
+        if (e is! TimeoutException && !_isNotTaskFault(e)) {
           debugPrint(
             '[Orchestrator p$projectId] task ${task.task_pk}: merge turn $turn failed: $e',
           );
@@ -2382,31 +2782,9 @@ class ProjectOrchestrator {
     );
   }
 
-  /// Drive the Coordinator persona once to scaffold the base project onto main.
+  /// Drive a coding persona once to scaffold the base project onto main.
   /// Returns true when main has a commit (the scaffold landed).
   Future<bool> _runTemplaterAgent(Project project) async {
-    // Scaffolding is a CODING job — prefer a generalist worker (its model is
-    // code-tuned), not the Coordinator (whose model is the interview/discovery
-    // collection, which just chats instead of creating files). Fall back to the
-    // Coordinator only if no worker persona exists.
-    final persona =
-        await _findPersonaForRole(AgentRole.sdeGeneralist) ??
-        await _findPersonaForRole(AgentRole.coordinator);
-    if (persona == null) {
-      // ignore: avoid_print
-      print(
-        '[Templater] NO generalist/Coordinator persona — cannot scaffold (failed/gated).',
-      );
-      return false;
-    }
-    final resolved = await _resolveBackend(persona);
-    if (resolved == null) {
-      // ignore: avoid_print
-      print(
-        '[Templater] no inference backend for ${persona.name} — cannot scaffold.',
-      );
-      return false;
-    }
     final handles = await _resolveWorkspaceHandles();
     final ws = handles.ws;
     final git = handles.git;
@@ -2414,6 +2792,19 @@ class ProjectOrchestrator {
       // ignore: avoid_print
       print('[Templater] workspace/git unavailable — cannot scaffold.');
       return false;
+    }
+
+    var tasks = await _db.getTasksForProject(projectId)
+      ..sort((a, b) {
+        final byMilestone = (a.milestoneOrder ?? 0).compareTo(
+          b.milestoneOrder ?? 0,
+        );
+        if (byMilestone != 0) return byMilestone;
+        return a.task_pk.compareTo(b.task_pk);
+      });
+    final stackKind = await _detectStackKind();
+    if (stackKind == 'flutter') {
+      tasks = await _organizeFlutterTasks(tasks);
     }
 
     // Scaffold onto main so every task branch (created off it) inherits the base.
@@ -2427,8 +2818,9 @@ class ProjectOrchestrator {
     // commit (the files exist) and look like a failure. Reuse the scaffold and
     // let the caller proceed (re-run the CI gate, etc.).
     final existingHead = await git.headOid();
-    final existingFiles = (await ws.walk()).where((f) => !f.isDirectory).length;
-    if (existingHead != null && existingFiles > 0) {
+    final existing = await _inspectScaffold(ws, tasks);
+    final existingFiles = existing.fileCount;
+    if (existingHead != null && existing.valid) {
       // ignore: avoid_print
       print(
         '[Templater] scaffold already present (head=$existingHead, '
@@ -2439,7 +2831,7 @@ class ProjectOrchestrator {
     // RETRY after an interrupted run: the agent had written a scaffold but a 502
     // burst killed it before git_commit (head still unborn, files on disk). Don't
     // redo the whole thing — commit what's there and accept.
-    if (existingHead == null && existingFiles >= 2) {
+    if (existingHead == null && existing.valid) {
       try {
         await ref
             .read(gitLaneProvider(projectId))
@@ -2465,14 +2857,65 @@ class ProjectOrchestrator {
     // A pre-existing main commit must NOT let the templater "succeed" without
     // doing work, so we only count it scaffolded once a NEW commit lands.
     final beforeHead = await git.headOid();
+
+    // Known application stacks do not need a model to invent their base file
+    // layout. Generate the Flutter handoff directly from the accepted project
+    // tags and task records. This makes the Templater useful even when a routed
+    // model refuses tools or supplies host-machine paths instead of workspace
+    // paths, and gives every future worker one explicit file to own.
+    if (stackKind == 'flutter') {
+      return _writeDeterministicFlutterTemplate(
+        project: project,
+        tasks: tasks,
+        ws: ws,
+        git: git,
+        beforeHead: beforeHead,
+      );
+    }
+
+    // Unknown stacks still use a coding persona to choose their initial
+    // structure. Prefer a generalist worker and fall back to the Coordinator.
+    final persona =
+        await _findPersonaForRole(AgentRole.sdeGeneralist) ??
+        await _findPersonaForRole(AgentRole.coordinator);
+    if (persona == null) {
+      // ignore: avoid_print
+      print(
+        '[Templater] NO generalist/Coordinator persona — cannot scaffold (failed/gated).',
+      );
+      return false;
+    }
+    final resolved = await _resolveBackend(persona);
+    if (resolved == null) {
+      // ignore: avoid_print
+      print(
+        '[Templater] no inference backend for ${persona.name} — cannot scaffold.',
+      );
+      return false;
+    }
     // ignore: avoid_print
     print(
       '[Templater] running scaffolder agent "${persona.name}" on main '
       '(beforeHead=${beforeHead ?? "unborn"}).',
     );
 
-    final tasks = await _db.getTasksForProject(projectId);
-    final taskList = tasks.map((t) => '- ${t.title}').join('\n');
+    final taskList = tasks
+        .map((t) {
+          final description = (t.description ?? '').trim();
+          final acceptance = (t.acceptanceCriteria ?? '').trim();
+          return StringBuffer()
+            ..writeln(
+              '- Milestone ${(t.milestoneOrder ?? 0) + 1}, task #${t.task_pk}: '
+              '${t.title}',
+            )
+            ..writeln(
+              '  Description: ${description.isEmpty ? '(none supplied)' : description}',
+            )
+            ..write(
+              '  Acceptance: ${acceptance.isEmpty ? '(none supplied)' : acceptance}',
+            );
+        })
+        .join('\n');
     final baseSpec = await _buildTemplaterBaseSpec();
     final prompts = await _loadPrompts();
     final vars = PromptVars(
@@ -2505,12 +2948,12 @@ class ProjectOrchestrator {
       // Scaffold-only toolset: file/git/CI only — no image/story/task tools, so
       // the scaffolder can't wander off (e.g. into image generation).
       scaffoldMode: true,
-      systemPromptOverride: await _framedPrompt(
-        AgentRole.coordinator,
-        OrchestratorPromptField.templaterFraming,
-        prompts,
-        vars,
-      ),
+      // A normal Coordinator prompt says it integrates existing branches and
+      // does not write code, which directly contradicts this one-off job. Give
+      // the phase a dedicated identity while retaining the authoritative stack
+      // baseline and the user-editable templater instructions.
+      systemPromptOverride: await _templaterPrompt(prompts, vars),
+      reasoningEffort: personaReasoningEffort(persona.configJson),
       enableThinking: resolveEnableThinking(
         agent: personaThinkingMode(
           persona.configJson,
@@ -2520,10 +2963,13 @@ class ProjectOrchestrator {
       ),
     );
 
-    var kickoff = prompts.render(
-      OrchestratorPromptField.templaterKickoff,
-      vars,
-    );
+    var kickoff =
+        'Your FIRST action must be write_file with path "/WORK_TEMPLATE.md". '
+        'In that file, list every task by its #id and milestone, its dependencies, '
+        'and the shared versus task-owned files it should use. Then create the '
+        'manifest, entry point, .gitignore, contracts and task starting files, '
+        'then stop; the app validates and commits the finished scaffold.\n\n'
+        '${prompts.render(OrchestratorPromptField.templaterKickoff, vars)}';
     const maxTransientRetries = 10;
     var transientRetries = 0;
     // Manual turn counter so a TRANSIENT failure (502/stall/backpressure) can
@@ -2547,6 +2993,7 @@ class ProjectOrchestrator {
               );
             },
           ),
+          activity: session.turnActivity,
         );
       } catch (e) {
         if (e is! TimeoutException && !_isNotTaskFault(e)) {
@@ -2556,6 +3003,11 @@ class ProjectOrchestrator {
           break; // fall through to the salvage commit below
         }
         transient = true; // 502 / stall / backpressure
+        // Surface the REAL cause (was swallowed) — e.g. connection closed vs a
+        // 5xx vs a stall — so a "transient" that never bills tokens can be told
+        // apart from a genuine backend hiccup.
+        // ignore: avoid_print
+        print('[Templater] transient cause: ${e.runtimeType}: $e');
       }
       if (transient) {
         transientRetries++;
@@ -2569,33 +3021,51 @@ class ProjectOrchestrator {
         continue; // retry same turn without incrementing
       }
       transientRetries = 0;
-      final head = await git.headOid();
-      final wsFiles = (await ws.walk()).where((f) => !f.isDirectory).length;
+      var head = await git.headOid();
+      final scaffold = await _inspectScaffold(ws, tasks);
+      final wsFiles = scaffold.fileCount;
       // ignore: avoid_print
       print(
         '[Templater] turn $turn: $toolCalls tool call(s); '
         'workspace has $wsFiles file(s); head=${head ?? "unborn"} '
         '(beforeHead=${beforeHead ?? "unborn"}).',
       );
-      if (head != beforeHead && wsFiles > 0) {
+      if (scaffold.valid && head == beforeHead) {
+        try {
+          await ref
+              .read(gitLaneProvider(projectId))
+              .run(
+                () => git.commitAll(message: 'chore: scaffold base project'),
+                timeout: _laneOpTimeout,
+              );
+          head = await git.headOid();
+        } catch (e) {
+          debugPrint(
+            '[Orchestrator p$projectId] validated scaffold commit failed: $e',
+          );
+        }
+      }
+      if (head != beforeHead && scaffold.valid) {
         // ignore: avoid_print
         print('[Templater] NEW commit + $wsFiles file(s) — scaffold accepted.');
         ref.read(workspaceRevisionProvider(projectId).notifier).state++;
         return true;
       }
       kickoff =
-          'You have NOT committed the scaffold yet (workspace shows $wsFiles '
-          'file(s)). Use create_file to write the manifest + main runner + a stub '
-          'file per task (+ DB schema if there is a database), THEN git_commit. '
-          'An empty commit does not count.';
+          'The scaffold is NOT ready. Missing or invalid: '
+          '${scaffold.missing.join(", ")}. Use write_file now to complete the '
+          'WORK_TEMPLATE, manifest, entry point, .gitignore, shared contracts '
+          'and task-owned starting files. The app commits once validation passes; '
+          'a prose answer does not count.';
       turn++;
     }
     // SALVAGE: the agent wrote a scaffold but never committed it (common when a
     // 502 burst interrupts before git_commit). Don't throw the work away — commit
     // the workspace ourselves and accept it. A stub scaffold is a valid base; the
     // base CI gate is non-blocking and the end-of-project scan is the real gate.
-    final leftover = (await ws.walk()).where((f) => !f.isDirectory).length;
-    if (leftover >= 2 && (await git.headOid()) == beforeHead) {
+    final leftoverState = await _inspectScaffold(ws, tasks);
+    final leftover = leftoverState.fileCount;
+    if (leftoverState.valid && (await git.headOid()) == beforeHead) {
       try {
         await ref
             .read(gitLaneProvider(projectId))
@@ -2621,6 +3091,482 @@ class ProjectOrchestrator {
     // ignore: avoid_print
     print('[Templater] hit turn cap without a real scaffold — FAILED.');
     return false;
+  }
+
+  /// Put foundation work before feature composition, then persist the order as
+  /// milestone batches. The original task-generation order reflects story
+  /// insertion order, which can place physics after the game loop that needs it.
+  Future<List<Task>> _organizeFlutterTasks(List<Task> tasks) async {
+    if (tasks.isEmpty) return tasks;
+    final ordered = [...tasks]
+      ..sort((a, b) {
+        final byFoundation = _flutterTaskRank(a).compareTo(_flutterTaskRank(b));
+        if (byFoundation != 0) return byFoundation;
+        return a.task_pk.compareTo(b.task_pk);
+      });
+    // Preserve dependency layers without turning every topic into a serial
+    // milestone. Independent foundations and sibling feature/UI work share a
+    // rank and can use separate worker slots; composition still waits for its
+    // inputs to settle.
+    final ranks = ordered.map(_flutterTaskRank).toSet().toList()..sort();
+    final milestoneByRank = <int, int>{
+      for (var index = 0; index < ranks.length; index++) ranks[index]: index,
+    };
+    final batchCount = ranks.length;
+    for (var index = 0; index < ordered.length; index++) {
+      final milestone = milestoneByRank[_flutterTaskRank(ordered[index])]!;
+      if (ordered[index].milestoneOrder != milestone) {
+        await _db.setTaskMilestone(ordered[index].task_pk, milestone);
+      }
+    }
+    await _db.setProjectMilestonePlan(projectId, count: batchCount);
+
+    // ignore: avoid_print
+    print(
+      '[Templater] Flutter build batches: '
+      '${ranks.map((rank) => ordered.where((task) => _flutterTaskRank(task) == rank).map((task) => "#${task.task_pk}").join(" + ")).join(" → ")}',
+    );
+
+    final refreshed = await _db.getTasksForProject(projectId);
+    refreshed.sort((a, b) {
+      final byMilestone = (a.milestoneOrder ?? 0).compareTo(
+        b.milestoneOrder ?? 0,
+      );
+      if (byMilestone != 0) return byMilestone;
+      final byFoundation = _flutterTaskRank(a).compareTo(_flutterTaskRank(b));
+      if (byFoundation != 0) return byFoundation;
+      return a.task_pk.compareTo(b.task_pk);
+    });
+    return refreshed;
+  }
+
+  static int _flutterTaskRank(Task task) {
+    // Use the title as the task's declared responsibility. Descriptions often
+    // mention later UI concepts (for example a core task mentioning menus),
+    // which would otherwise distort the dependency order.
+    return flutterTaskDependencyRankForTitle(task.title);
+  }
+
+  /// Write a stable Flutter project skeleton and its worker handoff without an
+  /// inference round. Each task owns one feature directory; shared entry points
+  /// and contracts are created once and treated as integration-owned files.
+  Future<bool> _writeDeterministicFlutterTemplate({
+    required Project project,
+    required List<Task> tasks,
+    required Workspace ws,
+    required NxtprjGitEngine git,
+    required String? beforeHead,
+  }) async {
+    final packageName = _dartIdentifier(
+      project.name,
+      fallback: 'nexus_project',
+    );
+    final ownedDirs = <int, String>{};
+    final pageFiles = <int, String>{};
+    final classNames = <int, String>{};
+    for (final task in tasks) {
+      final slug = _dartIdentifier(task.title, fallback: 'feature');
+      final ownedDir = 'lib/features/task_${task.task_pk}_$slug';
+      ownedDirs[task.task_pk] = ownedDir;
+      pageFiles[task.task_pk] = '$ownedDir/${slug}_page.dart';
+      classNames[task.task_pk] = _dartClassName(task.title, task.task_pk);
+    }
+
+    final template = StringBuffer()
+      ..writeln('# Work template: ${project.name}')
+      ..writeln()
+      ..writeln('This file is the handoff for task workers and coordinators. ')
+      ..writeln('Implement milestones in the order below. Tasks in the same ')
+      ..writeln('milestone may run in parallel. A task owns its listed ')
+      ..writeln('feature directory; do not create a second copy elsewhere.')
+      ..writeln()
+      ..writeln('## Shared files (integration-owned)')
+      ..writeln()
+      ..writeln('- `/lib/main.dart`: application bootstrapping only')
+      ..writeln('- `/lib/app_routes.dart`: the single route registry')
+      ..writeln('- `/lib/core/game_contracts.dart`: shared game vocabulary')
+      ..writeln('- `/web/index.html`: shared web bootstrap')
+      ..writeln('- `/pubspec.yaml`: the single dependency manifest')
+      ..writeln()
+      ..writeln(
+        'Workers consume these shared files. Extend behavior inside the ',
+      )
+      ..writeln('task-owned directory and leave cross-task integration to the ')
+      ..writeln(
+        'coordinator, preventing duplicate models, routes, and services.',
+      )
+      ..writeln()
+      ..writeln('## Build order');
+
+    for (var index = 0; index < tasks.length; index++) {
+      final task = tasks[index];
+      final milestone = (task.milestoneOrder ?? 0) + 1;
+      final prior = tasks
+          .where(
+            (candidate) => (candidate.milestoneOrder ?? 0) == milestone - 2,
+          )
+          .map((candidate) => '#${candidate.task_pk}')
+          .toList();
+      final dependencies = prior.isEmpty
+          ? 'none (foundation task)'
+          : prior.join(', ');
+      final description = (task.description ?? '').trim();
+      final acceptance = (task.acceptanceCriteria ?? '').trim();
+      template
+        ..writeln()
+        ..writeln('### ${index + 1}. Task #${task.task_pk}: ${task.title}')
+        ..writeln()
+        ..writeln('- Milestone: $milestone')
+        ..writeln('- Depends on: $dependencies')
+        ..writeln('- Owns: `/${ownedDirs[task.task_pk]}`')
+        ..writeln('- Starter: `/${pageFiles[task.task_pk]}`')
+        ..writeln('- Uses: `/lib/core/game_contracts.dart`')
+        ..writeln(
+          '- Goal: ${description.isEmpty ? 'Implement the named feature.' : description.replaceAll('\n', ' ')}',
+        )
+        ..writeln(
+          '- Acceptance: ${acceptance.isEmpty ? 'Derive focused tests from the goal before submission.' : acceptance.replaceAll('\n', ' ')}',
+        );
+    }
+
+    final imports = tasks
+        .map((task) => "import '${pageFiles[task.task_pk]!.substring(4)}';")
+        .join('\n');
+    final routes = tasks
+        .map((task) {
+          final slug = _dartIdentifier(task.title, fallback: 'feature');
+          return "  '/task-${task.task_pk}-$slug': (_) => "
+              '${classNames[task.task_pk]}(),';
+        })
+        .join('\n');
+
+    final writes = <String, String>{
+      '/WORK_TEMPLATE.md': template.toString(),
+      '/pubspec.yaml': '''name: $packageName
+description: Scaffold generated from the Nexus project work template.
+publish_to: none
+version: 0.1.0+1
+environment:
+  sdk: ^3.11.5
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_riverpod: ^3.3.2
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+flutter:
+  uses-material-design: true
+''',
+      '/.gitignore': '''.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+build/
+coverage/
+*.iml
+.idea/
+.vscode/
+''',
+      '/analysis_options.yaml': '''include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  exclude:
+    - build/**
+''',
+      '/web/index.html':
+          '''<!DOCTYPE html>
+<html>
+<head>
+  <base href="\$FLUTTER_BASE_HREF">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="${_dartLiteral(project.name)}">
+  <title>${project.name}</title>
+</head>
+<body>
+  <script src="flutter_bootstrap.js" async></script>
+</body>
+</html>
+''',
+      '/lib/core/game_contracts.dart':
+          '''enum DifficultyTier { easy, medium, hard }
+
+enum LevelPack { classic, variants }
+
+class GameSessionState {
+  const GameSessionState({
+    this.score = 0,
+    this.isRunning = false,
+    this.isGameOver = false,
+  });
+
+  final int score;
+  final bool isRunning;
+  final bool isGameOver;
+}
+''',
+      '/lib/app_routes.dart':
+          '''import 'package:flutter/widgets.dart';
+
+$imports
+
+final Map<String, WidgetBuilder> appRoutes = {
+$routes
+};
+''',
+      '/lib/main.dart':
+          '''import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import 'app_routes.dart';
+
+void main() {
+  runApp(const ProviderScope(child: GeneratedApp()));
+}
+
+class GeneratedApp extends StatelessWidget {
+  const GeneratedApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: '${_dartLiteral(project.name)}',
+      routes: appRoutes,
+      home: const TemplateHome(),
+    );
+  }
+}
+
+class TemplateHome extends StatelessWidget {
+  const TemplateHome({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('${_dartLiteral(project.name)}')),
+      body: ListView(
+        children: [
+          for (final route in appRoutes.keys)
+            ListTile(
+              title: Text(route),
+              onTap: () => Navigator.of(context).pushNamed(route),
+            ),
+        ],
+      ),
+    );
+  }
+}
+''',
+      '/test/widget_test.dart':
+          '''import 'package:flutter_test/flutter_test.dart';
+import 'package:$packageName/main.dart';
+
+void main() {
+  testWidgets('generated project shell loads', (tester) async {
+    await tester.pumpWidget(const GeneratedApp());
+    expect(find.text('${_dartLiteral(project.name)}'), findsOneWidget);
+  });
+}
+''',
+    };
+
+    for (final task in tasks) {
+      final className = classNames[task.task_pk]!;
+      final title = _dartLiteral(task.title);
+      writes['/${pageFiles[task.task_pk]}'] =
+          '''import 'package:flutter/material.dart';
+
+class $className extends StatelessWidget {
+  const $className({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return const Scaffold(
+      body: Center(child: Text('Task #${task.task_pk}: $title')),
+    );
+  }
+}
+
+// TODO(task #${task.task_pk}): Replace this starting page with the task implementation.
+''';
+    }
+
+    // ignore: avoid_print
+    print(
+      '[Templater] writing deterministic Flutter work template for '
+      '${tasks.length} task(s).',
+    );
+    for (final entry in writes.entries) {
+      await ws.writeString(entry.key, entry.value);
+    }
+
+    final scaffold = await _inspectScaffold(ws, tasks);
+    if (!scaffold.valid) {
+      // ignore: avoid_print
+      print('[Templater] deterministic scaffold invalid: ${scaffold.missing}');
+      return false;
+    }
+    try {
+      await ref
+          .read(gitLaneProvider(projectId))
+          .run(
+            () => git.commitAll(message: 'chore: scaffold base project'),
+            timeout: _laneOpTimeout,
+          );
+      final head = await git.headOid();
+      if (head != beforeHead) {
+        // ignore: avoid_print
+        print(
+          '[Templater] deterministic Flutter scaffold committed: '
+          '${scaffold.fileCount} file(s), head=$head.',
+        );
+        ref.read(workspaceRevisionProvider(projectId).notifier).state++;
+        return true;
+      }
+    } catch (e) {
+      debugPrint(
+        '[Orchestrator p$projectId] deterministic scaffold commit failed: $e',
+      );
+    }
+    return false;
+  }
+
+  static String _dartIdentifier(String value, {required String fallback}) {
+    var result = value
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^a-z0-9]+'), '_')
+        .replaceAll(RegExp(r'^_+|_+$'), '');
+    if (result.isEmpty) result = fallback;
+    if (RegExp(r'^[0-9]').hasMatch(result)) result = '${fallback}_$result';
+    return result;
+  }
+
+  static String _dartClassName(String value, int taskPk) {
+    final words = value
+        .split(RegExp(r'[^A-Za-z0-9]+'))
+        .where((word) => word.isNotEmpty);
+    var stem = words
+        .map((word) => '${word[0].toUpperCase()}${word.substring(1)}')
+        .join();
+    if (stem.isEmpty || RegExp(r'^[0-9]').hasMatch(stem)) stem = 'Feature$stem';
+    return '${stem}Task${taskPk}Page';
+  }
+
+  static String _dartLiteral(String value) => value
+      .replaceAll(r'\', r'\\')
+      .replaceAll("'", r"\'")
+      .replaceAll('\r', ' ')
+      .replaceAll('\n', ' ');
+
+  Future<String> _templaterPrompt(
+    OrchestratorPrompts prompts,
+    PromptVars vars,
+  ) async {
+    final baseline = await buildProjectBaseline(_db, projectId);
+    return '''$baseline
+
+You are the Templater. This is a one-time planning and scaffolding phase before
+feature workers start. Establish the implementation order, shared contracts,
+shared file ownership, and task-specific starting files so later workers build
+on one coherent structure without duplicating or overwriting each other's work.
+Your first deliverable is /WORK_TEMPLATE.md. It must mention every task by #id
+and record its milestone, dependencies, primary files, and any shared contract
+it consumes or owns. This is the handoff future workers use to stay in lane.
+Use the provided file and git tools immediately. A prose plan does not change
+the workspace and does not count as progress.
+
+${prompts.render(OrchestratorPromptField.templaterFraming, vars)}
+
+FINAL EXECUTION RULE: write the files with write_file. Do not inspect host paths
+and do not manage Git; the workspace begins empty and the app validates and
+commits the scaffold after all required artifacts exist.''';
+  }
+
+  /// A templater commit is useful only when it leaves a concrete handoff and a
+  /// runnable project shape. Counting "one file + one commit" accepted malformed
+  /// model output as a scaffold, so validate the artifacts that future workers
+  /// actually depend on.
+  Future<({bool valid, int fileCount, List<String> missing})> _inspectScaffold(
+    Workspace ws,
+    List<Task> tasks,
+  ) async {
+    final entries = (await ws.walk()).where((f) => !f.isDirectory).toList();
+    final paths = [
+      for (final entry in entries) entry.path.replaceAll('\\', '/'),
+    ];
+    final lower = paths.map((p) => p.toLowerCase()).toList();
+    bool hasName(String name) =>
+        lower.any((p) => p == name || p.endsWith('/$name'));
+
+    final hasManifest = lower.any((p) {
+      final name = p.split('/').last;
+      return const {
+            'pubspec.yaml',
+            'package.json',
+            'pyproject.toml',
+            'requirements.txt',
+            'cargo.toml',
+            'go.mod',
+            'cmakelists.txt',
+            'pom.xml',
+            'build.gradle',
+            'build.gradle.kts',
+            'package.swift',
+            'gemfile',
+            'composer.json',
+          }.contains(name) ||
+          name.endsWith('.csproj');
+    });
+    final hasEntryPoint = lower.any((p) {
+      final name = p.split('/').last;
+      return const {
+        'main.dart',
+        'main.py',
+        'main.go',
+        'main.rs',
+        'main.c',
+        'main.cpp',
+        'main.ts',
+        'main.js',
+        'main.java',
+        'index.ts',
+        'index.js',
+        'app.py',
+        'program.cs',
+      }.contains(name);
+    });
+
+    String workTemplate = '';
+    final workTemplateIndex = lower.indexWhere(
+      (p) => p == 'work_template.md' || p.endsWith('/work_template.md'),
+    );
+    if (workTemplateIndex >= 0) {
+      try {
+        workTemplate = await ws.readString(paths[workTemplateIndex]);
+      } catch (_) {}
+    }
+    final coversTasks = tasks.every(
+      (task) => workTemplate.contains('#${task.task_pk}'),
+    );
+    final targetFileCount = tasks.length < 9 ? tasks.length + 3 : 12;
+
+    final missing = <String>[
+      if (workTemplateIndex < 0) 'WORK_TEMPLATE.md',
+      if (workTemplateIndex >= 0 && !coversTasks)
+        'all task #ids in WORK_TEMPLATE',
+      if (!hasManifest) 'project manifest',
+      if (!hasEntryPoint) 'main entry point',
+      if (!hasName('.gitignore')) '.gitignore',
+      if (entries.length < targetFileCount)
+        'task/contract starting files (${entries.length}/$targetFileCount)',
+    ];
+    return (
+      valid: missing.isEmpty,
+      fileCount: entries.length,
+      missing: missing,
+    );
   }
 
   /// The Templater's base spec: the condensed top-of-tree story (a whole-project
@@ -3040,18 +3986,12 @@ class ProjectOrchestrator {
     }
   }
 
-  /// Open the next milestone batch when appropriate. Two triggers:
-  ///   1. The current-or-earlier batches are fully finished (clean progression).
-  ///   2. BACKFILL: there are IDLE worker slots and the current batch has no more
-  ///      STARTABLE work — its remaining tasks are all in flight (or held) — so
-  ///      the next batch opens to feed the idle slots instead of the pipeline
-  ///      tailing off to a single task while later batches sit gated. This is what
-  ///      keeps all N connections busy across a batch boundary (the "11 & 12
-  ///      finished but the next 25 never started" stall).
-  /// Advances at most ONE batch per call; since each stage re-pumps on completion,
-  /// it opens just enough batches to keep the workers fed. A Blocked task is
-  /// surfaced to the human and does NOT freeze progression. No-op on the last batch.
-  Future<bool> _maybeAdvanceMilestone(Project project, int workerCap) async {
+  /// Open the next milestone after every task in the current-or-earlier layers
+  /// has reached a settled state. Done work supplies its implementation; Blocked
+  /// work stays visibly unresolved but does not strand independent Todo work in
+  /// later batches. Final project completion remains gated on clearing every
+  /// Blocked task in [_maybeFinalizeProject]. Advances at most one batch per call.
+  Future<bool> _maybeAdvanceMilestone(Project project) async {
     final count = project.milestoneCount;
     if (count <= 1) return false;
     final current = project.currentMilestone;
@@ -3059,17 +3999,14 @@ class ProjectOrchestrator {
     final tasks = await _db.getTasksForProject(projectId);
     final inScope = tasks.where((t) => (t.milestoneOrder ?? 0) <= current);
     if (inScope.isEmpty) return false;
-    final batchDone = !inScope.any(
-      (t) => t.status != TaskStatus.done && t.status != TaskStatus.blocked,
+    final batchSettled = !inScope.any(
+      (t) => !taskStatusSettlesMilestone(t.status),
     );
-    // Idle slots + nothing startable in the current scope → backfill from next.
-    final idleSlots = _active.length < workerCap;
-    final noStartable = _assignableTasks(tasks, current).isEmpty;
-    if (!batchDone && !(idleSlots && noStartable)) return false;
+    if (!batchSettled) return false;
     final next = await _db.advanceProjectMilestone(projectId);
     debugPrint(
       '[Orchestrator p$projectId] milestone $current → opening $next/${count - 1} '
-      '(${batchDone ? 'batch complete' : 'backfilling idle worker slots'}).',
+      '(dependency layer settled).',
     );
     return true;
   }
@@ -3101,11 +4038,30 @@ class ProjectOrchestrator {
     );
     if (open.isNotEmpty)
       return false; // work still in flight — not finished yet
-    // A BLOCKED task = unresolved work: NEVER start end-of-project testing on an
-    // incomplete project. Blocked must be cleared first (self-healed or by the
-    // human) — testing against a project with a missing/failed feature just
-    // manufactures errors. The re-pump retries once it's unblocked.
-    if (tasks.any((t) => t.status == TaskStatus.blocked)) return false;
+    // PRE-TEST RECOVERY: reaching the final boundary with Blocked work means the
+    // first worker budget was exhausted. Give every such task one automatic fresh
+    // budget before CI. This keeps the safety state useful without making normal
+    // unattended runs depend on a human dragging cards back to Todo. The sweep is
+    // deliberately once per orchestrator run; a task that blocks again remains
+    // Blocked and final testing cannot claim the project passed.
+    final blocked = tasks.where((t) => t.status == TaskStatus.blocked).toList();
+    if (blocked.isNotEmpty) {
+      if (!_blockedRecoverySweepDone) {
+        _blockedRecoverySweepDone = true;
+        final count = await _db.requeueBlockedTasks(projectId);
+        for (final task in blocked) {
+          _attempts.remove(task.task_pk);
+          _reviewFailures.remove(task.task_pk);
+          _parkedUntil.remove(task.task_pk);
+        }
+        debugPrint(
+          '[Orchestrator p$projectId] PRE-TEST RECOVERY: requeued $count Blocked '
+          'task(s) with fresh retry budgets before final CI.',
+        );
+        return count > 0;
+      }
+      return false;
+    }
     final done = tasks.where((t) => t.status == TaskStatus.done).toList();
     if (done.isEmpty) return false; // nothing built — leave it
     // Skip if this exact completed state already passed (or exhausted) testing —
@@ -3508,6 +4464,13 @@ class ProjectOrchestrator {
       debugPrint(
         '[Orchestrator p$projectId] final-pass tree stub scan failed: $e',
       );
+      rethrow;
+    }
+    final testCoverage = await _featureTestCoverageProblem();
+    if (testCoverage.isNotEmpty) {
+      if (buf.isNotEmpty) buf.writeln();
+      buf.writeln('MISSING FEATURE TEST COVERAGE:');
+      buf.writeln('- $testCoverage');
     }
     try {
       final allTasks = await _db.getTasksForProject(projectId);
@@ -3522,8 +4485,27 @@ class ProjectOrchestrator {
         buf.writeln('UNWIRED / INCOMPLETE FEATURES (from a code review):');
         buf.writeln(code.issues.trim());
       }
+      final unconfirmed = reviewPks.difference(code.verified);
+      if (unconfirmed.isNotEmpty) {
+        final issuePks = RegExp(r'#(\d+)\s+ISSUE\b', caseSensitive: false)
+            .allMatches(code.issues)
+            .map((match) => int.tryParse(match.group(1)!))
+            .whereType<int>()
+            .toSet();
+        final missingVerdicts = unconfirmed.difference(issuePks);
+        if (missingVerdicts.isNotEmpty) {
+          if (buf.isNotEmpty) buf.writeln();
+          buf.writeln('INCONCLUSIVE FEATURE REVIEW:');
+          for (final pk in missingVerdicts.toList()..sort()) {
+            buf.writeln(
+              '- #$pk was not confirmed implemented and reachable by the code-trace reviewer.',
+            );
+          }
+        }
+      }
     } catch (e) {
       debugPrint('[Orchestrator p$projectId] final-pass code trace failed: $e');
+      rethrow;
     }
     // VISION is ADVISORY ONLY — it must NOT block completion. The web-build
     // screenshot is inherently unreliable: a NATIVE app (drift/native-SQLite,
@@ -3632,6 +4614,7 @@ class ProjectOrchestrator {
       leanTools: false,
       fixMode: true, // file/git read tools — we instruct it to only read
       systemPromptOverride: systemPrompt,
+      reasoningEffort: personaReasoningEffort(persona.configJson),
       enableThinking: resolveEnableThinking(
         agent: personaThinkingMode(
           persona.configJson,
@@ -3658,6 +4641,7 @@ class ProjectOrchestrator {
             maxToolRounds: 8,
             onToolResult: (_) => sawTool = true,
           ),
+          activity: session.turnActivity,
           onEvent: (ev) {
             if (ev is ChatContentDelta) content.write(ev.text);
           },
@@ -3864,7 +4848,11 @@ class ProjectOrchestrator {
                   'placeholder, CONNECT it to the existing implementation with the '
                   'SMALLEST change. Reuse what is there — do NOT rewrite files or '
                   're-implement working code; only implement something new if a '
-                  'feature is genuinely absent. Wire everything in this one push.'
+                  'feature is genuinely absent. Wire everything in this one push. '
+                  'Also create or upgrade focused tests under test/ that exercise '
+                  'the requested behavior and state transitions. The generated '
+                  'smoke test and shell-load widget test do not count as feature '
+                  'coverage.'
             : functional
             ? 'You are the end-of-project FINAL PASS agent. The project compiles '
                   'and its CI is GREEN. Each listed problem was found by a code '
@@ -3904,6 +4892,11 @@ class ProjectOrchestrator {
       ..writeln(
         '- Keep changes minimal and correct; do not delete features or stub '
         'things out to silence errors. Preserve existing behavior.',
+      )
+      ..writeln(
+        '- If feature-test coverage is missing, add focused tests that exercise '
+        'the requested behavior or state transitions. A smoke assertion or a '
+        'widget-construction-only test is not sufficient.',
       )
       ..writeln(
         '- A failing TEST can be a RUNTIME error, not a compile error — read the '
@@ -3957,6 +4950,7 @@ class ProjectOrchestrator {
       // offering them only tempts a blocked call), no task/story/image tools.
       fixMode: true,
       systemPromptOverride: systemPrompt.toString(),
+      reasoningEffort: personaReasoningEffort(persona.configJson),
       enableThinking: resolveEnableThinking(
         agent: personaThinkingMode(
           persona.configJson,
@@ -4021,6 +5015,7 @@ class ProjectOrchestrator {
               );
             },
           ),
+          activity: session.turnActivity,
         );
       } catch (e) {
         if (e is! TimeoutException && !_isNotTaskFault(e)) {
@@ -4119,23 +5114,27 @@ class ProjectOrchestrator {
   /// forever. [onEvent] gets each event (e.g. to accumulate content).
   Future<void> _drainTurn(
     Stream<ChatStreamEvent> stream, {
+    Stream<void>? activity,
     void Function(ChatStreamEvent event)? onEvent,
+    Duration? wallClock,
   }) {
     final completer = Completer<void>();
     Timer? idle;
+    final effectiveWallClock = wallClock ?? _turnWallClock;
     void fail(Object e, [StackTrace? st]) {
       if (!completer.isCompleted) completer.completeError(e, st);
     }
 
     final wall = Timer(
-      _turnWallClock,
+      effectiveWallClock,
       () => fail(
         TimeoutException(
-          'turn exceeded ${_turnWallClock.inMinutes}m wall-clock cap',
+          'turn exceeded ${effectiveWallClock.inMinutes}m wall-clock cap',
         ),
       ),
     );
     void bumpIdle() {
+      if (completer.isCompleted) return;
       idle?.cancel();
       idle = Timer(
         _turnIdleTimeout,
@@ -4146,8 +5145,13 @@ class ProjectOrchestrator {
     }
 
     bumpIdle();
+    final activitySub = activity?.listen((_) {
+      _consecutiveConnCaps = 0;
+      bumpIdle();
+    });
     final sub = stream.listen(
       (ev) {
+        _consecutiveConnCaps = 0;
         bumpIdle();
         if (onEvent != null) {
           try {
@@ -4161,10 +5165,51 @@ class ProjectOrchestrator {
       },
       cancelOnError: true,
     );
-    return completer.future.whenComplete(() {
+    return completer.future.whenComplete(() async {
       idle?.cancel();
       wall.cancel();
-      unawaited(sub.cancel());
+      await activitySub?.cancel();
+      // Initiate cancellation before a task workspace is released, but never
+      // let a non-responsive HTTP stream's cancellation Future defeat the
+      // watchdog itself. Once cancel() is called the subscription stops
+      // delivering tool events; five seconds is enough for normal propagation.
+      try {
+        await sub.cancel().timeout(const Duration(seconds: 5));
+      } on TimeoutException {
+        // A single hung cancel may be one zombie socket, but the shared pool
+        // carries every other in-flight stage (sibling workers, verifiers) —
+        // closing it on the FIRST hang nukes all of them into transient
+        // failures that restart from their WIP branches, which multiplies the
+        // slowness and scatters spurious errors through the log. Only reset
+        // the transport after a REPEATED hang inside the backoff window (the
+        // same escalation the 429 path uses); one-off hangs ride out on the
+        // per-host idle timeout.
+        final now = DateTime.now();
+        _consecutiveHungCancels =
+            _lastHungCancelAt != null &&
+            now.difference(_lastHungCancelAt!) <= _connCapRecoveryWindow
+                ? _consecutiveHungCancels + 1
+                : 1;
+        _lastHungCancelAt = now;
+        debugPrint(
+          '[Orchestrator p$projectId] timed-out inference stream did not '
+          'acknowledge cancellation within 5s (hang #\$'
+          '${_consecutiveHungCancels}).',
+        );
+        if (_consecutiveHungCancels >= 2) {
+          _consecutiveHungCancels = 0;
+          // `http` cannot abort one streamed request independently from its
+          // Client. Repeated hung cancels mean the pool is holding zombie Router
+          // sessions counting against the account connection cap — close it and
+          // let in-flight stages yield as transient failures and restart from
+          // their WIP branches against a fresh transport.
+          resetInferenceConnections();
+          debugPrint(
+            '[Orchestrator p$projectId] repeated hung stream cancels — reset '
+            'the shared inference transport to release stale connections.',
+          );
+        }
+      }
     });
   }
 
@@ -4257,11 +5302,27 @@ class ProjectOrchestrator {
         (e.statusCode == 429 ||
             e.message.toLowerCase().contains('too_many_connections'));
     if (hit) {
-      _connBackoffUntil = DateTime.now().add(_connBackoff);
+      final now = DateTime.now();
+      _connBackoffUntil = now.add(_connBackoff);
+      if (_lastConnCapAt != null &&
+          now.difference(_lastConnCapAt!) <= _connCapRecoveryWindow) {
+        _consecutiveConnCaps++;
+      } else {
+        _consecutiveConnCaps = 1;
+      }
+      _lastConnCapAt = now;
       debugPrint(
         '[Orchestrator p$projectId] connection cap (429) — returning task to '
         'the board, pausing new agents for ${_connBackoff.inSeconds}s.',
       );
+      if (_consecutiveConnCaps >= 2) {
+        _consecutiveConnCaps = 0;
+        resetInferenceConnections();
+        debugPrint(
+          '[Orchestrator p$projectId] repeated 429s without successful inference '
+          'traffic — reset the shared transport to release stale connections.',
+        );
+      }
     }
     return hit;
   }
@@ -4449,14 +5510,19 @@ class ProjectOrchestrator {
         ? personaCollection.trim()
         : defaultOmniCollectionForTitle(persona.title);
     final pLlm = persona.llmModel;
-    final model = resolveAgentChatModel(
-      routed: routed,
-      personaModel: pLlm,
-      // For routed, the persona's collection is the default when no explicit
-      // llmModel; the resolver decomposes it to the chat component by tags.
-      selectedModel: routed ? collection : chosen.selectedModel,
-      serverModels: serverModels,
-    );
+    // The Router owns modality selection for an Omni collection. Sending its
+    // raw Qwen component bypasses that route and lands autonomous work on the
+    // shared model pool, where this run received responses from unrelated
+    // coding sessions. This mirrors setup/coordinator chat: keep the collection
+    // id intact unless the persona explicitly selected a concrete LLM.
+    final model = routed
+        ? ((pLlm != null && pLlm.trim().isNotEmpty) ? pLlm.trim() : collection)
+        : resolveAgentChatModel(
+            routed: false,
+            personaModel: pLlm,
+            selectedModel: chosen.selectedModel,
+            serverModels: serverModels,
+          );
     debugPrint(
       '[Orchestrator p$projectId] worker "${persona.name}" → server '
       '"${chosen.name}" model=$model (routed=$routed, collection=$collection)',
@@ -4467,7 +5533,11 @@ class ProjectOrchestrator {
       name: chosen.name,
       baseUrl: chosen.baseUrl,
       apiKey: chosen.apiKey,
-      providerType: 'lemonade',
+      // Preserve routed vs self-hosted provenance. LemonadeBackend uses this
+      // value to decide whether prompt KV caching is private and safe; labeling
+      // the shared Router as local Lemonade enabled an unkeyed cache and leaked
+      // stale context from unrelated sessions into autonomous workers.
+      providerType: chosen.providerType,
       selectedModel: chosen.selectedModel,
       availableModels: models,
     );
@@ -4480,8 +5550,8 @@ class ProjectOrchestrator {
     // task still stays warm on its backend. No taskPk (e.g. the one-shot
     // Templater) falls back to the per-agent id.
     final sessionId = taskPk != null
-        ? 'agent-${persona.agent_pk}-task-$taskPk'
-        : 'agent-${persona.agent_pk}';
+        ? 'agent-${persona.agent_pk}-task-$taskPk-$_routingRunId-${_routingDispatch++}'
+        : 'agent-${persona.agent_pk}-$_routingRunId-${_routingDispatch++}';
     return (
       client: backendForServer(
         uiServer,

@@ -92,3 +92,98 @@ String writeThinkingModeIntoConfigJson(String? configJson, ThinkingMode mode) {
   }
   return jsonEncode(cfg);
 }
+
+/// Graded reasoning effort for an agent, pi-style.
+///
+/// Sent to the model VERBATIM as `reasoning_effort` (identity mapping — the
+/// level we pick is the level we send; no clamping to whatever the model
+/// claims to support). Stored as a string in a persona's `configJson` under
+/// the `thinkingLevel` key (alongside `thinkingMode`).
+enum ThinkingLevel {
+  off,
+  minimal,
+  low,
+  medium,
+  high,
+  xhigh,
+  max;
+
+  /// Lenient parse. Unknown/missing values fall back to
+  /// [kDefaultThinkingLevel] (Low for now).
+  static ThinkingLevel fromString(String? s) {
+    switch (s?.trim().toLowerCase()) {
+      case 'off':
+      case 'none':
+        return ThinkingLevel.off;
+      case 'minimal':
+      case 'min':
+        return ThinkingLevel.minimal;
+      case 'low':
+        return ThinkingLevel.low;
+      case 'medium':
+      case 'med':
+        return ThinkingLevel.medium;
+      case 'high':
+        return ThinkingLevel.high;
+      case 'xhigh':
+      case 'x-high':
+      case 'x_high':
+        return ThinkingLevel.xhigh;
+      case 'max':
+        return ThinkingLevel.max;
+      default:
+        return kDefaultThinkingLevel;
+    }
+  }
+
+  /// The value sent to the model in `reasoning_effort`. Identity: the level
+  /// name itself, nothing else.
+  String get wire => name;
+
+  String get label => switch (this) {
+    ThinkingLevel.off => 'Off',
+    ThinkingLevel.minimal => 'Minimal',
+    ThinkingLevel.low => 'Low',
+    ThinkingLevel.medium => 'Medium',
+    ThinkingLevel.high => 'High',
+    ThinkingLevel.xhigh => 'X-High',
+    ThinkingLevel.max => 'Max',
+  };
+}
+
+/// The level any agent that hasn't set one explicitly runs at. For now:
+/// everything is Low.
+const ThinkingLevel kDefaultThinkingLevel = ThinkingLevel.low;
+
+/// Reads a persona's thinking level from its `configJson` (`thinkingLevel`
+/// key). Agents without an explicit level resolve to [kDefaultThinkingLevel]
+/// (Low), so every agent starts at Low until the user adjusts one.
+ThinkingLevel personaThinkingLevel(String? configJson) {
+  if (configJson != null && configJson.trim().isNotEmpty) {
+    try {
+      final cfg = jsonDecode(configJson);
+      if (cfg is Map && cfg['thinkingLevel'] != null) {
+        return ThinkingLevel.fromString('${cfg['thinkingLevel']}');
+      }
+    } catch (_) {}
+  }
+  return kDefaultThinkingLevel;
+}
+
+/// The `reasoning_effort` value to send for this persona's config (null
+/// omits the parameter entirely).
+String? personaReasoningEffort(String? configJson) =>
+    personaThinkingLevel(configJson).wire;
+
+/// Merges [level] into an existing `configJson`, preserving other keys.
+String writeThinkingLevelIntoConfigJson(String? configJson, ThinkingLevel level) {
+  Map<String, dynamic> cfg = {};
+  if (configJson != null && configJson.trim().isNotEmpty) {
+    try {
+      final parsed = jsonDecode(configJson);
+      if (parsed is Map) cfg = Map<String, dynamic>.from(parsed);
+    } catch (_) {}
+  }
+  cfg['thinkingLevel'] = level.wire;
+  return jsonEncode(cfg);
+}

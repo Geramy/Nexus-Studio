@@ -35,6 +35,26 @@ class StoryGen {
   final int tasks;
 }
 
+const _generatedTaskVerification =
+    'Inspect the task branch and confirm every acceptance criterion is fully '
+    'implemented and reachable. Reject placeholders, empty implementations, '
+    'or destructive regressions.';
+
+String _generatedTaskAcceptance(
+  String title,
+  String description,
+  String provided,
+) {
+  if (provided.trim().isNotEmpty) return provided.trim();
+  final outcome = description.trim();
+  if (outcome.isNotEmpty) {
+    return 'The completed implementation delivers this user outcome end to '
+        'end: $outcome';
+  }
+  return '$title is fully implemented, wired into the application, and has no '
+      'placeholder or empty behavior.';
+}
+
 /// Immutable progress snapshot for the whole run.
 class TaskGenProgress {
   const TaskGenProgress({
@@ -120,7 +140,22 @@ class TaskGenerator extends ChangeNotifier {
       // Parent-first order so a child story's tasks can link UNDER its parent
       // story's task — the task tree then mirrors the story tree instead of
       // being a flat, seemingly-random pile.
-      final buildable = _storiesParentFirst(stories, templaterRootPk);
+      // Exclude EVERY parentless root story from task generation — a top-level
+      // story is structural (the templater base, or a project-overview /
+      // category), never a worker task; its CHILDREN are the features. Excluding
+      // only roots.first left a 2nd root ("General E-commerce Store" overview)
+      // to become a vague "build the whole store" mega-task that looped forever.
+      final rootPks = {for (final r in roots) r.story_pk};
+      var buildable = _storiesParentFirst(
+        stories,
+        templaterRootPk,
+      ).where((s) => !rootPks.contains(s.story_pk)).toList();
+      // Safety net: if the tree is degenerately FLAT (every story is a root, so
+      // that filter emptied the backlog), fall back to excluding only the
+      // templater base so we never drop all the features.
+      if (buildable.isEmpty) {
+        buildable = _storiesParentFirst(stories, templaterRootPk);
+      }
 
       _emit(
         TaskGenProgress(
@@ -193,6 +228,12 @@ class TaskGenerator extends ChangeNotifier {
                 projectPk: projectId,
                 title: rep.title,
                 description: combined,
+                acceptanceCriteria: _generatedTaskAcceptance(
+                  rep.title,
+                  combined,
+                  '',
+                ),
+                verification: _generatedTaskVerification,
                 agentPk: worker,
                 storyPk: rep.story_pk,
               );
@@ -236,6 +277,12 @@ class TaskGenerator extends ChangeNotifier {
               final title = (t['title'] ?? '').toString().trim();
               if (title.isEmpty) continue;
               final ac = (t['acceptance_criteria'] ?? '').toString().trim();
+              final description = (t['description'] ?? '').toString().trim();
+              final acceptance = _generatedTaskAcceptance(
+                title,
+                description,
+                ac,
+              );
               final layer = (t['layer'] ?? '').toString().trim();
               // Route each task to a layer-appropriate specialist persona when one
               // exists (UI/UX for client, Database for db, …), else the worker.
@@ -248,12 +295,9 @@ class TaskGenerator extends ChangeNotifier {
               final taskPk = await db.createTaskInProject(
                 projectPk: projectId,
                 title: title,
-                description: (t['description'] ?? '').toString().trim(),
-                acceptanceCriteria: ac.isEmpty ? null : ac,
-                verification: ac.isEmpty
-                    ? null
-                    : 'Confirm every acceptance criterion above is satisfied; run '
-                          'the project\'s build/tests where applicable.',
+                description: description,
+                acceptanceCriteria: acceptance,
+                verification: _generatedTaskVerification,
                 agentPk: agentPk,
                 storyPk: s.story_pk,
                 parentPk: parentTaskPk,
@@ -267,6 +311,12 @@ class TaskGenerator extends ChangeNotifier {
                 projectPk: projectId,
                 title: s.title,
                 description: s.narrative,
+                acceptanceCriteria: _generatedTaskAcceptance(
+                  s.title,
+                  s.narrative,
+                  '',
+                ),
+                verification: _generatedTaskVerification,
                 agentPk: worker,
                 storyPk: s.story_pk,
                 parentPk: parentTaskPk,
@@ -408,6 +458,8 @@ class TaskGenerator extends ChangeNotifier {
       final title = (t['title'] ?? '').toString().trim();
       if (title.isEmpty) continue;
       final ac = (t['acceptance_criteria'] ?? '').toString().trim();
+      final description = (t['description'] ?? '').toString().trim();
+      final acceptance = _generatedTaskAcceptance(title, description, ac);
       final layer = (t['layer'] ?? '').toString().trim();
       final agentPk = await resolveWorkerPersonaForLayer(
         db,
@@ -418,12 +470,9 @@ class TaskGenerator extends ChangeNotifier {
       final taskPk = await db.createTaskInProject(
         projectPk: projectId,
         title: title,
-        description: (t['description'] ?? '').toString().trim(),
-        acceptanceCriteria: ac.isEmpty ? null : ac,
-        verification: ac.isEmpty
-            ? null
-            : 'Confirm every acceptance criterion above is satisfied; run '
-                  'the project\'s build/tests where applicable.',
+        description: description,
+        acceptanceCriteria: acceptance,
+        verification: _generatedTaskVerification,
         agentPk: agentPk,
         storyPk: storyPk,
         parentPk: parentPk,
@@ -840,7 +889,7 @@ class TaskGenerator extends ChangeNotifier {
       name: chosen.name,
       baseUrl: chosen.baseUrl,
       apiKey: chosen.apiKey,
-      providerType: 'lemonade',
+      providerType: chosen.providerType,
       selectedModel: chosen.selectedModel,
       availableModels: models,
     );

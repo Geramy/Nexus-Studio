@@ -293,6 +293,7 @@ class SetupChatController extends ChangeNotifier {
       // COLLAPSED, tappable tile (see onThinking below) so it's out of the way by
       // default but viewable on demand — not the inline garbage it used to be.
       enableThinking: resolved.enableThinking,
+      reasoningEffort: resolved.reasoningEffort,
       leanContext: _ref.read(leanContextProvider),
     );
     // If we resumed into refinement (or already finalized), start in refine.
