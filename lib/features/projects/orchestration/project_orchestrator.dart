@@ -368,7 +368,7 @@ class ProjectOrchestrator {
   // [_maxStagnantRounds] consecutive rounds — so the user doesn't have to step in
   // while it's still improving. [_absoluteMaxTestingRounds] is a hard backstop
   // against a pathological infinite loop.
-  static const int _maxStagnantRounds = 6;
+  static const int _maxStagnantRounds = 3;
   static const int _absoluteMaxTestingRounds = 40;
 
   /// After CI goes green, the FINAL PASS verifies every requested feature is
@@ -4362,6 +4362,7 @@ commits the scaffold after all required artifacts exist.''';
   Future<bool?> _convergeCi(Project project, String doneSig) async {
     var stagnant = 0;
     int? prevCount;
+    var prevNoCommit = false;
     for (var round = 1; round <= _absoluteMaxTestingRounds; round++) {
       if (!await _stillRunning()) return null;
       _setTesting(true, 'Testing — CI run $round…');
@@ -4399,6 +4400,19 @@ commits the scaffold after all required artifacts exist.''';
       final diag = outcome.runPk != null
           ? await _collectCiFailpoints(outcome.runPk!)
           : (text: '', count: 0);
+      // ESCALATION: if the previous round committed NOTHING (it only re-read
+      // files and gave up), the identical prompt next round reproduces the
+      // identical no-op — observed: 6 straight no-progress rounds on 3 test
+      // failures. Lead the failpoints with an explicit directive that breaks
+      // the pattern: this round MUST end with committed edits.
+      final diagText = prevNoCommit
+          ? 'NOTE: the previous fix round made NO commits — it only read files. '
+            'This round you MUST edit the implementation that produces each '
+            'failure (reason from the Expected/Actual values to the exact '
+            'line of code that is wrong, fix THAT, and git_commit it). Do '
+            'NOT end the round without committing at least one edit.\n\n'
+            '$diag.text'
+          : diag.text;
       debugPrint(
         '[Orchestrator p$projectId] CI convergence round $round: CI RED — '
         '${diag.count} failpoint(s)'
@@ -4428,7 +4442,8 @@ commits the scaffold after all required artifacts exist.''';
         true,
         'Testing — fixing ${diag.count} error(s) (round $round)…',
       );
-      await _runFixAgent(project, diag.text, round);
+      final changed = await _runFixAgent(project, diagText, round);
+      prevNoCommit = !changed;
     }
     // Hard backstop hit (rare — the progress gate usually ends it first).
     _testingExhaustedSig = doneSig;
