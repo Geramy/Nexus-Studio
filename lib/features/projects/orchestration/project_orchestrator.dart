@@ -457,8 +457,7 @@ class ProjectOrchestrator {
   /// hang a turn indefinitely without ever tripping the idle guard — observed as
   /// the Final Pass fixer freezing for 18min. This cap fires no matter what, so a
   /// stuck turn is aborted (and retried) instead of wedging the phase.
-  static const Duration _turnWallClock = Duration(minutes: 5);
-
+  ///
   /// Code-writing turns emit complete source files inside tool arguments, and a
   /// routed round can legitimately take 3-5min of pure generation (observed on
   /// the NXS-PJX-Chat pool). A read → edit → (re-edit) → commit → submit worker
@@ -466,6 +465,12 @@ class ProjectOrchestrator {
   /// right before submission — the task then re-dispatched, re-read, and lost
   /// the cycle (task 776 spun on this for two days). 20m fits a full slow cycle
   /// while the 4-min idle guard still catches dead streams early.
+  ///
+  /// This is the DEFAULT cap for every agent turn (worker dispatch, testing-fix,
+  /// verify, merge, templater, final pass). An earlier 5m default was silently
+  /// killing code-writing fixer turns mid-generation — observed: a testing-fix
+  /// turn aborted at exactly 5:00 and retried with zero progress, so the test
+  /// phase burned 5min + a full ~22k-token prompt per kill in a loop.
   static const Duration _workerTurnWallClock = Duration(minutes: 20);
 
   /// Safety valve for the shared git lane: a single materialize/commit/merge
@@ -1391,7 +1396,7 @@ Paths from any other repository, operating system, task, or prior conversation a
           }
           if (e is TimeoutException) {
             // The turn stalled — idle (no stream for _turnIdleTimeout) OR it blew
-            // the hard wall-clock cap (_turnWallClock) while trickling keep-alives
+            // the hard wall-clock cap (_workerTurnWallClock) while trickling keep-alives
             // but never completing. NOT the task's fault: undo the attempt and
             // yield back so the slot frees and the pump moves on.
             // A watchdog timeout is an interrupted inference request, regardless
@@ -5018,7 +5023,16 @@ commits the scaffold after all required artifacts exist.''';
           activity: session.turnActivity,
         );
       } catch (e) {
-        if (e is! TimeoutException && !_isNotTaskFault(e)) {
+        if (e is TimeoutException) {
+          // A watchdog kill (idle timeout or wall-clock cap). Log it — these
+          // used to retry silently, so a cap kill mid-generation looked like
+          // "the test phase is just slow" and cost 5min + the full prompt each
+          // time with no trace in the output.
+          debugPrint(
+            '[Orchestrator p$projectId] testing-fix r$round turn $turn '
+            'interrupted by watchdog: $e — retrying.',
+          );
+        } else if (!_isNotTaskFault(e)) {
           debugPrint(
             '[Orchestrator p$projectId] testing-fix turn $turn failed: $e',
           );
@@ -5107,7 +5121,7 @@ commits the scaffold after all required artifacts exist.''';
   // ── Shared helpers ──────────────────────────────────────────────────────
 
   /// Drain an agent turn stream with BOTH an idle timeout (no event for
-  /// [_turnIdleTimeout]) AND a hard wall-clock cap ([_turnWallClock]). Either
+  /// [_turnIdleTimeout]) AND a hard wall-clock cap ([_workerTurnWallClock]). Either
   /// firing throws a [TimeoutException] and cancels the subscription (closing the
   /// SSE socket). Unlike `stream.timeout` (which only enforces idle and resets on
   /// every keep-alive), the wall-clock cap guarantees a stuck turn can't hang
@@ -5120,7 +5134,7 @@ commits the scaffold after all required artifacts exist.''';
   }) {
     final completer = Completer<void>();
     Timer? idle;
-    final effectiveWallClock = wallClock ?? _turnWallClock;
+    final effectiveWallClock = wallClock ?? _workerTurnWallClock;
     void fail(Object e, [StackTrace? st]) {
       if (!completer.isCompleted) completer.completeError(e, st);
     }

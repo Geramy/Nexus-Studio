@@ -50,6 +50,32 @@ class ProcessSpawnException implements Exception {
 class ProcessRunner {
   const ProcessRunner();
 
+  /// Prepend well-known local SDK/tool dirs (only if they exist) to [path] so
+  /// children see the same tools the user's interactive shell does. GUI apps
+  /// launched from a desktop session never source ~/.bashrc, so anything the
+  /// user put on their interactive PATH (e.g. ~/tools/flutter/bin) is invisible
+  /// to spawned shells — CI steps died with `flutter: command not found`
+  /// (exit 127) at the very first step and the test phase looped forever on a
+  /// failure that had nothing to do with tests.
+  static String _toolPath(String path) {
+    final sep = Platform.isWindows ? ';' : ':';
+    final fs = Platform.pathSeparator;
+    final home =
+        Platform.environment['HOME'] ?? Platform.environment['USERPROFILE'] ?? '';
+    if (home.isEmpty) return path;
+    final current = path.split(sep).where((p) => p.isNotEmpty).toList();
+    final currentSet = current.toSet();
+    final prepend = <String>[
+      for (final dir in [
+        '$home${fs}tools${fs}flutter${fs}bin',
+        '$home$fs.pub-cache${fs}bin',
+      ])
+        if (currentSet.add(dir) && Directory(dir).existsSync()) dir,
+    ];
+    if (prepend.isEmpty) return path;
+    return [...prepend, ...current].join(sep);
+  }
+
   /// Spawn [executable] with [args] and stream merged stdout/stderr lines while
   /// it runs, completing with the [ProcResult] when it exits.
   ///
@@ -68,13 +94,22 @@ class ProcessRunner {
     Duration? timeout,
     Future<void>? cancel,
   }) async {
+    // Augment the child's PATH with the local SDK dirs (see [_toolPath]) —
+    // only when a PATH is actually in play (parent env or caller-provided),
+    // so callers that intentionally pass a closed environment are untouched.
+    final String? basePath = environment?['PATH'] ??
+        (includeParentEnvironment ? Platform.environment['PATH'] : null);
+    final Map<String, String> env = {
+      ...?environment,
+      if (basePath != null) 'PATH': _toolPath(basePath),
+    };
     final Process proc;
     try {
       proc = await Process.start(
         executable,
         args,
         workingDirectory: workingDirectory,
-        environment: environment,
+        environment: env.isEmpty ? null : env,
         includeParentEnvironment: includeParentEnvironment,
         runInShell: false,
       );
