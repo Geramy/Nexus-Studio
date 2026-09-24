@@ -486,7 +486,7 @@ class ProjectOrchestrator {
   /// compiler diagnostics (`error -`, `warning -`, `info -`), `file.dart:line`
   /// references, the analyze summary, and test/exception failures.
   static final RegExp _diagLineRe = RegExp(
-    r'(\b(error|warning|info)\b\s*[-:]|\.dart:\d+|\bissues? found\b|\bError:|\bFAILED\b|\bException\b)',
+    r'(\b(error|warning|info)\b\s*[-:]|\.dart:\d+|\bissues? found\b|\bError:|\bFAILED\b|\bException\b|\[E\]\s*$|\bExpected:\s|\bActual:\s)',
     caseSensitive: false,
   );
 
@@ -503,7 +503,14 @@ class ProjectOrchestrator {
 
   /// A REAL blocker line — an `error`/`warning` analyzer diagnostic (severity is
   /// the FIRST token, so we anchor to line start to avoid matching the word
-  /// mid-message) or a test/runtime failure. CI runs `flutter analyze
+  /// mid-message) or a test/runtime failure. `flutter test` reports a failing
+  /// test as `mm:ss +P -F: path/test.dart: test name [E]` followed by indented
+  /// `Expected:`/`Actual:` diff lines — none of which match `.dart:LINE` (the
+  /// path is followed by `: test name`, no digits), so without the `\[E\]` and
+  /// Expected/Actual alternatives the fixer only ever saw the noise lines
+  /// ("Test failed. See exception logs above.") and couldn't fix a single
+  /// failing test — observed: 3 real test failures looping as "5 failpoints"
+  /// for 5+ rounds with zero edits. CI runs `flutter analyze
   /// --no-fatal-infos`, so `info -` lints (e.g. `withOpacity` deprecations) do
   /// NOT fail the build. Counting them as failpoints inflates the number (2 real
   /// errors + 21 deprecation infos → "23 failpoints"), floods the fix agent with
@@ -511,7 +518,7 @@ class ProjectOrchestrator {
   /// the progress gate (fixing a real error only nudges 23→21). Info lines are
   /// dropped from the failpoint set whenever ANY genuine blocker is present.
   static final RegExp _blockerLineRe = RegExp(
-    r'^\s*(error|warning)\b\s*[-:•]|\bError:|\bFAILED\b|\bException\b',
+    r'^\s*(error|warning)\b\s*[-:•]|\bError:|\bFAILED\b|\bException\b|\[E\]\s*$|^\s*(Expected|Actual):\s',
     caseSensitive: false,
   );
 
