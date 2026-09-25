@@ -522,6 +522,88 @@ class ProjectOrchestrator {
     caseSensitive: false,
   );
 
+  /// A `flutter test` line announcing a FAILED test: a progress prefix
+  /// (`mm:ss +P -F:`) followed by the test name and a trailing `[E]`. One match
+  /// = ONE failing test — the anchor for [_testFailureBlock]'s consolidation so
+  /// a single failing test is one failpoint (header + its Expected/Actual
+  /// context) instead of each diff line counting separately. Observed: 3 real
+  /// test failures reported as "18 failpoints", which diluted the fixer's
+  /// attention and flatlined the progress gate (the same 3 tests' diff lines
+  /// re-matched every round, so the count never moved).
+  static final RegExp _testFailRe = RegExp(r'^\s*\d+:\d+\s.* \[E\]\s*$');
+
+  /// An analyzer diagnostic or a compile/step failure — the NON-test failpoints
+  /// that accompany test blocks in [_collectCiFailpoints] (still one per line).
+  static final RegExp _compileOrAnalyzeRe = RegExp(
+    r'^\s*(error|warning)\b\s*[-:•]|\bError:|\bFAILED\b',
+    caseSensitive: false,
+  );
+
+  /// Assemble ONE failpoint for the failing test whose `[E]` line sits at index
+  /// [i] of [lines]: the header, the indented context lines that follow it
+  /// (Expected/Actual/Which + the alignment diff), and — for widget tests, whose
+  /// full exception box is logged BEFORE the `[E]` line — the failure message of
+  /// the nearest preceding `EXCEPTION CAUGHT` box (including the finder's
+  /// `reason:` text) plus the `file…line N` the expectation fired on. Stack
+  /// frames and box rules are dropped.
+  static String _testFailureBlock(List<String> lines, int i) {
+    final out = StringBuffer('FAILING TEST: ${lines[i].trim()}');
+    // 1) Indented context after the [E] line, until a blank or column-0 line.
+    //    Stack frames (`package:…`, `dart:…`, `#n`) are skipped, not stopped
+    //    on — in matcher failures they follow the diff with no blank between.
+    var detail = 0;
+    for (var j = i + 1; j < lines.length && detail < 12; j++) {
+      final l = lines[j];
+      if (l.trim().isEmpty || (!l.startsWith(' ') && !l.startsWith('\t'))) break;
+      final t = l.trimLeft();
+      if (t.startsWith('package:') ||
+          t.startsWith('dart:') ||
+          _stackFrameRe.hasMatch(l)) {
+        continue;
+      }
+      out.writeln('\n  $t');
+      detail++;
+    }
+    // 2) Nearest preceding exception box: its failure message (the lines
+    //    between "…was thrown…:" and the stack/"When the exception…" section,
+    //    which carries the real reason for widget-test finders) and the
+    //    `file…line N` the expectation fired on.
+    for (var k = i - 1; k >= 0 && k >= i - 250; k--) {
+      if (!lines[k].startsWith('══╡ EXCEPTION CAUGHT')) continue;
+      var mode = 0; // 0=hunting message start, 1=message, 2=after message
+      for (var m = k + 1; m < lines.length && m < k + 80; m++) {
+        final l = lines[m];
+        if (l.startsWith('═')) break;
+        final t = l.trim();
+        if (t.isEmpty) continue;
+        if (mode == 0) {
+          if (l.contains('was thrown')) mode = 1;
+          continue;
+        }
+        if (mode == 1) {
+          if (t.startsWith('When the exception') ||
+              t.startsWith('This was caught') ||
+              t.startsWith('The test description')) {
+            mode = 2;
+            continue;
+          }
+          if (t.startsWith('#') ||
+              t.startsWith('package:') ||
+              t.startsWith('dart:')) {
+            continue;
+          }
+          out.writeln('\n  $t');
+          continue;
+        }
+        if (RegExp(r'\bline\s+\d+', caseSensitive: false).hasMatch(t)) {
+          out.writeln('\n  at $t');
+        }
+      }
+      break; // nearest box only
+    }
+    return out.toString();
+  }
+
   /// Keep only genuine blockers (errors/warnings/test failures) from matched
   /// diagnostic [hits] when any exist; fall back to all hits for an info-only red
   /// (the info-only finalize gate treats that as green anyway) so the fixer still
@@ -2399,14 +2481,35 @@ Paths from any other repository, operating system, task, or prior conversation a
     // `info` lints don't inflate the count or distract the fixer from what
     // actually breaks CI.
     final summaryRe = RegExp(r'\bissues?\s+found\b', caseSensitive: false);
-    final failpoints = _preferBlockers(
-      hits.where((l) => !summaryRe.hasMatch(l)).toList(),
-    );
-    final picked = failpoints.isNotEmpty
-        ? failpoints
-        : (hits.isNotEmpty
-              ? hits
-              : lines.reversed.take(60).toList().reversed.toList());
+    final candidate = hits.where((l) => !summaryRe.hasMatch(l)).toList();
+
+    // A failing `flutter test` case is ONE failpoint — its `[E]` header plus
+    // the Expected/Actual context, assembled by [_testFailureBlock]. Counting
+    // each diff line separately inflated 3 real test failures into "18
+    // failpoints", and the inflated count flatlined the progress gate because
+    // the same 3 tests' lines re-matched every round. Analyzer/compile blockers
+    // ride alongside, still one per line.
+    final testBlocks = <String>[];
+    for (var i = 0; i < lines.length; i++) {
+      if (_testFailRe.hasMatch(lines[i])) {
+        testBlocks.add(_testFailureBlock(lines, i));
+      }
+    }
+
+    final List<String> picked;
+    if (testBlocks.isNotEmpty) {
+      picked = [
+        ...candidate.where(_compileOrAnalyzeRe.hasMatch),
+        ...testBlocks,
+      ];
+    } else {
+      final failpoints = _preferBlockers(candidate);
+      picked = failpoints.isNotEmpty
+          ? failpoints
+          : (hits.isNotEmpty
+                ? hits
+                : lines.reversed.take(60).toList().reversed.toList());
+    }
     var text = picked.join('\n').trim();
     // Generous cap (keep the HEAD so the first failures, usually the root cause,
     // survive) — big enough that ~100 failpoints all reach the fixer in one pass.
@@ -4407,10 +4510,13 @@ commits the scaffold after all required artifacts exist.''';
       // the pattern: this round MUST end with committed edits.
       final diagText = prevNoCommit
           ? 'NOTE: the previous fix round made NO commits — it only read files. '
-            'This round you MUST edit the implementation that produces each '
-            'failure (reason from the Expected/Actual values to the exact '
-            'line of code that is wrong, fix THAT, and git_commit it). Do '
-            'NOT end the round without committing at least one edit.\n\n'
+            'This round you MUST edit the code that produces each failure '
+            '(reason from the Expected/Actual values to the exact line that is '
+            'wrong and fix THAT, and git_commit it). When a failure is a '
+            'contradiction BETWEEN a test\'s expectation and the implemented '
+            'behavior, decide which side is wrong and fix THAT side — changing '
+            'the test is a valid edit when its expectation is the bug. Do NOT '
+            'end the round without committing at least one edit.\n\n'
             '$diag.text'
           : diag.text;
       debugPrint(
@@ -4935,6 +5041,23 @@ commits the scaffold after all required artifacts exist.''';
         'should flex) — the file:line in the error points at the exact widget. A '
         'missing provider/DB/DI at startup is fixed by initializing it (or a test '
         'setup), never by weakening the test.',
+      )
+      ..writeln(
+        '- An Expected/Actual mismatch can mean the TEST or the IMPLEMENTATION is '
+        'wrong — read the code and decide which, then fix THAT side. When the '
+        'test\'s expectation contradicts a deliberately implemented design (e.g. '
+        'the test was written against an older formula or default), updating the '
+        'test IS the fix. Never leave a mismatch to "converge" away by re-reading '
+        'the files — pick a side, edit it, and commit it.',
+      )
+      ..writeln(
+        '- A widget-test `find.text(…)`/`find.byType(…)` that finds 0 widgets is '
+        'often SCROLLVIEW LAZINESS, not a missing feature: a ListView/GridView '
+        'only builds the children on screen, so an item below the fold of the '
+        '800x600 test surface does not exist yet. Fix by scrolling it into view '
+        'before the assertion (tester.dragOn on the list, or ensureVisible on a '
+        'GlobalKey) or by making the list eager — NOT by deleting the assertion '
+        'or the list item.',
       )
       ..writeln(
         '- ALWAYS read_file the EXACT current contents of a file immediately '
