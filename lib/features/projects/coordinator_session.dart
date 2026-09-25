@@ -771,9 +771,20 @@ class ProjectCoordinatorSession {
     ) {
       Set<String> names;
       if (workerCommitted) {
-        names = const {'submit_for_completion'};
-      } else if (workerReadActions < 3) {
-        names = const {'read_file'};
+        names = workBranch != null
+            ? const {'submit_for_completion'}
+            // Fixer (on main): work is committed — let it re-verify, the round
+            // ends when it stops (the orchestrator re-runs CI next).
+            : const {'read_file', 'git_commit'};
+      } else if (workerReadActions < (fixMode ? 6 : 3)) {
+        names = fixMode
+            ? const {
+                'read_file',
+                'read_file_chunk',
+                'search_directory',
+                'search_file_content',
+              }
+            : const {'read_file'};
       } else if (workerWriteActions == 0) {
         names = const {
           'write_file',
@@ -880,7 +891,7 @@ class ProjectCoordinatorSession {
                 verificationTaskId != null)
             ? allTools
             : _effectiveTools(allTools);
-        if (workBranch != null) tools = workerPhaseTools(tools);
+        if (workBranch != null || fixMode) tools = workerPhaseTools(tools);
         if (verificationTaskId != null) {
           tools = verificationPhaseTools(tools);
         }
@@ -1211,7 +1222,7 @@ class ProjectCoordinatorSession {
                 result.startsWith('Submitted task')) {
               workerSubmitted = true;
             }
-            if (workBranch != null &&
+            if ((workBranch != null || fixMode) &&
                 workerToolSucceeded(call.function.name, result)) {
               if (const {
                 'read_file',
