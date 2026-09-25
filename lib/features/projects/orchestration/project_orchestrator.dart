@@ -2027,9 +2027,25 @@ Paths from any other repository, operating system, task, or prior conversation a
         return '';
       }
     }
+    // Be PRESCRIPTIVE: name the exact features that need tests so the fixer
+    // doesn't waste its whole read budget guessing what to cover. A vague
+    // "add feature tests" sends the model into a read-everything loop where it
+    // re-reads each feature page looking for a cue and never writes a file.
+    final featureLines = <String>[];
+    try {
+      final tasks = (await _db.getTasksForProject(projectId))
+        ..sort((a, b) => a.task_pk.compareTo(b.task_pk));
+      for (final t in tasks) {
+        final title = t.title.trim();
+        if (title.isNotEmpty) featureLines.add('- $title');
+      }
+    } catch (_) {}
+    final featureBlock = featureLines.isEmpty
+        ? ''
+        : '\nWrite at least one focused test per feature below (or one test ' 'file covering all of them):\n${featureLines.join('\n')}';
     return 'Only generated smoke/shell tests exist. Add focused feature tests '
         'that exercise requested behavior and state transitions before the final '
-        'CI result can count as a project pass.';
+        'CI result can count as a project pass.$featureBlock';
   }
 
   /// REVIEW. The project's CI/test gate is consolidated into a SINGLE end-of-
@@ -5030,7 +5046,10 @@ commits the scaffold after all required artifacts exist.''';
                   'if it is MISSING FEATURE TEST COVERAGE, the fix is to WRITE the '
                   'missing focused test file(s) under test/ (real interactions and '
                   'expects — not a smoke/shell-load assertion) and git_commit them. '
-                  'Never leave a TODO/placeholder behind.'
+                  'Budget for reading: open the routes/entrypoint and each feature '
+                  'page ONCE — never re-read a file you already read — and once you '
+                  'know what to test, your NEXT tool call must be writing the test '
+                  'file(s), not another read. Never leave a TODO/placeholder behind.'
             : '- Work across AS MANY FILES AS NEEDED — read the failing files, '
                   'find the real cause, and fix it. Do not stop at the first '
                   'error; resolve the whole class of failures.',
