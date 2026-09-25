@@ -230,6 +230,15 @@ class ProjectCoordinatorSession {
   /// persona denies the CI tools, so the fixer just reads/edits/commits.
   final bool fixMode;
 
+  // FIX-MODE action funnel, SESSION-scoped (the fixer runs many runTurns per
+  // fix round; runTurn-local counters would let it re-draw its read budget
+  // every turn — observed: wrote the test file, then drew 6 fresh reads on
+  // every following turn). A fix round gets exactly one 6-read budget, then
+  // must write, then commit. A new fix round builds a new session (fresh).
+  int _fixReadActions = 0;
+  int _fixWriteActions = 0;
+  bool _fixCommitted = false;
+
   /// Post-COMPLETION Editor mode: the user-facing maintenance chat for a project
   /// whose autonomous build has finished (orchestrationState == 'completed').
   /// Offered the file/git/build/CI tool set up front (like the scaffolder) so it
@@ -769,14 +778,20 @@ class ProjectCoordinatorSession {
     List<Map<String, dynamic>> workerPhaseTools(
       List<Map<String, dynamic>> available,
     ) {
+      // Fixer counters are SESSION-scoped (see _fixReadActions fields) —
+      // runTurn-local counters reset every turn and let the fixer re-draw its
+      // read budget forever.
+      final committed = fixMode ? _fixCommitted : workerCommitted;
+      final readActions = fixMode ? _fixReadActions : workerReadActions;
+      final writeActions = fixMode ? _fixWriteActions : workerWriteActions;
       Set<String> names;
-      if (workerCommitted) {
+      if (committed) {
         names = workBranch != null
             ? const {'submit_for_completion'}
             // Fixer (on main): work is committed — let it re-verify, the round
             // ends when it stops (the orchestrator re-runs CI next).
             : const {'read_file', 'git_commit'};
-      } else if (workerReadActions < (fixMode ? 6 : 3)) {
+      } else if (readActions < (fixMode ? 6 : 3)) {
         names = fixMode
             ? const {
                 'read_file',
@@ -785,14 +800,14 @@ class ProjectCoordinatorSession {
                 'search_file_content',
               }
             : const {'read_file'};
-      } else if (workerWriteActions == 0) {
+      } else if (writeActions == 0) {
         names = const {
           'write_file',
           'edit_file',
           'generate_image',
           'edit_image',
         };
-      } else if (workerWriteActions >= 3) {
+      } else if (writeActions >= 3) {
         names = const {'git_commit'};
       } else {
         names = const {
@@ -850,6 +865,7 @@ class ProjectCoordinatorSession {
       'write_file' =>
         result.startsWith('Updated file "') ||
             result.startsWith('Created file "'),
+      'create_file' => result.startsWith('Created file "'),
       'edit_file' => result.startsWith('Edited "'),
       'generate_image' || 'edit_image' =>
         result.startsWith('Generated ') || result.startsWith('Edited '),
@@ -1230,7 +1246,11 @@ class ProjectCoordinatorSession {
                 'search_directory',
                 'search_file_content',
               }.contains(call.function.name)) {
-                workerReadActions++;
+                if (fixMode) {
+                  _fixReadActions++;
+                } else {
+                  workerReadActions++;
+                }
                 workerReadPaths.add(
                   normalizedWorkerPath(
                     (args['path'] ?? args['file_path'] ?? '').toString(),
@@ -1239,18 +1259,27 @@ class ProjectCoordinatorSession {
               }
               if (const {
                 'write_file',
+                'create_file',
                 'edit_file',
                 'generate_image',
                 'edit_image',
               }.contains(call.function.name)) {
-                workerWriteActions++;
+                if (fixMode) {
+                  _fixWriteActions++;
+                } else {
+                  workerWriteActions++;
+                }
                 final written = normalizedWorkerPath(
                   (args['path'] ?? args['file_path'] ?? '').toString(),
                 );
                 if (written.isNotEmpty) workerReadablePaths.add(written);
               }
               if (call.function.name == 'git_commit') {
-                workerCommitted = true;
+                if (fixMode) {
+                  _fixCommitted = true;
+                } else {
+                  workerCommitted = true;
+                }
               }
             }
             if (verificationTaskId != null) {
