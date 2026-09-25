@@ -534,9 +534,12 @@ class ProjectOrchestrator {
 
   /// An analyzer diagnostic or a compile/step failure — the NON-test failpoints
   /// that accompany test blocks in [_collectCiFailpoints] (still one per line).
+  /// Case-SENSITIVE: `failed` appears in prose ("Test failed. See exception
+  /// logs above.", "Some tests failed.") and must not count — only the
+  /// analyzer's lowercase severity prefix, dart's `Error:`, and a runner's
+  /// all-caps `FAILED` marker are real blockers.
   static final RegExp _compileOrAnalyzeRe = RegExp(
     r'^\s*(error|warning)\b\s*[-:•]|\bError:|\bFAILED\b',
-    caseSensitive: false,
   );
 
   /// Assemble ONE failpoint for the failing test whose `[E]` line sits at index
