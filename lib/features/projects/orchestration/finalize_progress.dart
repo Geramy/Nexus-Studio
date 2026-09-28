@@ -8,23 +8,24 @@ import 'dart:io';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
-/// Persistent record of how far the end-of-project FINALIZE phase has gotten, so
-/// the LINK → CI → double-check passes SHRINK across re-entries instead of
-/// redoing everything each time (restart, re-pump, or a rebuild all re-enter the
-/// phase). Without this the linking push re-processes all features every time and
-/// the double-check re-reviews all of them, churning already-settled work.
+/// Persistent record of how far the end-of-project finalize phase has gotten,
+/// so the BUILD PHASE 2 (linking push → feature check) passes SHRINK across
+/// re-entries instead of redoing everything each time (restart, re-pump, or a
+/// rebuild all re-enter the phase). Without this the linking push re-processes
+/// all features every time and the feature check re-reviews all of them,
+/// churning already-settled work.
 ///
 /// Stored as a sidecar JSON next to the project's `.nxtprj` disks (survives
 /// restarts, needs no DB schema change, and doesn't pollute the project's git
 /// repo).
 class FinalizeProgress {
-  /// The one-shot comprehensive LINKING PUSH (Phase 1) has already run — don't
-  /// redo the whole-app wiring push on a later entry; go straight to the
-  /// (incremental) double-check.
+  /// The one-shot comprehensive LINKING PUSH (Build phase 2, step 1) has already
+  /// run — don't redo the whole-app wiring push on a later entry; go straight
+  /// to the (incremental) feature check.
   bool linkDone;
 
-  /// task_pk of every feature the double-check has CONFIRMED wired + reachable
-  /// with CI green. These are skipped by later linking pushes and code-trace
+  /// task_pk of every feature the feature check has CONFIRMED coded + reachable.
+  /// These are skipped by later linking pushes and code-trace
   /// reviews, so each pass only works on what's left.
   final Set<int> verified;
 

@@ -3,7 +3,6 @@
 // Licensed under the Sustainable Use License. See LICENSE.md.
 
 import 'dart:async';
-import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:vad/vad.dart';

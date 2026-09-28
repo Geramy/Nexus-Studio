@@ -801,22 +801,44 @@ class ProjectCoordinatorSession {
               }
             : const {'read_file'};
       } else if (writeActions == 0) {
-        names = const {
-          'write_file',
-          'edit_file',
-          'generate_image',
-          'edit_image',
-        };
+        // Fixer: keep read_file OFFERED in the write phases. Its prompt
+        // mandates "ALWAYS read_file before edit_file", so removing reads here
+        // produced hundreds of rejected calls per run (observed: 514) that
+        // bloated the history to 500+ messages. The 6-read budget above still
+        // fronts the grounding reads; stall protection comes from the
+        // orchestrator's no-edit-turns break, not from starving the toolset.
+        names = fixMode
+            ? const {
+                'read_file',
+                'read_file_chunk',
+                'write_file',
+                'edit_file',
+              }
+            : const {
+                'write_file',
+                'edit_file',
+                'generate_image',
+                'edit_image',
+              };
       } else if (writeActions >= 3) {
-        names = const {'git_commit'};
+        names = fixMode
+            ? const {'read_file', 'git_commit'}
+            : const {'git_commit'};
       } else {
-        names = const {
-          'write_file',
-          'edit_file',
-          'generate_image',
-          'edit_image',
-          'git_commit',
-        };
+        names = fixMode
+            ? const {
+                'read_file',
+                'write_file',
+                'edit_file',
+                'git_commit',
+              }
+            : const {
+                'write_file',
+                'edit_file',
+                'generate_image',
+                'edit_image',
+                'git_commit',
+              };
       }
       final selected = available
           .where((tool) {
@@ -1069,11 +1091,49 @@ class ProjectCoordinatorSession {
             .toSet();
         for (final call in toolCalls) {
           Map<String, dynamic> args = {};
+          String? argParseError;
           try {
             final raw = call.function.arguments.trim();
-            if (raw.startsWith('{'))
+            if (raw.startsWith('{')) {
               args = (jsonDecode(raw) as Map).cast<String, dynamic>();
-          } catch (_) {}
+            }
+          } catch (e) {
+            // A truncated/malformed argument string (observed: a long
+            // write_file content cut mid-string) used to decode to `{}` and
+            // then fail deep in the tool as "path and content are required",
+            // which told the model nothing about the real problem. Report the
+            // parse failure so it re-issues a valid call.
+            argParseError = 'arguments were not valid JSON ($e)';
+            debugPrint(
+              '[Coordinator] tool ${call.function.name} arguments failed to '
+              'parse (${call.function.arguments.length} chars): $e',
+            );
+          }
+          if (argParseError != null) {
+            final result =
+                'Tool ${call.function.name} call failed: $argParseError. '
+                'Re-issue the call with a single valid JSON object of '
+                'arguments (escape quotes/newlines in file contents).';
+            onToolResult?.call(result);
+            _history.add({
+              'role': 'tool',
+              'tool_call_id': call.id,
+              'content': result,
+            });
+            _fullTrace.add({
+              'role': 'tool',
+              'tool_call_id': call.id,
+              'content': result,
+            });
+            if (workBranch != null && ++workerProtocolFailures >= 3) {
+              throw StateError(
+                'Worker repeatedly emitted unparseable tool arguments; '
+                'rotating its Router dispatch instead of spending the full '
+                'turn.',
+              );
+            }
+            continue;
+          }
 
           // Inline-call recovery must obey the same phase boundary as native
           // tool calls. Previously a no-tools/off-domain Router response could

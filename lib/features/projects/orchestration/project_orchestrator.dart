@@ -400,6 +400,13 @@ class ProjectOrchestrator {
   bool _testingActive = false;
   String? _testingDetail;
 
+  /// Live BUILD PHASE 2 flag + detail (the one-time feature check that runs
+  /// after the build and before Testing). While true the top-bar shows a light
+  /// orange "Build phase 2" stage — between the orange of building and the
+  /// yellow of testing.
+  bool _phase2Active = false;
+  String? _phase2Detail;
+
   /// Done-set signature the testing loop exhausted its rounds on, so we don't
   /// immediately re-enter the (slow) loop for the same unchanged red state.
   String? _testingExhaustedSig;
@@ -524,7 +531,7 @@ class ProjectOrchestrator {
 
   /// A `flutter test` line announcing a FAILED test: a progress prefix
   /// (`mm:ss +P -F:`) followed by the test name and a trailing `[E]`. One match
-  /// = ONE failing test — the anchor for [_testFailureBlock]'s consolidation so
+  /// = ONE failing test — the anchor for [testFailureBlock]'s consolidation so
   /// a single failing test is one failpoint (header + its Expected/Actual
   /// context) instead of each diff line counting separately. Observed: 3 real
   /// test failures reported as "18 failpoints", which diluted the fixer's
@@ -545,11 +552,13 @@ class ProjectOrchestrator {
   /// Assemble ONE failpoint for the failing test whose `[E]` line sits at index
   /// [i] of [lines]: the header, the indented context lines that follow it
   /// (Expected/Actual/Which + the alignment diff), and — for widget tests, whose
-  /// full exception box is logged BEFORE the `[E]` line — the failure message of
-  /// the nearest preceding `EXCEPTION CAUGHT` box (including the finder's
-  /// `reason:` text) plus the `file…line N` the expectation fired on. Stack
-  /// frames and box rules are dropped.
-  static String _testFailureBlock(List<String> lines, int i) {
+  /// exception boxes are logged BEFORE the `[E]` line — the failure message of
+  /// EVERY preceding `EXCEPTION CAUGHT` box in the window, in log order (the
+  /// root-cause box comes first; the nearest-only variant lost the root cause
+  /// in favour of the surface matcher symptom). Stack frames and box rules are
+  /// dropped.
+  @visibleForTesting
+  static String testFailureBlock(List<String> lines, int i) {
     final out = StringBuffer('FAILING TEST: ${lines[i].trim()}');
     // 1) Indented context after the [E] line, until a blank or column-0 line.
     //    Stack frames (`package:…`, `dart:…`, `#n`) are skipped, not stopped
@@ -567,12 +576,24 @@ class ProjectOrchestrator {
       out.writeln('\n  $t');
       detail++;
     }
-    // 2) Nearest preceding exception box: its failure message (the lines
+    // 2) Preceding exception boxes: each one's failure message (the lines
     //    between "…was thrown…:" and the stack/"When the exception…" section,
     //    which carries the real reason for widget-test finders) and the
     //    `file…line N` the expectation fired on.
+    //
+    //    ALL boxes in the window are collected, not just the nearest: a
+    //    widget-test crash logs the ROOT-CAUSE box (e.g. WIDGETS LIBRARY
+    //    assertion) FIRST and the surface-symptom box (TEST FRAMEWORK
+    //    matcher failure) LAST — nearest-only handed the fixer "Found 0
+    //    widgets with text X" while the real cause ("If the home property is
+    //    specified, the routes table cannot include an entry for /") sat in
+    //    the earlier box. Observed: 9 fix rounds reading the (correct) widget
+    //    file, editing nothing, never finding main.dart's home+routes clash.
+    final boxStarts = <int>[];
     for (var k = i - 1; k >= 0 && k >= i - 250; k--) {
-      if (!lines[k].startsWith('══╡ EXCEPTION CAUGHT')) continue;
+      if (lines[k].startsWith('══╡ EXCEPTION CAUGHT')) boxStarts.add(k);
+    }
+    for (final k in boxStarts.reversed) { // log order: root cause first
       var mode = 0; // 0=hunting message start, 1=message, 2=after message
       for (var m = k + 1; m < lines.length && m < k + 80; m++) {
         final l = lines[m];
@@ -602,7 +623,6 @@ class ProjectOrchestrator {
           out.writeln('\n  at $t');
         }
       }
-      break; // nearest box only
     }
     return out.toString();
   }
@@ -803,6 +823,8 @@ class ProjectOrchestrator {
         waiting: waiting,
         testing: _testingActive,
         testingDetail: _testingDetail,
+        buildPhase2: _phase2Active,
+        buildPhase2Detail: _phase2Detail,
       );
     } catch (_) {
       // Status is best-effort telemetry; never let it disturb the pump.
@@ -2503,7 +2525,7 @@ Paths from any other repository, operating system, task, or prior conversation a
     final candidate = hits.where((l) => !summaryRe.hasMatch(l)).toList();
 
     // A failing `flutter test` case is ONE failpoint — its `[E]` header plus
-    // the Expected/Actual context, assembled by [_testFailureBlock]. Counting
+    // the Expected/Actual context, assembled by [testFailureBlock]. Counting
     // each diff line separately inflated 3 real test failures into "18
     // failpoints", and the inflated count flatlined the progress gate because
     // the same 3 tests' lines re-matched every round. Analyzer/compile blockers
@@ -2511,7 +2533,7 @@ Paths from any other repository, operating system, task, or prior conversation a
     final testBlocks = <String>[];
     for (var i = 0; i < lines.length; i++) {
       if (_testFailRe.hasMatch(lines[i])) {
-        testBlocks.add(_testFailureBlock(lines, i));
+        testBlocks.add(testFailureBlock(lines, i));
       }
     }
 
@@ -4209,9 +4231,10 @@ commits the scaffold after all required artifacts exist.''';
     if (ws == null || !await ws.exists(_defaultCiPath)) return false;
 
     // FAST LANE: an Editor session (state == 'editing') finalizes LIGHT — no
-    // linking pass, no double-check feature scan. Just confirm the edit still
-    // builds and flip back to 'completed'. Everything else uses the full Testing
-    // phase (linking → CI convergence → double-check).
+    // linking pass, no feature-check scan. Just confirm the edit still
+    // builds and flip back to 'completed'. Everything else runs the full
+    // finalize (Build phase 2: linking + feature check → Testing: CI
+    // convergence).
     if (project.orchestrationState == 'editing') {
       _testing = true;
       unawaited(
@@ -4237,7 +4260,7 @@ commits the scaffold after all required artifacts exist.''';
   }
 
   /// The Editor fast-lane finalize. Skips the two expensive phases the full
-  /// Testing gate runs — the LINKING pass and the per-feature DOUBLE-CHECK scan
+  /// finalize runs — the LINKING pass and the per-feature FEATURE-CHECK scan
   /// (an already-built project doesn't need a whole-app re-audit after a tweak).
   /// It just makes sure the edit didn't break the build: ensure the CI gate,
   /// converge CI once (progress-gated, and now driven by the REAL-blocker
@@ -4258,13 +4281,14 @@ commits the scaffold after all required artifacts exist.''';
         await _db.setProjectOrchestrationState(projectId, 'completed');
         debugPrint(
           '[Orchestrator p$projectId] EDITOR finalize: CI green → COMPLETE '
-          '(fast lane — no linking pass, no double-check).',
+          '(fast lane — no linking pass, no feature check).',
         );
         return;
       }
       // Fast CI couldn't converge — the edit broke something the quick pass can't
-      // clear. Fall back to the full Testing phase (linking + convergence +
-      // double-check) so it's still driven to green. Reset the gate sigs the
+      // clear. Fall back to the full finalize (Build phase 2: linking + feature
+      // check → Testing: convergence) so it's still driven to green. Reset the
+      // gate sigs the
       // convergence may have set so the full pass runs fresh rather than being
       // suppressed as "already exhausted".
       _testingExhaustedSig = null;
@@ -4287,26 +4311,34 @@ commits the scaffold after all required artifacts exist.''';
   /// after the count fails to drop for [_maxStagnantRounds] rounds. [doneSig] is
   /// the completed-task signature this run gates, so a pass/exhaust suppresses
   /// re-running for the same settled state.
-  /// End-of-project finalize, ordered to avoid the "green → rewire → re-break →
-  /// re-converge" thrash: LINK first, CI second, then a read-only double-check
-  /// SCAN.
+  /// End-of-project finalize, ordered ONE-WAY to stop the "fix a feature →
+  /// break the build → fix the build → re-break a feature" thrash the old
+  /// interleaved loop produced (observed: 9+ alternating CI/double-check
+  /// rounds on one project). Two distinct sub-phases, run in sequence:
   ///
-  ///   PHASE 1 — LINKING PUSH: one solid pass that wires EVERY requested feature
-  ///     into the running app (route/nav/entrypoint), UP FRONT, before CI. The
-  ///     build phase should already have wired most of it; this closes the gaps
-  ///     in a single comprehensive edit instead of one-feature-at-a-time later.
-  ///   PHASE 2 — CI CONVERGENCE: compile/test the now-wired app and fix whatever
-  ///     the wiring surfaced, progress-gated, until GREEN.
-  ///   PHASE 3 — DOUBLE-CHECK SCAN: a READ-ONLY logic re-confirmation that every
-  ///     feature is reachable. CI must never *unlink* anything, so this should
-  ///     pass first time; only if it genuinely finds a gap does it do a targeted
-  ///     rewire and re-converge (bounded by the stagnation gate).
+  ///   BUILD PHASE 2 (light orange) — the one-time FEATURE CHECK:
+  ///     STEP 1 LINKING PUSH: one solid pass that wires EVERY requested feature
+  ///     into the running app (route/nav/entrypoint).
+  ///     STEP 2 FEATURE CHECK: scan that every feature is coded, reachable,
+  ///     stub-free and test-covered; code whatever is missing (bounded loop).
+  ///     NO CI convergence in here — build errors are deliberately left for the
+  ///     Testing phase, so feature fixes can't be blamed for compile regressions
+  ///     and vice versa.
+  ///   TESTING (yellow) — PURE CI CONVERGENCE: compile/test main and grind the
+  ///     failpoint count to zero, progress-gated. No feature re-scanning here.
+  ///
+  /// The project reaches `completed` only when the feature check passed AND CI
+  /// is green; CI green with unresolved feature gaps is flagged for manual
+  /// review instead.
   Future<void> _runTestingPhase(Project project, String doneSig) async {
-    _setTesting(true, 'Linking — wiring every feature across the app…');
+    _setPhase2(
+      true,
+      'Build phase 2 — checking every feature is coded & reachable…',
+    );
     try {
       if (!await _stillRunning()) return;
 
-      // Make sure the CI gate is current before we converge — in particular, add
+      // Make sure the CI gate is current before Testing — in particular, add
       // the build_runner codegen step for drift/freezed/… projects so we don't
       // grind against stale generated files (hundreds of phantom errors). First
       // provision the codegen toolchain in pubspec if the source uses it but the
@@ -4315,58 +4347,55 @@ commits the scaffold after all required artifacts exist.''';
       await _ensureCodegenDeps(project);
       await _ensureDefaultCiWorkflow(project);
 
-      // ── PHASE 1: LINKING PUSH (one comprehensive wiring pass, before CI) ─────
+      // ── BUILD PHASE 2, STEP 1: LINKING PUSH (wire every feature in) ───────
       await _runLinkingPass(project);
 
-      // ── PHASE 2: CONVERGE CI on the now-wired app ───────────────────────────
-      final green = await _convergeCi(project, doneSig);
-      if (green == null) return; // infra down — retry on a later pump/tick
-      if (!green) return; // exhausted — [_testingExhaustedSig] already set
-
-      // ── PHASE 3: DOUBLE-CHECK (INCREMENTAL — shrinks as features verify) ─────
-      // Load the persistent checklist so each pass only re-reviews features that
-      // are NOT yet confirmed, and a verified feature is never re-touched. This is
-      // what stops the link↔test alternation from re-litigating settled work every
-      // round (the count only goes DOWN).
+      // ── BUILD PHASE 2, STEP 2: FEATURE CHECK (one-way; NO CI in here) ──────
+      // The persistent checklist makes each pass shrink: only UNconfirmed
+      // features are re-reviewed, so a verified feature is never re-touched.
       final prog = await loadFinalizeProgress(projectId);
       _finalPassPrevCount = null;
       _finalPassStagnant = 0;
+      var featureCheckPassed = false;
       for (var pass = 1; pass <= _absoluteMaxTestingRounds; pass++) {
         if (!await _stillRunning()) return;
-        _setTesting(true, 'Double-check — re-confirming remaining features…');
+        _setPhase2(true, 'Build phase 2 — feature check (pass $pass)…');
         debugPrint(
-          '[Orchestrator p$projectId] CI GREEN → DOUBLE-CHECK (pass $pass): '
-          '${prog.verified.length} feature(s) already confirmed — re-checking the '
-          'rest + stubs + screenshot…',
+          '[Orchestrator p$projectId] BUILD PHASE 2 — feature check (pass '
+          '$pass): ${prog.verified.length} feature(s) already confirmed — '
+          'checking the rest + stubs + screenshot…',
         );
         final scan = await _runFinalPass(
           project,
           alreadyVerified: prog.verified,
         );
+        if (scan.notes.isNotEmpty) {
+          debugPrint(
+            '[Orchestrator p$projectId] BUILD PHASE 2 note (non-blocking, on the '
+            'record only): ${scan.notes}',
+          );
+        }
         if (scan.nowVerified.isNotEmpty) {
           prog.verified.addAll(scan.nowVerified);
           await saveFinalizeProgress(projectId, prog);
           debugPrint(
-            '[Orchestrator p$projectId] DOUBLE-CHECK: +${scan.nowVerified.length} '
+            '[Orchestrator p$projectId] BUILD PHASE 2: +${scan.nowVerified.length} '
             'feature(s) confirmed this pass (${prog.verified.length} total).',
           );
         }
         if (scan.passed) {
-          _finalScanPassedSig = doneSig; // settled green — stop re-scanning
+          featureCheckPassed = true;
           _finalPassPrevCount = null;
           _finalPassStagnant = 0;
-          await _db.setProjectOrchestrationState(projectId, 'completed');
-          // Done — drop the checklist so any future re-run (after the project is
-          // re-opened / tasks change) re-verifies from scratch.
-          await clearFinalizeProgress(projectId);
           debugPrint(
-            '[Orchestrator p$projectId] DOUBLE-CHECK OK — project COMPLETE '
-            '(linked, CI green, every feature confirmed reachable, no stubs).',
+            '[Orchestrator p$projectId] BUILD PHASE 2 OK — every feature '
+            'confirmed coded & reachable (no stubs, tests covered). On to '
+            'Testing (CI convergence).',
           );
-          return;
+          break;
         }
-        // A gap remains (unverified wiring, a stub, or a visual issue). Targeted
-        // fix, then re-converge CI. Progress = the issue count dropping OR the
+        // Gaps remain (unwired, stub, missing tests, or a visual issue). Code
+        // them, then re-scan. Progress = the issue count dropping OR the
         // verified set growing; only a pass that does NEITHER counts toward the
         // stagnation budget.
         final issueCount = _countIssueBullets(scan.issues);
@@ -4377,36 +4406,55 @@ commits the scaffold after all required artifacts exist.''';
         if (!madeProgress) {
           _finalPassStagnant++;
           if (_finalPassStagnant >= _maxFinalPassStagnant) {
-            _testingExhaustedSig = doneSig;
             debugPrint(
-              '[Orchestrator p$projectId] DOUBLE-CHECK: no progress for '
+              '[Orchestrator p$projectId] BUILD PHASE 2: no progress for '
               '$_maxFinalPassStagnant passes ($issueCount issue(s) left) — '
-              'leaving for manual review:\n${scan.issues}',
+              'gaps stay on record; continuing to Testing anyway:\n'
+              '${scan.issues}',
             );
-            return;
+            break; // don't stall the pipeline — Testing still runs
           }
         } else {
           _finalPassStagnant = 0;
         }
         _finalPassPrevCount = issueCount;
         debugPrint(
-          '[Orchestrator p$projectId] DOUBLE-CHECK found $issueCount issue(s) — '
-          'targeted fix then re-converge:\n${scan.issues}',
+          '[Orchestrator p$projectId] BUILD PHASE 2 found $issueCount gap(s) — '
+          'coding them, then re-checking (CI comes AFTER):\n${scan.issues}',
         );
-        _setTesting(
-          true,
-          'Double-check — fixing $issueCount remaining issue(s)…',
-        );
+        _setPhase2(true, 'Build phase 2 — coding $issueCount missing piece(s)…');
         await _runFixAgent(project, scan.issues, pass, functional: true);
-        final reGreen = await _convergeCi(project, doneSig);
-        if (reGreen == null) return; // infra down — retry later
-        if (!reGreen) return; // exhausted — flag set
+        // Deliberately NO _convergeCi here: compile/test errors are the
+        // Testing phase's job. One-way flow — a feature fix that breaks the
+        // build is fixed in Testing, not by re-scanning features.
       }
-      _testingExhaustedSig = doneSig;
-      debugPrint(
-        '[Orchestrator p$projectId] DOUBLE-CHECK hit the $_absoluteMaxTestingRounds-'
-        'pass backstop — leaving for manual review.',
-      );
+
+      // ── TESTING: PURE CI CONVERGENCE (yellow) ──────────────────────────────
+      _setPhase2(false, null);
+      _setTesting(true, 'Testing — running CI on main…');
+      final green = await _convergeCi(project, doneSig);
+      if (green == null) return; // infra down — retry on a later pump/tick
+      if (!green) return; // exhausted — [_testingExhaustedSig] already set
+
+      if (featureCheckPassed) {
+        _finalScanPassedSig = doneSig; // settled green — stop re-scanning
+        await _db.setProjectOrchestrationState(projectId, 'completed');
+        // Done — drop the checklist so any future re-run (after the project is
+        // re-opened / tasks change) re-verifies from scratch.
+        await clearFinalizeProgress(projectId);
+        debugPrint(
+          '[Orchestrator p$projectId] TESTING OK — project COMPLETE '
+          '(every feature confirmed coded & reachable, CI green).',
+        );
+      } else {
+        // CI is green but the feature check never fully cleared — don't claim
+        // completion, and don't re-run this settled state on every pump.
+        _testingExhaustedSig = doneSig;
+        debugPrint(
+          '[Orchestrator p$projectId] TESTING OK (CI green) but the feature '
+          'check has unresolved gaps — leaving for manual review.',
+        );
+      }
     } catch (e, st) {
       // A torn-down orchestrator (project switch / navigating off the workspace
       // view disposes this autoDispose provider) throws "Cannot use Ref after
@@ -4433,7 +4481,7 @@ commits the scaffold after all required artifacts exist.''';
   /// in one solid pass (edits main, commits). Runs ONCE per project (tracked by
   /// [FinalizeProgress.linkDone]) — on a later entry (restart / re-pump / rebuild)
   /// it is SKIPPED so we don't re-churn already-wired work; the incremental
-  /// double-check handles what's left. Features already CONFIRMED wired
+  /// feature check handles what's left. Features already CONFIRMED wired
   /// ([FinalizeProgress.verified]) are dropped from the worklist so even the first
   /// push only spans what isn't settled.
   Future<void> _runLinkingPass(Project project) async {
@@ -4442,7 +4490,7 @@ commits the scaffold after all required artifacts exist.''';
     if (prog.linkDone) {
       debugPrint(
         '[Orchestrator p$projectId] LINKING PASS: already done on a prior entry — '
-        'skipping the full re-link, going straight to the double-check.',
+        'skipping the full re-link, going straight to the feature check.',
       );
       return;
     }
@@ -4507,7 +4555,7 @@ commits the scaffold after all required artifacts exist.''';
       // even though the app compiles and runs — and the fixer often can't clear a
       // stubborn lint, stalling the whole project. If the red run failed ONLY on
       // info-level lints (no errors/warnings, no test/build failure), accept it as
-      // green and move on to the double-check.
+      // green and move on to the feature check.
       if (outcome.runPk != null && await _ciRedIsInfoOnly(outcome.runPk!)) {
         debugPrint(
           '[Orchestrator p$projectId] CI convergence round $round: run '
@@ -4579,20 +4627,32 @@ commits the scaffold after all required artifacts exist.''';
     return false;
   }
 
-  /// FINAL PASS: with CI green, confirm every REQUESTED feature (task) is truly
-  /// implemented AND reachable in the running app — not left as a placeholder or
-  /// stub. Two checks: a code-trace review (the reliable one — catches the
+  /// FEATURE CHECK (Build phase 2): confirm every REQUESTED feature (task) is
+  /// truly implemented AND reachable in the running app — not left as a
+  /// placeholder or stub. Runs AFTER the linking push and BEFORE Testing (CI
+  /// convergence), so the tree is not yet guaranteed green. Two checks: a
+  /// code-trace review (the reliable one — catches the
   /// "press Start, land on a placeholder screen" case), and a best-effort
   /// screenshot of the running web build for a vision sanity check. Passed only
   /// when neither flags anything.
   /// [alreadyVerified]: task_pks the checklist has already confirmed — the
   /// code-trace SKIPS them (only re-reviews the rest), so each pass shrinks.
   /// [nowVerified] returns the task_pks this pass newly confirmed wired+reachable.
-  Future<({bool passed, String issues, Set<int> nowVerified})> _runFinalPass(
+  ///
+  /// BLOCKING issues (gate [passed] + drive the fixer): stubs, unwired/
+  /// incomplete features, inconclusive reviews — i.e. things that stop the app
+  /// from genuinely RUNNING. NON-BLOCKING (returned in [notes], logged on the
+  /// record only): missing FEATURE TEST COVERAGE — green is defined as "CI
+  /// stopped doing tests + the app runs", so missing tests are noted, not
+  /// looped on (the fixer repeatedly burned its budget re-reading files instead
+  /// of writing tests, which stalled projects that were otherwise fine).
+  Future<({bool passed, String issues, String notes, Set<int> nowVerified})>
+  _runFinalPass(
     Project project, {
     Set<int> alreadyVerified = const <int>{},
   }) async {
     final buf = StringBuffer();
+    final notes = StringBuffer();
     var nowVerified = <int>{};
     // HARD NO on stubs — a deterministic whole-tree scan (no base exemption,
     // footprint-independent, restart-proof). This is the guarantee the per-task
@@ -4620,9 +4680,10 @@ commits the scaffold after all required artifacts exist.''';
     }
     final testCoverage = await _featureTestCoverageProblem();
     if (testCoverage.isNotEmpty) {
-      if (buf.isNotEmpty) buf.writeln();
-      buf.writeln('MISSING FEATURE TEST COVERAGE:');
-      buf.writeln('- $testCoverage');
+      // NON-BLOCKING — recorded on the log for the human, never gates green.
+      if (notes.isNotEmpty) notes.writeln();
+      notes.writeln('MISSING FEATURE TEST COVERAGE (note, does not block):');
+      notes.writeln('- $testCoverage');
     }
     try {
       final allTasks = await _db.getTasksForProject(projectId);
@@ -4679,7 +4740,12 @@ commits the scaffold after all required artifacts exist.''';
       debugPrint('[Orchestrator p$projectId] final-pass vision skipped: $e');
     }
     final issues = buf.toString().trim();
-    return (passed: issues.isEmpty, issues: issues, nowVerified: nowVerified);
+    return (
+      passed: issues.isEmpty,
+      issues: issues,
+      notes: notes.toString().trim(),
+      nowVerified: nowVerified,
+    );
   }
 
   /// Count the flagged features in a Final Pass report (bullet lines) — the
@@ -5006,12 +5072,17 @@ commits the scaffold after all required artifacts exist.''';
                   'smoke test and shell-load widget test do not count as feature '
                   'coverage.'
             : functional
-            ? 'You are the end-of-project FINAL PASS agent. The project compiles '
-                  'and its CI is GREEN. Each listed problem was found by a code '
+            ? 'You are the end-of-project BUILD PHASE 2 (feature-check) agent. '
+                  'All tasks are built and merged onto main. A dedicated TESTING '
+                  'phase runs AFTER you and makes CI green — so do NOT chase '
+                  'compile errors across the app; focus ONLY on making each '
+                  'listed feature genuinely exist and be reachable (keep your '
+                  'own edits as compilable as you can). '
+                  'Each listed problem was found by a code '
                   'REVIEW that read the actual code — so if it says a feature is '
                   'missing/not-implemented, it GENUINELY is not there (a compiling, '
                   'partly-working file is NOT the same as the feature being done). '
-                  'Four kinds, resolve them ALL: (1) UNIMPLEMENTED STUBS — a '
+                  'Three kinds, resolve them ALL: (1) UNIMPLEMENTED STUBS — a '
                   'TODO/placeholder/empty body/UnimplementedError: build the real '
                   'UI/logic and remove the marker. (2) UNWIRED — the real code '
                   'exists but is unreachable: connect it with the smallest '
@@ -5021,14 +5092,7 @@ commits the scaffold after all required artifacts exist.''';
                   'missing part FOR REAL, even if it needs a refactor — widen the '
                   'enum to a class/sealed hierarchy or add a variant AND update '
                   'every usage (model + provider + screen + widget), add the input '
-                  'UI, etc. (4) MISSING FEATURE TEST COVERAGE — the only tests that '
-                  'exist are generated smoke/shell-load ones: WRITE focused test '
-                  'files under test/ for the requested features — pump the real '
-                  'app or feature widget, DRIVE the actual interaction (tap, enter, '
-                  'navigate), and expect the real state change; then git_commit '
-                  'them. A smoke or shell-load assertion does not count, and an '
-                  'uncommitted test file does not count. Reading the files is NOT '
-                  'progress — you must EDIT/WRITE them. '
+                  'UI, etc. '
                   'Before you finish, RE-READ the changed files and CONFIRM the '
                   'EXACT described capability now exists in the code; NEVER commit a '
                   '"implemented/done" message for something you did not actually '
@@ -5042,14 +5106,11 @@ commits the scaffold after all required artifacts exist.''';
         functional || linkAll
             ? '- For EACH listed item: if it is a STUB, build the real feature and '
                   'remove the marker; if it merely needs WIRING, find the existing '
-                  'implementation and connect its trigger path with a small edit; '
-                  'if it is MISSING FEATURE TEST COVERAGE, the fix is to WRITE the '
-                  'missing focused test file(s) under test/ (real interactions and '
-                  'expects — not a smoke/shell-load assertion) and git_commit them. '
+                  'implementation and connect its trigger path with a small edit. '
                   'Budget for reading: open the routes/entrypoint and each feature '
-                  'page ONCE — never re-read a file you already read — and once you '
-                  'know what to test, your NEXT tool call must be writing the test '
-                  'file(s), not another read. Never leave a TODO/placeholder behind.'
+                  'page ONCE — never re-read a file you already read — and once '
+                  'you know what to change, your NEXT tool call must be the edit, '
+                  'not another read. Never leave a TODO/placeholder behind.'
             : '- Work across AS MANY FILES AS NEEDED — read the failing files, '
                   'find the real cause, and fix it. Do not stop at the first '
                   'error; resolve the whole class of failures.',
@@ -5057,11 +5118,6 @@ commits the scaffold after all required artifacts exist.''';
       ..writeln(
         '- Keep changes minimal and correct; do not delete features or stub '
         'things out to silence errors. Preserve existing behavior.',
-      )
-      ..writeln(
-        '- If feature-test coverage is missing, add focused tests that exercise '
-        'the requested behavior or state transitions. A smoke assertion or a '
-        'widget-construction-only test is not sufficient.',
       )
       ..writeln(
         '- A failing TEST can be a RUNTIME error, not a compile error — read the '
@@ -5149,12 +5205,10 @@ commits the scaffold after all required artifacts exist.''';
               'committing as you go. Do NOT stop after the first; wire them all now. '
               'Requested features:\n\n$errors'
         : functional
-        ? 'CI is green but the final review flagged the problems below. Each is '
+        ? 'The feature check flagged the problems below. Each is '
               'one of: an UNWIRED feature (connect it end to end), an UNIMPLEMENTED '
-              'or INCOMPLETE feature (build the missing part for real), or MISSING '
-              'FEATURE TEST COVERAGE (write the missing focused test file(s) under '
-              'test/ that drive the real behavior and state transitions, then '
-              'commit them). Resolve EVERY one in this session, committing as you '
+              'or INCOMPLETE feature (build the missing part for real). Resolve '
+              'EVERY one in this session, committing as you '
               'go. Do NOT stop after the first, and do NOT end the session having '
               'only read files. Problems:\n\n$errors'
         : 'CI on main is RED with the failpoints below. Fix EVERY one of them in '
@@ -5295,6 +5349,30 @@ commits the scaffold after all required artifacts exist.''';
         waiting: cur.waiting,
         testing: active,
         testingDetail: detail,
+        buildPhase2: _phase2Active,
+        buildPhase2Detail: _phase2Detail,
+      );
+    } catch (_) {}
+  }
+
+  /// Mirror the BUILD PHASE 2 (one-time feature check) flag + detail into the
+  /// status provider so the top-bar shows its light-orange stage while it runs.
+  void _setPhase2(bool active, String? detail) {
+    _phase2Active = active;
+    _phase2Detail = detail;
+    if (_disposed) return;
+    try {
+      final cur = ref.read(orchestratorStatusProvider(projectId));
+      ref
+          .read(orchestratorStatusProvider(projectId).notifier)
+          .state = OrchestratorStatus(
+        workerSlots: cur.workerSlots,
+        activeStages: cur.activeStages,
+        waiting: cur.waiting,
+        testing: _testingActive,
+        testingDetail: _testingDetail,
+        buildPhase2: active,
+        buildPhase2Detail: detail,
       );
     } catch (_) {}
   }
@@ -5784,12 +5862,23 @@ class OrchestratorStatus {
   /// Human-readable detail for the TESTING phase (e.g. "CI run 2 of 6…").
   final String? testingDetail;
 
+  /// True while BUILD PHASE 2 runs — the one-time feature check after the
+  /// build (linking + "is everything coded & reachable?" scan + coding gaps).
+  /// The UI shows a light-orange "Build phase 2" stage between the orange of
+  /// building and the yellow of testing.
+  final bool buildPhase2;
+
+  /// Human-readable detail for the BUILD PHASE 2 stage.
+  final String? buildPhase2Detail;
+
   const OrchestratorStatus({
     this.workerSlots = 0,
     this.activeStages = 0,
     this.waiting = const [],
     this.testing = false,
     this.testingDetail,
+    this.buildPhase2 = false,
+    this.buildPhase2Detail,
   });
 }
 

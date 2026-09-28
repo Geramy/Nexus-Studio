@@ -11,7 +11,6 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 /// in the OS keychain via flutter_secure_storage — never in Drift or prefs.
 class GithubTokenStore {
   static const _store = FlutterSecureStorage(
-    aOptions: AndroidOptions(encryptedSharedPreferences: true),
     iOptions: IOSOptions(accessibility: KeychainAccessibility.first_unlock),
     // See nexus_account_store.dart: legacy keychain avoids the macOS
     // keychain-access-groups entitlement that crashes ad-hoc debug builds.

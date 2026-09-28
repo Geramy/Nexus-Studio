@@ -45,7 +45,7 @@ Future<WorkspaceZip> exportWorkspaceZip(
       // Skip unreadable entries rather than failing the whole export.
     }
   }
-  final zipped = ZipEncoder().encode(archive) ?? const <int>[];
+  final zipped = ZipEncoder().encode(archive);
 
   final docs = await getApplicationDocumentsDirectory();
   final dir = Directory(p.join(docs.path, 'NexusExports'));

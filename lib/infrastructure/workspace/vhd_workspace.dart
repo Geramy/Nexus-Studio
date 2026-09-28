@@ -68,7 +68,7 @@ class VhdWorkspace implements Workspace {
     return VhdWorkspace._(db);
   }
 
-  void dispose() => _db.dispose();
+  void dispose() => _db.close();
 
   static int _now() => DateTime.now().millisecondsSinceEpoch;
 
@@ -307,9 +307,9 @@ class VhdWorkspace implements Workspace {
             : data.length;
         stmt.execute([nodeId, block, data.sublist(i, endIdx)]);
       }
-      stmt.dispose();
+      stmt.close();
       _db.execute('COMMIT');
-      return stat(wsPath);
+      return await stat(wsPath);
     } catch (e) {
       _db.execute('ROLLBACK');
       rethrow;

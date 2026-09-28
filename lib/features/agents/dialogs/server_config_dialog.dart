@@ -273,7 +273,7 @@ class _ServerConfigDialogState extends ConsumerState<ServerConfigDialog> {
                         ? _server.selectedModel
                         : null;
                     return DropdownButtonFormField<String>(
-                      value: value,
+                      initialValue: value,
                       decoration: const InputDecoration(
                         border: OutlineInputBorder(),
                         labelText: 'Active Model',

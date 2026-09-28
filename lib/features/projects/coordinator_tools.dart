@@ -3696,6 +3696,18 @@ class CoordinatorToolExecutor {
         ? rawPaths.map((e) => '$e'.trim()).where((e) => e.isNotEmpty).toList()
         : const <String>[];
     try {
+      if (paths.isEmpty) {
+        // No-op guard: commitAll is a blind snapshot — without this check a
+        // clean tree still produced a fresh commit (new timestamp → new hash)
+        // and reported success, so a stuck fixer looped forever committing
+        // nothing and the orchestrator's no-edit stall guard never fired
+        // (observed: 18 identical empty commits in one testing-fix round).
+        final status = await _withGitLane(() => git!.status());
+        if (status.isClean) {
+          return 'Working tree is already clean — nothing to commit. If all '
+              'failpoints are fixed, reply "done" and stop.';
+        }
+      }
       final oid = await _withGitLane(
         () => paths.isEmpty
             ? git!.commitAll(message: message, authorName: agentName)

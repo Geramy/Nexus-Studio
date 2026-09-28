@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 1.17.9+86
+version: 1.18.0+87
 
 environment:
   sdk: ^3.11.5
@@ -31,23 +31,12 @@ dependencies:
   flutter:
     sdk: flutter
 
-  # The following adds the Cupertino Icons font to your application.
-  # Use with the CupertinoIcons class for iOS style icons.
-  cupertino_icons: ^1.0.8
-
   # State Management (following Card-wars patterns)
   flutter_riverpod: ^3.3.2
   riverpod_annotation: ^4.0.3
 
-  # Immutable models + code generation
-  freezed_annotation: ^3.0.0
-  json_annotation: ^4.9.0
-
   # Navigation
   go_router: ^17.3.0
-
-  # Networking (future use)
-  dio: ^5.8.0+1
 
   # Useful utilities
   collection: ^1.19.1
@@ -56,17 +45,14 @@ dependencies:
   # Reactive cross-platform SQLite (Drift) - chosen for real-time DB subscriptions
   # so UI can be directly driven by database changes (local + future remote sync)
   drift: ^2.26.0
-  drift_flutter: ^0.3.0
   sqlite3_flutter_libs: ^0.6.0+eol  # for mobile/desktop native SQLite
   sqlite3: ^3.3.3               # direct: per-project SQLite-backed virtual disk (.nxtprj)
-  git2dart: ^0.5.0              # libgit2 (FFI) — git engine
   git2dart_binaries: ^1.11.2     # PINNED: 1.10.4 resolves its native libs via
                                 # Isolate.resolvePackageUri, which returns null
                                 # inside a compiled Flutter app → runtime "Unable
                                 # to resolve git2dart_binaries package location".
                                 # raw libgit2 FFI symbols (custom ODB/refdb backend)
   ffi: ^2.1.0                   # calloc/free for the custom backend structs
-  docker2: ^6.1.0               # container-based build/CI execution
   path_provider: ^2.1.4
   path: ^1.9.0
   yaml: ^3.1.2                   # parse .github/workflows/*.yml for the local CI runner
@@ -90,7 +76,6 @@ dependencies:
   # main.dart via JustAudioMediaKit.ensureInitialized.
   just_audio_media_kit: ^2.0.6
   media_kit_libs_linux: ^1.1.3
-  permission_handler: ^12.0.3
   http: ^1.2.0
   vad: ^0.0.8  # Same resolved version as lemonade_mobile (the one where audioStream: + v5 works on desktop)
   audio_session: ^0.2.3  # Proper voice chat audio session config (AEC, etc.)
@@ -129,8 +114,6 @@ dev_dependencies:
   # Code generation
   build_runner: ^2.4.15
   riverpod_generator: ^4.0.4
-  freezed: ^3.1.0
-  json_serializable: ^6.9.5
   riverpod_lint: ^3.1.4
 
   # Drift code generation

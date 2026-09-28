@@ -7,7 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:nexus_projects_client/infrastructure/lemonade/models/discovered_server.dart';
 
 import '../cards/discovered_server_card.dart';
-import '../widgets/empty_state.dart';
+import 'package:nexus_projects_client/shared/ui/widgets/empty_state.dart';
 
 /// Tab showing servers discovered via beacon.
 class DiscoveredServersTab extends StatelessWidget {
@@ -28,8 +28,8 @@ class DiscoveredServersTab extends StatelessWidget {
         if (discovered.isEmpty)
           const EmptyState(
             icon: Icons.wifi_off_outlined,
-            message:
-                'No servers discovered. Make sure your Lemonade server is running.',
+            title: 'No servers discovered',
+            message: 'Make sure your Lemonade server is running.',
           )
         else
           ...discovered.map(

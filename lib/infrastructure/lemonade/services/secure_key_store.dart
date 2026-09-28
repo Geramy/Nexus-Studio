@@ -9,7 +9,6 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 class SecureKeyStore {
   static const _store = FlutterSecureStorage(
-    aOptions: AndroidOptions(encryptedSharedPreferences: true),
     iOptions: IOSOptions(accessibility: KeychainAccessibility.first_unlock),
     // See nexus_account_store.dart: legacy keychain avoids the macOS
     // keychain-access-groups entitlement that crashes ad-hoc debug builds.

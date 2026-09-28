@@ -34,7 +34,7 @@ import 'package:nexus_projects_client/features/projects/task_workflow.dart';
 /// (null = auto: first working). Auto-falls back if that worker leaves the feed.
 final focusedWorkerProvider = StateProvider.family<int?, int>((ref, _) => null);
 
-enum _AgentState { working, complete, idle, templating, testing, waiting }
+enum _AgentState { working, complete, idle, templating, buildPhase2, testing, waiting }
 
 class _AgentActivity {
   const _AgentActivity(this.taskPk, this.agent, this.task, this.state);
@@ -67,6 +67,7 @@ class AgentFeedIndicator extends ConsumerWidget {
   static const int _openTasks = -2;
   static const int _templatingTaskPk = -99;
   static const int _testingTaskPk = -98;
+  static const int _phase2TaskPk = -97;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -213,7 +214,11 @@ class AgentFeedIndicator extends ConsumerWidget {
         tasks.isNotEmpty && tasks.every((t) => t.status == TaskStatus.done);
     final ciValidated = orchState == 'completed';
     final awaitingTesting = allTasksDone && !ciValidated;
-    final isTesting = !isTemplating && (orch.testing || awaitingTesting);
+    // BUILD PHASE 2 (one-time feature check) shows its own light-orange stage;
+    // it takes precedence over the yellow Testing stage while it runs.
+    final isPhase2 = !isTemplating && orch.buildPhase2;
+    final isTesting =
+        !isTemplating && !isPhase2 && (orch.testing || awaitingTesting);
 
     final rep = isTemplating
         ? const _AgentActivity(
@@ -221,6 +226,14 @@ class AgentFeedIndicator extends ConsumerWidget {
             'Templater',
             'Scaffolding base project…',
             _AgentState.templating,
+          )
+        : isPhase2
+        ? _AgentActivity(
+            _phase2TaskPk,
+            'Build phase 2',
+            orch.buildPhase2Detail ??
+                'Feature check — is everything coded & reachable?',
+            _AgentState.buildPhase2,
           )
         : isTesting
         ? _AgentActivity(
@@ -239,6 +252,11 @@ class AgentFeedIndicator extends ConsumerWidget {
 
     final tooltip = isTemplating
         ? 'Templater — scaffolding the base project before tasks start'
+        : isPhase2
+        ? (orch.buildPhase2Detail ??
+              'Build phase 2 — feature check: confirming every feature is coded '
+                  'and reachable, and coding anything missing, before Testing '
+                  'begins')
         : isTesting
         ? (orch.testing
               ? (orch.testingDetail ??
@@ -499,6 +517,7 @@ class AgentFeedIndicator extends ConsumerWidget {
     _AgentState.complete => 'complete',
     _AgentState.idle => 'idle',
     _AgentState.templating => 'templating',
+    _AgentState.buildPhase2 => 'build phase 2',
     _AgentState.testing => 'testing',
     _AgentState.waiting => 'waiting (file held)',
   };
@@ -509,6 +528,7 @@ class AgentFeedIndicator extends ConsumerWidget {
     _AgentState.complete => const Color(0xFF2E7D32),
     _AgentState.idle => const Color(0xFF616161),
     _AgentState.templating => const Color(0xFFF9A825), // yellow
+    _AgentState.buildPhase2 => const Color(0xFFFB8C00), // light orange
     _AgentState.testing => const Color(0xFFF9A825), // yellow
     _AgentState.waiting => const Color(0xFF1565C0), // blue
   };
@@ -544,6 +564,12 @@ class AgentFeedIndicator extends ConsumerWidget {
         return dark
             ? (bg: const Color(0xFFF9A825), fg: black)
             : (bg: const Color(0xFFFFF59D), fg: black);
+      case _AgentState.buildPhase2:
+        // Light orange — the one-time feature check between building (orange)
+        // and testing (yellow).
+        return dark
+            ? (bg: const Color(0xFFFB8C00), fg: white)
+            : (bg: const Color(0xFFFFCC80), fg: black);
       case _AgentState.testing:
         // Yellow — the end-of-project Testing phase is running CI + fixing.
         return dark

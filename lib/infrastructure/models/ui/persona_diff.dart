@@ -50,7 +50,7 @@ class PersonaFieldChange {
 /// UI layers should map them to `ui_model.AgentPersona` when needed.
 class ResolvedPersona {
   final dynamic effective; // Drift AgentPersona row (final merged values)
-  final dynamic? basePrefab; // Drift AgentPersona row (the source prefab)
+  final dynamic basePrefab; // Drift AgentPersona row (the source prefab)
   final PersonaDiff? diff; // Structured diff of local overrides
 
   /// True if this persona is derived from a prefab.

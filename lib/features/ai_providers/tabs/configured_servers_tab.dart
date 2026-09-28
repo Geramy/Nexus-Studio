@@ -9,7 +9,7 @@ import 'package:nexus_projects_client/infrastructure/lemonade/models/discovered_
 
 import '../cards/configured_server_card.dart';
 import '../widgets/server_count_chip.dart';
-import '../widgets/empty_state.dart';
+import 'package:nexus_projects_client/shared/ui/widgets/empty_state.dart';
 
 /// Tab showing configured Lemonade servers with add/edit/remove actions.
 class ConfiguredServersTab extends StatelessWidget {
@@ -51,7 +51,8 @@ class ConfiguredServersTab extends StatelessWidget {
         if (configured.isEmpty)
           const EmptyState(
             icon: Icons.storage_outlined,
-            message: 'No Lemonade servers configured. Add one to get started.',
+            title: 'No servers configured',
+            message: 'Add one to get started.',
           )
         else
           ...configured.map(

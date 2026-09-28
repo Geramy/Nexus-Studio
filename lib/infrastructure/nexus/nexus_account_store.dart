@@ -28,7 +28,6 @@ import 'models/nexus_account_models.dart';
 
 class NexusAccountStore {
   static const FlutterSecureStorage _store = FlutterSecureStorage(
-    aOptions: AndroidOptions(encryptedSharedPreferences: true),
     iOptions: IOSOptions(accessibility: KeychainAccessibility.first_unlock),
     mOptions: MacOsOptions(usesDataProtectionKeychain: false),
   );

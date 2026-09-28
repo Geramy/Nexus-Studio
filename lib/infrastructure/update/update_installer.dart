@@ -33,7 +33,7 @@ class UpdateInstaller {
         final r = await Process.run('xdg-open', [path]);
         if (r.exitCode == 0) return true;
         // Fall back to just showing the file so the user can install manually.
-        return revealInFolder(installer);
+        return await revealInFolder(installer);
       }
     } catch (_) {
       // Last resort: reveal the file.

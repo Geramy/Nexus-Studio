@@ -39,9 +39,6 @@ class WorkspaceExporter {
     }
 
     final data = ZipEncoder().encode(archive);
-    if (data == null) {
-      throw WorkspaceException('Failed to encode the export archive.');
-    }
 
     final dir = await _destinationDir();
     final file = File(
