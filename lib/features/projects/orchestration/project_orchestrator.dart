@@ -5322,10 +5322,15 @@ commits the scaffold after all required artifacts exist.''';
     );
 
     var kickoff = design
-        ? 'Design this project now: research its domain\'s look, build the '
-              'theme, build the real home/lobby, restyle every page, add the '
-              'generated art, and make every CTA lead somewhere real. Project '
-              'brief:\n\n$errors'
+        ? 'Design this project now. Work SEQUENTIALLY and write early — do NOT '
+              'read the whole codebase up front. Steps: (1) read ONLY lib/main.dart, '
+              'lib/app_routes.dart, pubspec.yaml and the current home/lobby page; '
+              '(2) immediately create lib/app_theme.dart and wire it into main.dart; '
+              '(3) rebuild the home into a real casino lobby; (4) THEN, for each '
+              'feature page, read it and restyle it with the theme one at a time '
+              '(do not change game logic); (5) generate 2–4 art assets and declare '
+              'assets/ in pubspec.yaml; (6) make every primary CTA actually '
+              'navigate. git_commit as you go. Project brief:\n\n$errors'
         : linkAll
         ? 'These are ALL the requested features. In ONE solid pass, go through the '
               'whole app and make sure EVERY one is wired up and reachable from the '
@@ -5415,33 +5420,61 @@ commits the scaffold after all required artifacts exist.''';
         ref.read(workspaceRevisionProvider(projectId).notifier).state++;
       }
       if (transient) continue; // don't count a failed turn as "idle/done"
+      // DESIGN pass: reading the whole app FIRST is correct (it must see every
+      // page before restyling), so "no edits yet" is NOT the done-signal here the
+      // way it is for the CI fixer. Push it hard to START WRITING, and only give
+      // up after several no-write turns. The CI/linking fixer keeps the tight
+      // 2-turn break (a fixer that stops editing is done).
+      final String designWriteNudge =
+          'STOP READING — you have already seen the whole app. WRITE NOW, in '
+          'this order: (1) create_file lib/app_theme.dart with a complete '
+          'Material 3 theme for this domain — a rich dark + gold casino '
+          'ColorScheme, text theme, and card/button/input styles; (2) edit '
+          'main.dart to wire `theme:` + `darkTheme:` into the MaterialApp; '
+          '(3) replace the template home (the raw list of route paths) with a '
+          'real casino lobby that links to every game; (4) restyle each feature '
+          'page with the theme (ColorScheme.of(context), spacing, hierarchy) — '
+          'do NOT change game logic; (5) generate_image 2–4 art assets (logo/'
+          'hero, a card-table or roulette background) and declare assets/ in '
+          'pubspec.yaml; (6) make every primary CTA actually navigate. Then '
+          'git_commit. Do NOT re-read files you have already read.';
       if (!sawTool) {
-        // A turn with no tool calls = the agent thinks it's finished. Give it one
+        // A turn with no tool calls = the agent thinks it's finished. Give it a
         // nudge in case it stopped early, then accept it's done.
         idleTurns++;
-        if (idleTurns >= 2) break;
-        kickoff =
-            'If EVERY failpoint above is now fixed AND committed, reply "done". '
-            'Otherwise keep fixing the remaining ones and git_commit them.';
+        if (idleTurns >= (design ? 3 : 2)) break;
+        kickoff = design
+            ? designWriteNudge
+            : 'If EVERY failpoint above is now fixed AND committed, reply '
+                  '"done". Otherwise keep fixing the remaining ones and '
+                  'git_commit them.';
         continue;
       }
       idleTurns = 0;
       if (sawEdit) {
         noEditTurns = 0;
-        kickoff =
-            'Keep going — fix the REMAINING failpoints from the list and '
-            'git_commit them. Re-read each file right before editing. When ALL '
-            'are fixed and committed, reply "done".';
+        kickoff = design
+            ? 'Good — keep going through the design checklist: finish the theme '
+                  'wiring, the lobby, the page restyles, the art assets, and the '
+                  'CTA wiring, then git_commit. Re-read a page right before '
+                  'restyling it. When every step is done and committed, reply '
+                  '"done".'
+            : 'Keep going — fix the REMAINING failpoints from the list and '
+                  'git_commit them. Re-read each file right before editing. '
+                  'When ALL are fixed and committed, reply "done".';
       } else {
-        // Tools ran but nothing changed (just reading/searching). After a couple
-        // of these the agent is done fixing — stop and let CI re-run rather than
-        // re-scanning the whole project.
+        // Tools ran but nothing changed (just reading/searching). For the CI
+        // fixer that means it's done — stop and let CI re-run. For the DESIGN
+        // pass it usually means it's re-reading instead of writing — nudge it
+        // to write, and only break after several such turns.
         noEditTurns++;
-        if (noEditTurns >= 2) break;
-        kickoff =
-            'You made no code change that turn. If every failpoint is fixed and '
-            'committed, reply "done" and stop. If something still needs fixing, '
-            'edit it and git_commit now — do NOT keep re-reading files.';
+        if (noEditTurns >= (design ? 5 : 2)) break;
+        kickoff = design
+            ? designWriteNudge
+            : 'You made no code change that turn. If every failpoint is fixed '
+                  'and committed, reply "done" and stop. If something still '
+                  'needs fixing, edit it and git_commit now — do NOT keep '
+                  're-reading files.';
       }
     }
     // SAFETY COMMIT: the next CI run only sees COMMITTED work, so if the agent
