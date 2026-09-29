@@ -797,9 +797,26 @@ class ProjectCoordinatorSession {
       if (committed) {
         names = workBranch != null
             ? const {'submit_for_completion'}
-            // Fixer (on main): work is committed — let it re-verify, the round
-            // ends when it stops (the orchestrator re-runs CI next).
-            : const {'read_file', 'git_commit'};
+            // Design pass: committing is a MILESTONE, not the end — it commits
+            // theme, lobby, restyles and art across several commits. Let it
+            // keep working; the stall logic ends the pass.
+            : designMode
+                ? const {
+                    'read_file',
+                    'read_file_chunk',
+                    'search_directory',
+                    'search_file_content',
+                    'write_file',
+                    'edit_file',
+                    'create_file',
+                    'generate_image',
+                    'web_fetch',
+                    'web_search',
+                    'git_commit',
+                  }
+                // Fixer (on main): work is committed — let it re-verify, the round
+                // ends when it stops (the orchestrator re-runs CI next).
+                : const {'read_file', 'git_commit'};
       } else if (readActions < (fixMode ? 6 : 3)) {
         names = fixMode
             ? designMode

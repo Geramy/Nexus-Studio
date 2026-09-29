@@ -79,9 +79,11 @@ Future<void> saveFinalizeProgress(int projectId, FinalizeProgress prog) async {
     final path = await _finalizePath(projectId);
     await Directory(p.dirname(path)).create(recursive: true);
     await File(path).writeAsString(jsonEncode(prog.toJson()));
-  } catch (_) {
+  } catch (e) {
     // Best-effort: losing the checklist only costs a redundant pass, never
-    // correctness.
+    // correctness — but make it VISIBLE (a silent swallow hid a live bug).
+    // ignore: avoid_print
+    print('[FinalizeProgress] save FAILED for p$projectId: $e');
   }
 }
 
