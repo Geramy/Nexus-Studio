@@ -3,6 +3,7 @@
 // Licensed under the Sustainable Use License. See LICENSE.md.
 
 import 'dart:convert';
+import 'dart:io' show HttpClient, HttpHeaders;
 
 import 'package:drift/drift.dart' show Value;
 import 'package:nexus_projects_client/infrastructure/database/nexus_database.dart';
@@ -101,6 +102,18 @@ class CoordinatorTools {
     'git_checkout_branch',
   };
 
+  /// The BUILD PHASE 2 DESIGN agent's toolset: the fix set (it works on main,
+  /// read/edit/commit) PLUS image generation (it ships real art assets, not
+  /// just icon-font glyphs) and the web tools (it researches how the project's
+  /// domain is actually styled before inventing a theme).
+  static const Set<String> _designToolNames = {
+    ..._fixToolNames,
+    'generate_image',
+    'edit_image',
+    'web_fetch',
+    'web_search',
+  };
+
   /// The post-completion EDITOR's toolset: a PURE DELEGATOR. Deliberately has NO
   /// code read/edit/write tools — the editor turns each request into tasks and
   /// hands them to worker agents (which read + implement). Reading/tracing the
@@ -138,6 +151,7 @@ class CoordinatorTools {
     bool workerOnly = false,
     bool verificationOnly = false,
     bool fixOnly = false,
+    bool designOnly = false,
     bool editorOnly = false,
   }) {
     // The post-setup Exploration (discovery) session gets ONLY the user-story
@@ -154,6 +168,7 @@ class CoordinatorTools {
         workerOnly ||
         verificationOnly ||
         fixOnly ||
+        designOnly ||
         editorOnly) {
       final allow = workerOnly
           ? _workerToolNames
@@ -161,6 +176,8 @@ class CoordinatorTools {
           ? _verificationToolNames
           : fixOnly
           ? _fixToolNames
+          : designOnly
+          ? _designToolNames
           : editorOnly
           ? _editorToolNames
           : _scaffoldToolNames;
@@ -1362,9 +1379,65 @@ class CoordinatorTools {
         },
       },
       ..._imageToolSchemas,
+      ..._webToolSchemas,
       if (includeStoryTools) ..._storyToolSchemas,
     ];
   }
+
+  /// Web research tools. The app is online (inference + CI both round-trip to
+  /// the server), so the agents can look at how real projects in the same
+  /// domain are styled / built before inventing an answer. Key-free: fetch
+  /// does a plain GET (the design agent is pointed at known references),
+  /// search uses DuckDuckGo's HTML endpoint. Both are best-effort and return
+  /// a friendly message on failure instead of throwing.
+  static const List<Map<String, dynamic>> _webToolSchemas = [
+    {
+      'type': 'function',
+      'function': {
+        'name': 'web_fetch',
+        'description':
+            'Fetch a web page and return its readable text content (HTML is '
+            'stripped to plain text, truncated). Use it to look at REFERENCE '
+            'material for the project — design docs, palettes, feature '
+            'comparisons, an existing app in the same domain. Pass a concrete '
+            'https:// URL. Fails gracefully on blocks/timeouts; try another '
+            'source instead of retrying the same URL.',
+        'parameters': {
+          'type': 'object',
+          'properties': {
+            'url': {
+              'type': 'string',
+              'description': 'The https:// URL to fetch.',
+            },
+          },
+          'required': ['url'],
+        },
+      },
+    },
+    {
+      'type': 'function',
+      'function': {
+        'name': 'web_search',
+        'description':
+            'Search the web and return the top results as '
+            '"title — url — snippet" lines. Use it to FIND reference material '
+            '(e.g. "casino app UI design dark gold theme", "Material 3 custom '
+            'color scheme") and then web_fetch the one or two URLs that look '
+            'most useful. Best-effort: if the search is blocked, fall back to '
+            'your own knowledge instead of retrying.',
+        'parameters': {
+          'type': 'object',
+          'properties': {
+            'query': {
+              'type': 'string',
+              'description': 'The search query.',
+            },
+          },
+          'required': ['query'],
+        },
+      },
+    },
+  ];
 
   /// User-story tools for the post-setup Exploration phase. Build the discovery
   /// story tree; intentionally read/write stories only (never tasks).
@@ -1960,6 +2033,10 @@ class CoordinatorToolExecutor {
           return await _generateImage(args);
         case 'edit_image':
           return await _editImage(args);
+        case 'web_fetch':
+          return await _webFetch(args);
+        case 'web_search':
+          return await _webSearch(args);
         case 'propose_plan_adjustment':
           return _proposePlanAdjustment(args);
         case 'list_open_tasks':
@@ -2789,6 +2866,143 @@ class CoordinatorToolExecutor {
     } catch (e) {
       return _imageError(e, imgModel);
     }
+  }
+
+  /// GET [url] and return its readable text (HTML stripped), truncated. Key-
+  /// free, best-effort: blocks/timeouts return a message the agent can act on
+  /// ("try another source") instead of throwing.
+  Future<String> _webFetch(Map<String, dynamic> args) async {
+    final raw = (args['url'] as String? ?? '').trim();
+    if (raw.isEmpty) return 'web_fetch needs a url.';
+    final uri = Uri.tryParse(raw);
+    if (uri == null || !(uri.scheme == 'https' || uri.scheme == 'http')) {
+      return 'web_fetch needs an http(s) URL.';
+    }
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 10)
+      ..userAgent = 'Mozilla/5.0 (X11; Linux x86_64) NexusProjects/1.18';
+    try {
+      final req = await client.getUrl(uri).timeout(const Duration(seconds: 15));
+      req.headers.set(HttpHeaders.acceptHeader, 'text/html,text/plain,*/*');
+      final res = await req.close().timeout(const Duration(seconds: 30));
+      final buf = StringBuffer();
+      var total = 0;
+      await for (final chunk in res.transform(const Utf8Decoder(allowMalformed: true))) {
+        buf.write(chunk);
+        total += chunk.length;
+        if (total > 400_000) break;
+      }
+      final html = buf.toString();
+      final text = _htmlToText(html);
+      final limit = 12_000;
+      final body = text.length > limit
+          ? '${text.substring(0, limit)}\n… [truncated]'
+          : text;
+      if (body.trim().isEmpty) {
+        return 'Fetched ${uri.host}${uri.path} but it had no readable text '
+              '(likely a JavaScript-rendered page). Try another source.';
+      }
+      return '--- $raw (HTTP ${res.statusCode}) ---\n$body';
+    } catch (e) {
+      return 'web_fetch of $raw failed ($e). Try another source instead of '
+            'retrying the same URL.';
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  /// DuckDuckGo HTML search — key-free, parses the result links + snippets
+  /// from the plain-HTML endpoint. Best-effort (it can be rate-limited/blocked;
+  /// the agent is told to fall back to its own knowledge).
+  Future<String> _webSearch(Map<String, dynamic> args) async {
+    final query = (args['query'] as String? ?? '').trim();
+    if (query.isEmpty) return 'web_search needs a query.';
+    final uri = Uri.parse(
+      'https://html.duckduckgo.com/html/?q=${Uri.encodeQueryComponent(query)}',
+    );
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 10)
+      ..userAgent =
+          'Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0';
+    try {
+      final req = await client.getUrl(uri).timeout(const Duration(seconds: 15));
+      req.headers.set(HttpHeaders.acceptHeader, 'text/html');
+      final res = await req.close().timeout(const Duration(seconds: 30));
+      final buf = await res
+          .transform(const Utf8Decoder(allowMalformed: true))
+          .join()
+          .timeout(const Duration(seconds: 5));
+      final results = <String>[];
+      final re = RegExp(
+        r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?'
+        r'(?:<a[^>]*class="result__snippet"[^>]*>(.*?)</a>)?',
+        dotAll: true,
+      );
+      for (final m in re.allMatches(buf).take(8)) {
+        var href = _decodeEntities(m.group(1)!);
+        // DDG wraps links in a redirect: //duckduckgo.com/l/?uddg=<encoded>
+        final uddg = RegExp(r'[?&]uddg=([^&]+)').firstMatch(href);
+        if (uddg != null) href = Uri.decodeComponent(uddg.group(1)!);
+        if (href.startsWith('//')) href = 'https:$href';
+        final title = _stripTags(_decodeEntities(m.group(2)!)).trim();
+        final snippet =
+            _stripTags(_decodeEntities(m.group(3) ?? '')).trim();
+        results.add('- $title — $href${snippet.isEmpty ? '' : ' — $snippet'}');
+      }
+      if (results.isEmpty) {
+        return 'web_search returned no parseable results (likely blocked or '
+              'rate-limited). Fall back to your own knowledge for reference '
+              'material instead of retrying.';
+      }
+      return 'Top web results for "$query":\n${results.join('\n')}';
+    } catch (e) {
+      return 'web_search failed ($e). Fall back to your own knowledge '
+            'instead of retrying.';
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  /// Crude HTML→text: drop script/style/noscript blocks and comments, turn
+  /// block-level tags into newlines, strip the rest, decode common entities,
+  /// collapse whitespace. (Dart RegExp has no inline flag groups or dotAll —
+  /// case via the constructor, newlines via [\s\S].)
+  static String _htmlToText(String html) {
+    var s = html;
+    s = s.replaceAll(RegExp(r'<script\b[\s\S]*?</script>', caseSensitive: false), '');
+    s = s.replaceAll(RegExp(r'<style\b[\s\S]*?</style>', caseSensitive: false), '');
+    s = s.replaceAll(RegExp(r'<noscript\b[\s\S]*?</noscript>', caseSensitive: false), '');
+    s = s.replaceAll(RegExp(r'<svg\b[\s\S]*?</svg>', caseSensitive: false), '');
+    s = s.replaceAll(RegExp(r'<head\b[\s\S]*?</head>', caseSensitive: false), '');
+    s = s.replaceAll(RegExp(r'<!--[\s\S]*?-->'), '');
+    s = s.replaceAll(
+      RegExp(r'<br\s*/?>|</(p|div|li|tr|h[1-6]|section|article|header|footer|table|pre)>', caseSensitive: false),
+      '\n',
+    );
+    s = _stripTags(s);
+    s = _decodeEntities(s);
+    s = s.replaceAll(RegExp(r'[ \t\x0B\f\r]+'), ' ');
+    s = s.replaceAll(RegExp(r'\n[ \t]*\n+'), '\n\n');
+    return s.trim();
+  }
+
+  static String _stripTags(String s) =>
+      s.replaceAll(RegExp(r'<[^>]+>'), ' ');
+
+  static String _decodeEntities(String s) {
+    var out = s
+        .replaceAll('&nbsp;', ' ')
+        .replaceAll('&amp;', '&')
+        .replaceAll('&lt;', '<')
+        .replaceAll('&gt;', '>')
+        .replaceAll('&quot;', '"')
+        .replaceAll('&#39;', "'")
+        .replaceAll('&apos;', "'");
+    out = out.replaceAllMapped(
+      RegExp(r'&#(\d+);'),
+      (Match m) => String.fromCharCodes([int.tryParse(m.group(1)!) ?? 63]),
+    );
+    return out;
   }
 
   Future<String> _listOpenTasks() async {

@@ -418,6 +418,7 @@ class ProjectOrchestrator {
   /// new run.
   int? _finalPassPrevCount;
   int _finalPassStagnant = 0;
+  int _designAssetSeq = 0;
 
   // Per-task retry budget within ONE run before a task is surfaced as Blocked.
   // Kept generous so a couple of transient hiccups (a flaky worker turn, a
@@ -4347,6 +4348,9 @@ commits the scaffold after all required artifacts exist.''';
       await _ensureCodegenDeps(project);
       await _ensureDefaultCiWorkflow(project);
 
+      // ── BUILD PHASE 2, STEP 0: DESIGN PUSH (theme, art, real home screen) ──
+      await _runDesignPass(project);
+
       // ── BUILD PHASE 2, STEP 1: LINKING PUSH (wire every feature in) ───────
       await _runLinkingPass(project);
 
@@ -4478,7 +4482,49 @@ commits the scaffold after all required artifacts exist.''';
 
   /// PHASE 1 helper — the comprehensive LINKING PUSH. Hands the task list to the
   /// wiring agent and tells it to trace the entrypoint and connect EVERY feature
-  /// in one solid pass (edits main, commits). Runs ONCE per project (tracked by
+  /// BUILD PHASE 2, STEP 0: DESIGN PUSH. The templater's base scaffold is
+  /// deliberately domain-agnostic — default Material theme, a home screen that
+  /// is a raw list of route paths, icon-font glyphs, no art. Observed result on
+  /// a casino project: every feature worked but the app looked like a settings
+  /// page and its primary CTAs ("Continue to the games") were dead-ends. This
+  /// one-shot pass (tracked by [FinalizeProgress.designDone]) fixes that:
+  /// research how the domain is styled (web tools), define the theme, build a
+  /// real home/lobby, restyle every page, ship generated art assets, and make
+  /// every CTA lead somewhere. Runs BEFORE the linking push so linking wires
+  /// features into the final shell.
+  Future<void> _runDesignPass(Project project) async {
+    if (!await _stillRunning()) return;
+    final prog = await loadFinalizeProgress(projectId);
+    if (prog.designDone) {
+      debugPrint(
+        '[Orchestrator p$projectId] DESIGN PASS: already done on a prior entry — '
+        'skipping.',
+      );
+      return;
+    }
+    final tasks = await _db.getTasksForProject(projectId);
+    final brief = StringBuffer();
+    brief.writeln('Project: ${project.name}');
+    for (final t in tasks) {
+      final desc = (t.description ?? '').trim();
+      final firstLine = desc.isEmpty ? '' : ' — ${desc.split('\n').first}';
+      brief.writeln('- [#${t.task_pk}] ${t.title}$firstLine');
+    }
+    debugPrint(
+      '[Orchestrator p$projectId] DESIGN PASS: one comprehensive theme/art/'
+      'lobby push over ${tasks.length} feature(s) before linking…',
+    );
+    _setPhase2(
+      true,
+      'Build phase 2 — design pass (theme, art, home screen)…',
+    );
+    await _runFixAgent(project, brief.toString().trim(), 0, design: true);
+    prog.designDone = true;
+    await saveFinalizeProgress(projectId, prog);
+  }
+
+  /// BUILD PHASE 2, STEP 1: LINKING PUSH — wires EVERY requested feature in
+  /// one solid pass (edits main, commits). Runs ONCE per project (tracked by
   /// [FinalizeProgress.linkDone]) — on a later entry (restart / re-pump / rebuild)
   /// it is SKIPPED so we don't re-churn already-wired work; the incremental
   /// feature check handles what's left. Features already CONFIRMED wired
@@ -4513,7 +4559,7 @@ commits the scaffold after all required artifacts exist.''';
       '[Orchestrator p$projectId] LINKING PASS: one comprehensive wiring push '
       'over ${pending.length}/${tasks.length} feature(s) before CI…',
     );
-    _setTesting(true, 'Linking — wiring every feature across the app…');
+    _setPhase2(true, 'Build phase 2 — linking every feature…');
     await _runFixAgent(
       project,
       worklist.toString().trim(),
@@ -4523,6 +4569,26 @@ commits the scaffold after all required artifacts exist.''';
     );
     prog.linkDone = true;
     await saveFinalizeProgress(projectId, prog);
+  }
+
+  /// Save a generated image (from the design pass's generate_image calls) into
+  /// the workspace's assets/ folder so it can be referenced in code + pubspec.
+  Future<void> _saveDesignAsset(String b64Png, String caption) async {
+    try {
+      final handles = await _resolveWorkspaceHandles();
+      final ws = handles.ws;
+      if (ws == null) return;
+      _designAssetSeq++;
+      final path = '/assets/gen_$_designAssetSeq.png';
+      await ws.writeBytes(path, base64Decode(b64Png));
+      debugPrint(
+        '[Orchestrator p$projectId] DESIGN PASS: saved generated art → $path '
+        '("${caption.length > 80 ? '${caption.substring(0, 80)}…' : caption}") — '
+        'declare assets/ in pubspec.yaml and reference this path in the UI.',
+      );
+    } catch (e) {
+      debugPrint('[Orchestrator p$projectId] DESIGN PASS: asset save failed: $e');
+    }
   }
 
   /// PHASE 2 helper — the progress-gated CI convergence loop. Runs CI on main and
@@ -4798,18 +4864,29 @@ commits the scaffold after all required artifacts exist.''';
     final baseline = await buildProjectBaseline(_db, projectId);
     final systemPrompt =
         '$baseline\n\n${defaultSystemPrompt(AgentRole.verificationAgent)}\n\n'
-        'You are the FINAL PASS reviewer. The project compiles and CI is GREEN, '
-        'but that does NOT prove the features are wired up. For EACH requested '
-        'feature below, verify it is genuinely implemented AND reachable in the '
+        'You are the FINAL PASS reviewer. Every requested feature is built and '
+        'merged onto main, but that does NOT prove the features are wired up or '
+        'that the app is a real product. For EACH requested feature below, '
+        'verify it is genuinely implemented AND reachable in the '
         'running app: the UI path that should reach it (entrypoint/home → '
         'button/route/menu/tab) leads to the REAL feature, not a '
         'TODO/placeholder/empty/"coming soon" screen. READ the code — open the '
         'entrypoint (main / home / router) and trace down to each feature. Do NOT '
         'edit anything.\n'
+        'ALSO verify the app is a real PRODUCT, not a bare scaffold — flag as an '
+        'ISSUE any of: (a) NO INTENTIONAL THEME — MaterialApp has no theme/'
+        'darkTheme, or pages rely on raw default colors (no domain-appropriate '
+        'palette); (b) TEMPLATE HOME — the entrypoint/home is the scaffold\'s raw '
+        'list of route paths, not a real screen for the domain; (c) DEAD-END CTA '
+        '— a primary button ("Play", "Continue to X", "Begin…") that only shows a '
+        'snackbar/dialog or does nothing instead of navigating somewhere real or '
+        'changing meaningful state.\n'
         'Output, for EACH feature, exactly one line:\n'
         '  #<pk> OK               — genuinely wired up and reachable.\n'
         '  #<pk> ISSUE: <what is wrong / what should happen instead + the file>\n'
-        'Then a final line: FINALPASS_OK (every feature OK) or FINALPASS_ISSUES.';
+        'Plus one extra ISSUE line per product-level problem found above '
+        '(mark it "#product"). Then a final line: FINALPASS_OK (every feature OK '
+        'and no product-level issues) or FINALPASS_ISSUES.';
 
     final sessionPk = await _db.getOrCreateAgentChatSession(
       projectId,
@@ -5022,6 +5099,11 @@ commits the scaffold after all required artifacts exist.''';
     // list (not a scan-derived defect list), and the agent proactively traces the
     // entrypoint and wires EVERY feature in one pass. Implies [functional].
     bool linkAll = false,
+    // [design]: BUILD PHASE 2 design push — [errors] is the project/task brief.
+    // Widens the fixer's toolset with image generation (it ships real art)
+    // and the web tools (it researches the domain's look), and routes generated
+    // images into the workspace's assets/ folder.
+    bool design = false,
   }) async {
     final persona =
         await _findPersonaForRole(AgentRole.sdeGeneralist) ??
@@ -5055,7 +5137,44 @@ commits the scaffold after all required artifacts exist.''';
       ..writeln(defaultSystemPrompt(AgentRole.sdeGeneralist))
       ..writeln()
       ..writeln(
-        linkAll
+        design
+            ? 'You are the end-of-project DESIGN agent. Every requested feature '
+                  'is ALREADY BUILT and merged onto main — this is a VISUAL & '
+                  'SHELL pass, not a logic pass. As scaffolded the app looks like '
+                  'a bare default-Flutter app: no theme, the home screen is a raw '
+                  'list of route paths, and primary buttons are dead-ends. Make '
+                  'it look like a real, shippable product that belongs in its '
+                  'domain. Work in this order: '
+                  '(1) RESEARCH (keep it brief — at most a handful of web calls): '
+                  'web_search the domain\'s look (e.g. "casino app UI design dark '
+                  'gold theme", "Material 3 custom color scheme") and web_fetch '
+                  'the one or two most useful references. If the web fails, use '
+                  'your own knowledge — do NOT stall on it. Decide: a domain-'
+                  'appropriate palette (dark or light, accent colors), typography '
+                  'feel, and component styles. '
+                  '(2) THEME: write a theme file (e.g. lib/app_theme.dart) with a '
+                  'complete Material 3 theme — ColorScheme, text theme, and styles '
+                  'for cards/buttons/inputs — and wire it into the MaterialApp '
+                  '(theme + darkTheme). From now on every page takes colors from '
+                  'the theme (ColorScheme.of(context)), not raw Colors.x. '
+                  '(3) HOME: replace the template home (the list of raw route '
+                  'paths) with a real home/lobby screen for the domain that links '
+                  'to EVERY feature (e.g. a game lobby: player identity, the games '
+                  'as big tappable tiles, options). '
+                  '(4) RESTYLE: restyle every feature page with the theme (layout, '
+                  'spacing, hierarchy, the domain\'s feel). Do NOT change feature '
+                  'logic. '
+                  '(5) ART: generate 2–4 image assets with generate_image (logo or '
+                  'hero, feature-tile art, a background) — each one is saved into '
+                  'assets/ automatically; declare the assets folder in '
+                  'pubspec.yaml and use the images in the UI. '
+                  '(6) DEAD ENDS: every primary CTA (Play, Continue, Begin…) '
+                  'must actually navigate or change meaningful state. A "Continue '
+                  'to the games" button that only shows a snackbar is a dead end — '
+                  'make it go somewhere real. '
+                  'Commit as you go; you are done when the app is themed, the home '
+                  'screen is real, art is in place, and every CTA leads somewhere.'
+            : linkAll
             ? 'You are the end-of-project LINKING agent. Every requested feature '
                   'below is ALREADY BUILT and merged onto main — this is a WIRING '
                   'pass, NOT a rebuild. In ONE solid pass, go through the WHOLE app '
@@ -5082,7 +5201,7 @@ commits the scaffold after all required artifacts exist.''';
                   'REVIEW that read the actual code — so if it says a feature is '
                   'missing/not-implemented, it GENUINELY is not there (a compiling, '
                   'partly-working file is NOT the same as the feature being done). '
-                  'Three kinds, resolve them ALL: (1) UNIMPLEMENTED STUBS — a '
+                  'Four kinds, resolve them ALL: (1) UNIMPLEMENTED STUBS — a '
                   'TODO/placeholder/empty body/UnimplementedError: build the real '
                   'UI/logic and remove the marker. (2) UNWIRED — the real code '
                   'exists but is unreachable: connect it with the smallest '
@@ -5092,7 +5211,10 @@ commits the scaffold after all required artifacts exist.''';
                   'missing part FOR REAL, even if it needs a refactor — widen the '
                   'enum to a class/sealed hierarchy or add a variant AND update '
                   'every usage (model + provider + screen + widget), add the input '
-                  'UI, etc. '
+                  'UI, etc. (4) PRODUCT-LEVEL — no theme / template home screen / '
+                  'dead-end CTA: fix the specific one flagged (wire the theme '
+                  'into the MaterialApp, build the real home screen, or make the '
+                  'CTA navigate / act for real). '
                   'Before you finish, RE-READ the changed files and CONFIRM the '
                   'EXACT described capability now exists in the code; NEVER commit a '
                   '"implemented/done" message for something you did not actually '
@@ -5187,6 +5309,7 @@ commits the scaffold after all required artifacts exist.''';
       // phase re-runs CI itself, and the generalist persona denies them, so
       // offering them only tempts a blocked call), no task/story/image tools.
       fixMode: true,
+      designMode: design,
       systemPromptOverride: systemPrompt.toString(),
       reasoningEffort: personaReasoningEffort(persona.configJson),
       enableThinking: resolveEnableThinking(
@@ -5198,7 +5321,12 @@ commits the scaffold after all required artifacts exist.''';
       ),
     );
 
-    var kickoff = linkAll
+    var kickoff = design
+        ? 'Design this project now: research its domain\'s look, build the '
+              'theme, build the real home/lobby, restyle every page, add the '
+              'generated art, and make every CTA lead somewhere real. Project '
+              'brief:\n\n$errors'
+        : linkAll
         ? 'These are ALL the requested features. In ONE solid pass, go through the '
               'whole app and make sure EVERY one is wired up and reachable from the '
               'entrypoint — connect any that are orphaned or land on a placeholder, '
@@ -5235,6 +5363,13 @@ commits the scaffold after all required artifacts exist.''';
           session.runTurn(
             kickoff,
             maxToolRounds: 8,
+            // Design pass: generated art lands in the workspace as assets/ so
+            // the agent can reference it in code + pubspec.
+            onImage: design
+                ? (b64, caption) {
+                    unawaited(_saveDesignAsset(b64, caption));
+                  }
+                : null,
             onToolResult: (r) {
               sawTool = true;
               // Did this tool result actually CHANGE the tree (edit/write/commit/

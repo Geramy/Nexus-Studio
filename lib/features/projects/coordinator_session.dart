@@ -211,6 +211,7 @@ class ProjectCoordinatorSession {
     this.discoveryMode = false,
     this.scaffoldMode = false,
     this.fixMode = false,
+    this.designMode = false,
     this.editorMode = false,
   });
 
@@ -229,6 +230,12 @@ class ProjectCoordinatorSession {
   /// CI/build tools) — the Testing phase re-runs CI itself and the generalist
   /// persona denies the CI tools, so the fixer just reads/edits/commits.
   final bool fixMode;
+
+  /// Build-phase-2 DESIGN mode (implies [fixMode]): the same read/edit/commit
+  /// funnel on main, but the toolset is widened with image generation (the
+  /// design pass ships real art assets) and the web tools (it researches how
+  /// the project's domain is styled before inventing a theme).
+  final bool designMode;
 
   // FIX-MODE action funnel, SESSION-scoped (the fixer runs many runTurns per
   // fix round; runTurn-local counters would let it re-draw its read budget
@@ -666,7 +673,9 @@ class ProjectCoordinatorSession {
         : verificationTaskId != null
         ? CoordinatorTools.buildToolSchemas(verificationOnly: true)
         : fixMode
-        ? CoordinatorTools.buildToolSchemas(fixOnly: true)
+        ? (designMode
+              ? CoordinatorTools.buildToolSchemas(designOnly: true)
+              : CoordinatorTools.buildToolSchemas(fixOnly: true))
         : scaffoldMode
         ? CoordinatorTools.buildToolSchemas(scaffoldOnly: true)
         : editorMode
@@ -793,12 +802,21 @@ class ProjectCoordinatorSession {
             : const {'read_file', 'git_commit'};
       } else if (readActions < (fixMode ? 6 : 3)) {
         names = fixMode
-            ? const {
-                'read_file',
-                'read_file_chunk',
-                'search_directory',
-                'search_file_content',
-              }
+            ? designMode
+                ? const {
+                    'read_file',
+                    'read_file_chunk',
+                    'search_directory',
+                    'search_file_content',
+                    'web_fetch',
+                    'web_search',
+                  }
+                : const {
+                    'read_file',
+                    'read_file_chunk',
+                    'search_directory',
+                    'search_file_content',
+                  }
             : const {'read_file'};
       } else if (writeActions == 0) {
         // Fixer: keep read_file OFFERED in the write phases. Its prompt
@@ -807,13 +825,28 @@ class ProjectCoordinatorSession {
         // bloated the history to 500+ messages. The 6-read budget above still
         // fronts the grounding reads; stall protection comes from the
         // orchestrator's no-edit-turns break, not from starving the toolset.
+        // Design mode adds image + web — it generates art assets and consults
+        // references while restyling.
         names = fixMode
-            ? const {
-                'read_file',
-                'read_file_chunk',
-                'write_file',
-                'edit_file',
-              }
+            ? designMode
+                ? const {
+                    'read_file',
+                    'read_file_chunk',
+                    'write_file',
+                    'edit_file',
+                    'create_file',
+                    'create_directory',
+                    'generate_image',
+                    'edit_image',
+                    'web_fetch',
+                    'web_search',
+                  }
+                : const {
+                    'read_file',
+                    'read_file_chunk',
+                    'write_file',
+                    'edit_file',
+                  }
             : const {
                 'write_file',
                 'edit_file',
@@ -822,16 +855,33 @@ class ProjectCoordinatorSession {
               };
       } else if (writeActions >= 3) {
         names = fixMode
-            ? const {'read_file', 'git_commit'}
+            ? designMode
+                ? const {
+                    'read_file',
+                    'write_file',
+                    'edit_file',
+                    'generate_image',
+                    'git_commit',
+                  }
+                : const {'read_file', 'git_commit'}
             : const {'git_commit'};
       } else {
         names = fixMode
-            ? const {
-                'read_file',
-                'write_file',
-                'edit_file',
-                'git_commit',
-              }
+            ? designMode
+                ? const {
+                    'read_file',
+                    'write_file',
+                    'edit_file',
+                    'generate_image',
+                    'edit_image',
+                    'git_commit',
+                  }
+                : const {
+                    'read_file',
+                    'write_file',
+                    'edit_file',
+                    'git_commit',
+                  }
             : const {
                 'write_file',
                 'edit_file',

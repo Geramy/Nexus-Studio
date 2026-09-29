@@ -19,6 +19,11 @@ import 'package:path_provider/path_provider.dart';
 /// restarts, needs no DB schema change, and doesn't pollute the project's git
 /// repo).
 class FinalizeProgress {
+  /// The one-shot DESIGN pass (Build phase 2, step 0) has already run — don't
+  /// redo the whole-app theme/art/lobby pass on a later entry; go straight to
+  /// the (incremental) linking push.
+  bool designDone;
+
   /// The one-shot comprehensive LINKING PUSH (Build phase 2, step 1) has already
   /// run — don't redo the whole-app wiring push on a later entry; go straight
   /// to the (incremental) feature check.
@@ -29,15 +34,21 @@ class FinalizeProgress {
   /// reviews, so each pass only works on what's left.
   final Set<int> verified;
 
-  FinalizeProgress({this.linkDone = false, Set<int>? verified})
+  FinalizeProgress({
+    this.designDone = false,
+    this.linkDone = false,
+    Set<int>? verified,
+  })
     : verified = verified ?? <int>{};
 
   Map<String, dynamic> toJson() => {
+    'designDone': designDone,
     'linkDone': linkDone,
     'verified': verified.toList()..sort(),
   };
 
   factory FinalizeProgress.fromJson(Map<String, dynamic> j) => FinalizeProgress(
+    designDone: j['designDone'] == true,
     linkDone: j['linkDone'] == true,
     verified: {
       for (final v in (j['verified'] as List? ?? const []))
