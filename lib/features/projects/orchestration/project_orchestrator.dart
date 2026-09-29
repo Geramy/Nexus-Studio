@@ -27,7 +27,11 @@ import 'package:nexus_projects_client/infrastructure/models/ui/inference_server.
 import 'package:nexus_projects_client/infrastructure/lemonade/api/types/model_info.dart'
     show ApiModelInfo;
 import 'package:nexus_projects_client/infrastructure/lemonade/services/persona_model_resolver.dart'
-    show resolveAgentChatModel, defaultOmniCollectionForTitle;
+    show
+        resolveAgentChatModel,
+        defaultOmniCollectionForTitle,
+        resolvePersonaModels,
+        firstImageModelId;
 import 'package:nexus_projects_client/infrastructure/lemonade/api/exceptions.dart'
     show LemonadeApiException;
 import 'package:nexus_projects_client/features/ai_providers/providers/ai_servers_cache_provider.dart'
@@ -5310,6 +5314,10 @@ commits the scaffold after all required artifacts exist.''';
       projectName: persona.name,
       db: _db,
       model: resolved.model,
+      // The design pass generates art — point its image tools at the same
+      // image model the interactive chat resolves (persona collection → any
+      // image model the server advertises).
+      imageModel: resolved.imageModel,
       chatSessionPk: sessionPk,
       confirmAsk: (_, _) async => true,
       agentName: persona.name,
@@ -5916,7 +5924,7 @@ commits the scaffold after all required artifacts exist.''';
 
   /// Resolve the inference backend + chat model for [persona] from its connected
   /// server (or the client's first server). Returns null when none exist.
-  Future<({InferenceBackend client, String? model})?> _resolveBackend(
+  Future<({InferenceBackend client, String? model, String? imageModel})?> _resolveBackend(
     AgentPersona persona, {
     int? taskPk,
   }) async {
@@ -5998,6 +6006,30 @@ commits the scaffold after all required artifacts exist.''';
       '"${chosen.name}" model=$model (routed=$routed, collection=$collection)',
     );
 
+    // Image-gen model for the same server: prefer the persona's Omni '
+    // collection image component (or explicit imageGenModel), else any image '
+    // model the server advertises — the same resolution the interactive chat '
+    // uses, so the design pass's generate_image works with the configured '
+    // image backend. Null (no image model on this server) is fine: the tool '
+    // reports it and the pass continues without art.
+    String? imageModel;
+    try {
+      final pm = resolvePersonaModels(
+        omniCollectionModel: collection,
+        llmModel: pLlm,
+        imageGenModel: persona.imageGenModel,
+        models: serverModels,
+      );
+      imageModel = pm.imageGen;
+    } catch (_) {}
+    imageModel ??= firstImageModelId(serverModels);
+    if (imageModel != null) {
+      debugPrint(
+        '[Orchestrator p$projectId] worker "${persona.name}" → imageModel='
+        '$imageModel',
+      );
+    }
+
     final uiServer = ui_server.InferenceServer(
       id: chosen.server_pk.toString(),
       name: chosen.name,
@@ -6029,6 +6061,7 @@ commits the scaffold after all required artifacts exist.''';
         sessionId: sessionId,
       ),
       model: model,
+      imageModel: imageModel,
     );
   }
 }
