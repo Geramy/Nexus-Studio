@@ -5298,7 +5298,6 @@ commits the scaffold after all required artifacts exist.''';
       db: _db,
       model: resolved.model,
       chatSessionPk: sessionPk,
-      permissions: AgentToolPermissions.fromConfigJson(persona.configJson),
       confirmAsk: (_, _) async => true,
       agentName: persona.name,
       workspace: ws,
@@ -5308,6 +5307,17 @@ commits the scaffold after all required artifacts exist.''';
       // File/git ONLY toolset — read/edit/write/commit. No CI/build tools (the
       // phase re-runs CI itself, and the generalist persona denies them, so
       // offering them only tempts a blocked call), no task/story/image tools.
+      // DESIGN MODE EXCEPTION: the design pass is a different job for the same
+      // persona — it must ship generated art, so layer image grants on top of
+      // the persona's lean coder permissions (the normal fixer stays lean).
+      permissions: design
+          ? AgentToolPermissions({
+              ...AgentToolPermissions.fromConfigJson(persona.configJson)
+                  .overrides,
+              'generate_image': ToolPerm.grant,
+              'edit_image': ToolPerm.grant,
+            })
+          : AgentToolPermissions.fromConfigJson(persona.configJson),
       fixMode: true,
       designMode: design,
       systemPromptOverride: systemPrompt.toString(),
