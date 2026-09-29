@@ -743,6 +743,7 @@ class ProjectCoordinatorSession {
             onPlanReview: onPlanReview,
             onImage: onImage,
             workBranch: workBranch,
+            designMode: designMode,
             gitLane: gitLane,
             workTaskId: workTaskId,
             workerWriteRoots: workerWriteRoots,
@@ -2019,6 +2020,7 @@ class ProjectCoordinatorSession {
       verificationTaskId: verificationTaskId,
       claimFile: fileClaim,
       editorMode: editorMode,
+      designMode: designMode,
     );
 
     final results = <String>[];

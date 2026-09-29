@@ -1833,6 +1833,16 @@ class CoordinatorToolExecutor {
   /// the build board. Provenance only — no effect on scheduling/execution.
   final bool editorMode;
 
+  /// True for the end-of-project DESIGN pass. Adds a safety guard: the design
+  /// agent must theme via TARGETED edits (the theme is wired in MaterialApp;
+  /// only hardcoded colors get touched per page). Overwriting a large existing
+  /// file whole is how a "restyle" silently rewrites game logic and breaks the
+  /// build (observed: 19 analyze errors across 3 game pages on p7), so
+  /// write_file onto an existing file over [_designRewriteMaxLines] is refused.
+  final bool designMode;
+
+  static const int _designRewriteMaxLines = 150;
+
   CoordinatorToolExecutor({
     required this.db,
     required this.projectId,
@@ -1859,6 +1869,7 @@ class CoordinatorToolExecutor {
     this.verificationTaskId,
     this.claimFile,
     this.editorMode = false,
+    this.designMode = false,
   });
 
   /// Gate a file mutation through the orchestrator's file-claim queue. Returns a
@@ -3456,6 +3467,18 @@ class CoordinatorToolExecutor {
     if (busy != null) return busy;
     try {
       final existed = await workspace!.exists(path);
+      if (designMode && existed) {
+        final existing = await workspace!.readString(path);
+        final lines = existing.split('\n').length;
+        if (lines > _designRewriteMaxLines) {
+          return 'REFUSED (design mode): "$path" already has $lines lines and '
+              'CANNOT be overwritten whole. Restyling is done with small '
+              'TARGETED edit_file changes to the styling lines only (colors, '
+              'fonts, decoration, padding) — the app theme (wired in '
+              'MaterialApp) styles most widgets automatically. Never rewrite '
+              'a page\'s logic or structure; if it compiles, its logic is done.';
+        }
+      }
       await workspace!.writeString(path, content);
       _recordWorkerEdit(path);
       return '${existed ? 'Updated' : 'Created'} file "$path" (${content.length} chars).';
