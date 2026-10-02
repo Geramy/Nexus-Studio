@@ -74,33 +74,45 @@ class _FileBrowserViewState extends ConsumerState<FileBrowserView> {
   Widget _toolbar(BuildContext context, int projectId, String? viewBranch) {
     final readOnly = viewBranch != null;
     return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 8, 4, 4),
-      child: Row(
-        children: [
-          const Icon(Icons.folder_special_outlined, size: 18),
-          const SizedBox(width: 8),
-          const Expanded(
-            child: Text(
-              'Workspace',
-              style: TextStyle(fontWeight: FontWeight.w600),
-            ),
-          ),
+      padding: const EdgeInsets.fromLTRB(8, 8, 4, 4),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final narrow = constraints.maxWidth < 230;
+          return Row(
+            children: [
+              if (!narrow) ...[
+                const Icon(Icons.folder_special_outlined, size: 18),
+                const SizedBox(width: 8),
+              ],
+              Flexible(
+                child: Text(
+                  'Workspace',
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+              ),
           IconButton(
-            icon: const Icon(Icons.note_add_outlined, size: 18),
+            icon: const Icon(Icons.note_add_outlined, size: 15),
+            iconSize: 15,
+            padding: const EdgeInsets.all(5),
+            constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
             tooltip: readOnly ? 'Read-only branch view' : 'New file',
             onPressed: readOnly
                 ? null
                 : () => _create(context, projectId, parent: '/', isFolder: false),
           ),
           IconButton(
-            icon: const Icon(Icons.create_new_folder_outlined, size: 18),
+            icon: const Icon(Icons.create_new_folder_outlined, size: 15),
+            iconSize: 15,
+            padding: const EdgeInsets.all(5),
+            constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
             tooltip: readOnly ? 'Read-only branch view' : 'New folder',
             onPressed: readOnly
                 ? null
                 : () => _create(context, projectId, parent: '/', isFolder: true),
           ),
           PopupMenuButton<String>(
-            icon: const Icon(Icons.more_vert, size: 18),
+            icon: const Icon(Icons.more_vert, size: 15),
             tooltip: 'Workspace storage',
             itemBuilder: (_) => const [
               PopupMenuItem(
@@ -121,7 +133,9 @@ class _FileBrowserViewState extends ConsumerState<FileBrowserView> {
             ],
             onSelected: (value) => _onStorageMenu(context, projectId, value),
           ),
-        ],
+            ],
+          );
+        },
       ),
     );
   }

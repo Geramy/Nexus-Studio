@@ -54,9 +54,6 @@ class _EditorWorkspaceViewState extends ConsumerState<EditorWorkspaceView> {
     // Editor's `start_delegated_build` (which flips the project to `running`)
     // actually spawns worker agents on this already-completed project.
     ref.watch(projectOrchestratorProvider(widget.projectId));
-    final promptAsync = ref.watch(
-      editorPromptProvider((projectId: widget.projectId, projectName: widget.projectName)),
-    );
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -132,41 +129,73 @@ class _EditorWorkspaceViewState extends ConsumerState<EditorWorkspaceView> {
         ),
         // ── Body: file tree | code/visual | Editor chat ─────────────────────
         Expanded(
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              const SizedBox(width: 300, child: FileBrowserView()),
-              const VerticalDivider(width: 1),
-              _visual
-                  ? Expanded(
-                      child: VisualEditorView(
-                        key: ValueKey('visual-${widget.projectId}'),
-                        projectId: widget.projectId,
-                        onViewCode: () => setState(() => _visual = false),
-                        onOpenChat: () {}, // chat pane is already visible
-                      ),
-                    )
-                  : const Expanded(child: CodeAndGitRightPanel()),
-              const VerticalDivider(width: 1),
-              SizedBox(
-                width: 460,
-                child: promptAsync.when(
-                  loading: () =>
-                      const Center(child: CircularProgressIndicator()),
-                  error: (e, _) => Center(child: Text('Editor error: $e')),
-                  data: (prompt) => StoriesChatSidebar(
-                    key: ValueKey('editor-sidebar-${widget.projectId}'),
-                    projectId: widget.projectId,
-                    projectName: widget.projectName,
-                    editorMode: true,
-                    systemPromptOverride: prompt,
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final wide = constraints.maxWidth >= 1150;
+              return Row(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  wide
+                      ? const SizedBox(width: 300, child: FileBrowserView())
+                      : Flexible(flex: 2, child: FileBrowserView()),
+                  const VerticalDivider(width: 1),
+                  Flexible(
+                    flex: 5,
+                    child: _visual
+                        ? VisualEditorView(
+                            key: ValueKey('visual-${widget.projectId}'),
+                            projectId: widget.projectId,
+                            onViewCode: () => setState(() => _visual = false),
+                            onOpenChat: () {}, // chat pane is already visible
+                          )
+                        : const CodeAndGitRightPanel(),
                   ),
-                ),
-              ),
-            ],
+                  const VerticalDivider(width: 1),
+                  wide
+                      ? SizedBox(
+                          width: 420,
+                          child: _EditorPromptPane(
+                            projectId: widget.projectId,
+                            projectName: widget.projectName,
+                          ),
+                        )
+                      : Flexible(
+                          flex: 3,
+                          child: _EditorPromptPane(
+                            projectId: widget.projectId,
+                            projectName: widget.projectName,
+                          ),
+                        ),
+                ],
+              );
+            },
           ),
         ),
       ],
+    );
+  }
+}
+
+/// The editor's chat sidebar, wired to the project's editor prompt.
+class _EditorPromptPane extends ConsumerWidget {
+  const _EditorPromptPane({required this.projectId, required this.projectName});
+  final int projectId;
+  final String projectName;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final promptAsync = ref.watch(editorPromptProvider(
+        (projectId: projectId, projectName: projectName)));
+    return promptAsync.when(
+      loading: () => const Center(child: CircularProgressIndicator()),
+      error: (e, _) => Center(child: Text('Editor error: $e')),
+      data: (prompt) => StoriesChatSidebar(
+        key: ValueKey('editor-sidebar-$projectId'),
+        projectId: projectId,
+        projectName: projectName,
+        editorMode: true,
+        systemPromptOverride: prompt,
+      ),
     );
   }
 }
