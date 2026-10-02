@@ -247,6 +247,54 @@ Future<_DeterministicEdit?> _deterministicEditAsync({
         return _DeterministicEdit(file, next);
       }
       return null;
+
+    case VisualOpKind.setPadding:
+      final p = op.padding;
+      if (p == null) return null;
+      final t = _fmt(p.$1);
+      final rt = _fmt(p.$2);
+      final b = _fmt(p.$3);
+      final l = _fmt(p.$4);
+      RegExpMatch? m =
+          RegExp(r'EdgeInsets\.all\(\s*[+-]?\d+(?:\.\d+)?\s*\)')
+              .firstMatch(windowText);
+      if (m != null) {
+        final at = windowStart + m.start;
+        final next = content.substring(0, at) +
+            'EdgeInsets.fromLTRB($l, $t, $rt, $b)' +
+            content.substring(at + m.end);
+        return _DeterministicEdit(file, next);
+      }
+      m = RegExp(
+        r'EdgeInsets\.symmetric\(\s*horizontal:\s*[+-]?\d+(?:\.\d+)?\s*,\s*vertical:\s*[+-]?\d+(?:\.\d+)?\s*\)|EdgeInsets\.symmetric\(\s*vertical:\s*[+-]?\d+(?:\.\d+)?\s*,\s*horizontal:\s*[+-]?\d+(?:\.\d+)?\s*\)',
+      ).firstMatch(windowText);
+      if (m != null) {
+        final at = windowStart + m.start;
+        final next = content.substring(0, at) +
+            'EdgeInsets.fromLTRB($l, $t, $rt, $b)' +
+            content.substring(at + m.end);
+        return _DeterministicEdit(file, next);
+      }
+      m = RegExp(
+        r'EdgeInsets\.fromLTRB\(\s*[+-]?\d+(?:\.\d+)?\s*,\s*[+-]?\d+(?:\.\d+)?\s*,\s*[+-]?\d+(?:\.\d+)?\s*,\s*[+-]?\d+(?:\.\d+)?\s*\)',
+      ).firstMatch(windowText);
+      if (m != null) {
+        final at = windowStart + m.start;
+        final next = content.substring(0, at) +
+            'EdgeInsets.fromLTRB($l, $t, $rt, $b)' +
+            content.substring(at + m.end);
+        return _DeterministicEdit(file, next);
+      }
+      m = RegExp(r'EdgeInsets\.only\(\s*(?:\w+:\s*[+-]?\d+(?:\.\d+)?\s*,\s*)+\)')
+          .firstMatch(windowText);
+      if (m != null) {
+        final at = windowStart + m.start;
+        final next = content.substring(0, at) +
+            'EdgeInsets.fromLTRB($l, $t, $rt, $b)' +
+            content.substring(at + m.end);
+        return _DeterministicEdit(file, next);
+      }
+      return null;
   }
 }
 
@@ -279,6 +327,8 @@ String _agentPrompt(VisualOp op) {
       'Visual edit task: replace the image shown in the ${r.label ?? r.widgetType} at $where (screen region $boxDesc) with the asset "${op.assetPath}". Edit only the minimal lines needed; keep the file compiling.',
     VisualOpKind.move =>
       'Visual edit task: move the ${r.label ?? r.widgetType} at $where (screen region $boxDesc) by (${op.dx.round()}, ${op.dy.round()}) pixels — change the surrounding padding/margin/Positioned/alignment, do NOT freeform-position the widget. Edit only the minimal lines needed; keep the file compiling.',
+    VisualOpKind.setPadding =>
+      'Visual edit task: set the padding of the ${r.label ?? r.widgetType} at $where (screen region $boxDesc) to top ${op.padding!.$1.round()}, right ${op.padding!.$2.round()}, bottom ${op.padding!.$3.round()}, left ${op.padding!.$4.round()} — adjust the nearest EdgeInsets/padding/margin, keep the layout sane. Edit only the minimal lines needed; keep the file compiling.',
   };
 }
 

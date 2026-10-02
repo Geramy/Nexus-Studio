@@ -19,6 +19,8 @@ class RectBox {
   bool contains(double px, double py) =>
       px >= x && px < x + w && py >= y && py < y + h;
 
+  double get area => w * h;
+
   Map<String, dynamic> toJson() =>
       {'x': x, 'y': y, 'w': w, 'h': h};
 
@@ -197,7 +199,7 @@ class ScreenMap {
 }
 
 /// A visual edit operation (what the user did) and the result of applying it.
-enum VisualOpKind { setColor, setText, insertImage, replaceImage, move }
+enum VisualOpKind { setColor, setText, insertImage, replaceImage, move, setPadding }
 
 class VisualOp {
   const VisualOp({
@@ -209,6 +211,7 @@ class VisualOp {
     this.assetPath, // workspace path of the image to (re)insert
     this.dx = 0,
     this.dy = 0,
+    this.padding, // (top, right, bottom, left)
   });
 
   final VisualOpKind kind;
@@ -218,6 +221,7 @@ class VisualOp {
   final String? text;
   final String? assetPath;
   final double dx, dy;
+  final (double, double, double, double)? padding;
 
   String get summary {
     final where = region.label ?? region.widgetType;
@@ -232,6 +236,10 @@ class VisualOp {
         return 'replace image in $where';
       case VisualOpKind.move:
         return 'move $where by (${dx.round()}, ${dy.round()})';
+      case VisualOpKind.setPadding:
+        final p = padding!;
+        return 'set padding of $where to '
+            '(t ${p.$1.round()}, r ${p.$2.round()}, b ${p.$3.round()}, l ${p.$4.round()})';
     }
   }
 }

@@ -23,6 +23,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../../infrastructure/workspace/git/git_engine_provider.dart';
 import '../../../../infrastructure/workspace/workspace_provider.dart';
 import 'code_applier.dart';
+import 'live_preview_service.dart';
 import 'region_model.dart';
 import 'screen_map_service.dart';
 import 'source_locator.dart';
@@ -66,6 +67,14 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
   bool _loading = true;
   String? _cacheDirPath;
   ScreenRegion? _dragRegion;
+  // Live preview (phase 2).
+  LivePreviewSession? _live;
+  bool _liveStarting = false;
+  String? _liveStage;
+  double _liveViewW = 0;
+  double _liveViewH = 0;
+  StreamSubscription<Map<String, dynamic>>? _liveSub;
+  ScreenRegion? _liveHover;
 
   @override
   void initState() {
@@ -221,6 +230,12 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
 
       if (outcome.status == OpStatus.applied) {
         unawaited(_recapture());
+        // Live preview (phase 2): rebuild the running web app and reload the
+        // browser so the user sees the change on the live app.
+        final live = _live;
+        if (live != null && !live.isRebuilding) {
+          unawaited(live.rebuildAndReload());
+        }
       }
     } catch (e) {
       if (!mounted) return;
@@ -317,6 +332,7 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
         const PopupMenuItem(value: 2, child: _MenuItem('Edit text…', Icons.text_fields)),
         const PopupMenuItem(value: 3, child: _MenuItem('Insert image…', Icons.image_outlined)),
         const PopupMenuItem(value: 4, child: _MenuItem('Replace image…', Icons.photo_outlined)),
+        const PopupMenuItem(value: 5, child: _MenuItem('Set spacing…', Icons.toc)),
       ],
     ).then((v) {
       if (v == null) return;
@@ -331,29 +347,24 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
           _imageDialog(r, VisualOpKind.insertImage);
         case 4:
           _imageDialog(r, VisualOpKind.replaceImage);
+        case 5:
+          _paddingDialog(r);
       }
     });
   }
 
-  void _colorDialog(ScreenRegion r) {
+  void _colorDialog(ScreenRegion r, {bool allScope = false}) {
     final current = r.colorHex;
     showDialog<void>(
       context: context,
       builder: (ctx) => _ColorDialog(
         current: current,
-        onPick: (hex) {
-          _applyOp(VisualOp(
-            kind: VisualOpKind.setColor,
-            region: r,
-            screenRoute: _currentScreen().route,
-            colorHex: hex,
-          ));
-        },
+        onPick: (hex) => _finishColor(r, hex, allScope: allScope),
       ),
     );
   }
 
-  void _textDialog(ScreenRegion r) {
+  void _textDialog(ScreenRegion r, {bool allScope = false}) {
     final controller = TextEditingController(text: r.text ?? '');
     showDialog<void>(
       context: context,
@@ -371,19 +382,170 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
           ),
           FilledButton(
             onPressed: () {
+              final value = controller.text;
               Navigator.pop(ctx);
-              _applyOp(VisualOp(
-                kind: VisualOpKind.setText,
-                region: r,
-                screenRoute: _currentScreen().route,
-                text: controller.text,
-              ));
+              _finishText(r, value, allScope: allScope);
             },
             child: const Text('Apply'),
           ),
         ],
       ),
     );
+  }
+
+  /// Single-region or (when the widget repeats across screens) ask scope.
+  void _finishColor(ScreenRegion r, String hex, {bool allScope = false}) {
+    final matches = _applyAllMatches(r);
+    if (matches.isEmpty || allScope) {
+      _applyOp(VisualOp(
+        kind: VisualOpKind.setColor,
+        region: r,
+        screenRoute: _currentScreen().route,
+        colorHex: hex,
+      ));
+      return;
+    }
+    _askScope(r, matches.length, onSingle: () {
+      _applyOp(VisualOp(
+        kind: VisualOpKind.setColor,
+        region: r,
+        screenRoute: _currentScreen().route,
+        colorHex: hex,
+      ));
+    }, onAll: () {
+      _applyBatch(VisualOpKind.setColor, colorHex: hex);
+    });
+  }
+
+  void _finishText(ScreenRegion r, String value, {bool allScope = false}) {
+    final matches = _applyAllMatches(r);
+    if (matches.isEmpty || allScope) {
+      _applyOp(VisualOp(
+        kind: VisualOpKind.setText,
+        region: r,
+        screenRoute: _currentScreen().route,
+        text: value,
+      ));
+      return;
+    }
+    _askScope(r, matches.length, onSingle: () {
+      _applyOp(VisualOp(
+        kind: VisualOpKind.setText,
+        region: r,
+        screenRoute: _currentScreen().route,
+        text: value,
+      ));
+    }, onAll: () {
+      _applyBatch(VisualOpKind.setText, text: value);
+    });
+  }
+
+  void _askScope(
+    ScreenRegion r,
+    int count, {
+    required VoidCallback onSingle,
+    required VoidCallback onAll,
+  }) {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Apply to other screens?'),
+        content: Text(
+          'This widget ("${r.label ?? r.widgetType}") also appears on ' 
+          '$count other screen${count == 1 ? '' : 's'}. Apply the change '
+          'everywhere, or just here?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              onSingle();
+            },
+            child: const Text('Just this one'),
+          ),
+          FilledButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              onAll();
+            },
+            child: Text('All $count screens'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Other regions across all screens that look like the same widget as the
+  /// currently selected one (same label + text + color) — "apply to all".
+  /// Returns (screen route, region) pairs.
+  List<(String, ScreenRegion)> _applyAllMatches(ScreenRegion r) {
+    final map = _map;
+    if (map == null) return const [];
+    final out = <(String, ScreenRegion)>[];
+    final seen = <String>{};
+    for (final s in map.screens) {
+      if (s.route == _currentScreen().route) continue;
+      for (final other in s.regions) {
+        if (other.label != r.label || other.text != r.text) continue;
+        if (other.colorHex != r.colorHex) continue;
+        if (!other.hasSource) continue;
+        final key = '${other.sourceFile}:${other.sourceLine}';
+        if (seen.contains(key)) continue;
+        seen.add(key);
+        out.add((s.route, other));
+      }
+    }
+    return out;
+  }
+
+  /// Re-apply [kind] to every matching region on every other screen.
+  /// Sequential; each op is individually committed and guarded.
+  Future<void> _applyBatch(
+    VisualOpKind kind, {
+    String? colorHex,
+    String? text,
+  }) async {
+    final r = _selected;
+    if (_busy || r == null) return;
+    final matches = _applyAllMatches(r);
+    if (matches.isEmpty) return;
+    setState(() => _busy = true);
+    var okCount = 0;
+    var failCount = 0;
+    try {
+      final ws = await ref.read(workspaceFsProvider(widget.projectId).future);
+      final git = await ref.read(gitEngineProvider(widget.projectId).future);
+      for (final (route, m) in matches) {
+        if (!mounted) return;
+        final op = VisualOp(
+          kind: kind,
+          region: m,
+          screenRoute: route,
+          colorHex: colorHex,
+          text: text,
+        );
+        final outcome = await applyVisualOp(ws: ws, git: git, op: op);
+        if (outcome.status == OpStatus.applied) {
+          okCount++;
+        } else {
+          failCount++;
+        }
+      }
+      if (!mounted) return;
+      ref.read(workspaceRevisionProvider(widget.projectId).notifier).state++;
+      _toast('Applied to $okCount of ${matches.length} matching widgets'
+          '${failCount > 0 ? ' — $failCount skipped (unsafe)' : ''}',
+          ok: failCount == 0);
+      unawaited(_recapture());
+      final live = _live;
+      if (live != null && !live.isRebuilding) {
+        unawaited(live.rebuildAndReload());
+      }
+    } catch (e) {
+      if (mounted) _toast('Batch edit failed: $e', ok: false);
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
   }
 
   void _imageDialog(ScreenRegion r, VisualOpKind kind) {
@@ -451,6 +613,77 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
     );
   }
 
+  void _paddingDialog(ScreenRegion r) {
+    final controllers = List.generate(4, (_) => TextEditingController());
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Set spacing (padding)'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Pixels for top, right, bottom, left:',
+                style: TextStyle(fontSize: 12)),
+            const SizedBox(height: 8),
+            Row(children: [
+              for (final (label, c) in [
+                ('T', controllers[0]),
+                ('R', controllers[1]),
+                ('B', controllers[2]),
+                ('L', controllers[3]),
+              ])
+                Padding(
+                  padding: const EdgeInsets.only(right: 8),
+                  child: SizedBox(
+                    width: 64,
+                    child: TextField(
+                      controller: c,
+                      keyboardType:
+                          const TextInputType.numberWithOptions(decimal: true),
+                      decoration: InputDecoration(
+                        labelText: label,
+                        isDense: true,
+                      ),
+                    ),
+                  ),
+                ),
+            ]),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () {
+              final nums = controllers
+                  .map((c) => double.tryParse(c.text.trim()))
+                  .toList();
+              if (nums.any((n) => n == null)) {
+                ScaffoldMessenger.of(ctx).showSnackBar(
+                  const SnackBar(
+                    content: Text('Enter a number for each side.'),
+                  ),
+                );
+                return;
+              }
+              Navigator.pop(ctx);
+              _applyOp(VisualOp(
+                kind: VisualOpKind.setPadding,
+                region: r,
+                screenRoute: _currentScreen().route,
+                padding: (nums[0]!, nums[1]!, nums[2]!, nums[3]!),
+              ));
+            },
+            child: const Text('Apply'),
+          ),
+        ],
+      ),
+    );
+  }
+
   void _toast(String msg, {bool ok = true}) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
@@ -460,6 +693,191 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
     ));
   }
 
+  @override
+  void dispose() {
+    _liveSub?.cancel();
+    _live?.dispose();
+    super.dispose();
+  }
+
+  // ------------------------------------------------------------- live preview
+
+  Future<void> _startLive() async {
+    if (_live != null || _liveStarting) return;
+    setState(() => _liveStarting = true);
+    try {
+      final session = await startLivePreview(
+        ws: await ref.read(workspaceFsProvider(widget.projectId).future),
+        onProgress: (s) {
+          if (mounted) setState(() => _liveStage = s);
+        },
+      );
+      if (!mounted) {
+        await session.dispose();
+        return;
+      }
+      _live = session;
+      _liveSub = session.events.stream.listen(_onLiveEvent);
+      setState(() {
+        _liveStarting = false;
+        _liveStage = null;
+      });
+      await openInBrowser(session.url);
+      _toast('Live preview running: ${session.url} — right-click widgets in the browser.');
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _liveStarting = false;
+        _liveStage = null;
+      });
+      showDialog<void>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Live preview failed'),
+          content: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 560),
+            child: SelectableText(e.toString()),
+          ),
+          actions: [
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Close'),
+            ),
+          ],
+        ),
+      );
+    }
+  }
+
+  Future<void> _stopLive() async {
+    final s = _live;
+    _live = null;
+    await _liveSub?.cancel();
+    _liveSub = null;
+    setState(() {
+      _liveHover = null;
+      _liveStarting = false;
+    });
+    await s?.dispose();
+  }
+
+  /// Browser → studio events (hover/rightclick in CSS px; the harness
+  /// captured at 1280×800, so scale proportionally).
+  void _onLiveEvent(Map<String, dynamic> e) {
+    final type = e['type'];
+    if (!mounted) return;
+    if (type == 'viewport') {
+      _liveViewW = (e['w'] as num?)?.toDouble() ?? 0;
+      _liveViewH = (e['h'] as num?)?.toDouble() ?? 0;
+      return;
+    }
+    final map = _map;
+    if (map == null || _liveViewW <= 0 || _liveViewH <= 0) return;
+    final screen = _currentScreen();
+    final num? x = e['x'] is num ? e['x'] as num : null;
+    final num? y = e['y'] is num ? e['y'] as num : null;
+    if (x == null || y == null) return;
+    // CSS px → harness logical px.
+    final sx = x.toDouble() * (1280 / _liveViewW);
+    final sy = y.toDouble() * (800 / _liveViewH);
+    final point = Offset(sx, sy);
+    final region = _hitTest(screen, point);
+    if (type == 'hover') {
+      final live = _live;
+      if (region == null) {
+        _liveHover = null;
+        live?.send({'type': 'clear'});
+      } else if (!identical(region, _liveHover)) {
+        _liveHover = region;
+        final scale = _liveViewW / 1280;
+        live?.send({
+          'type': 'highlight',
+          'rects': [
+            {
+              'x': region.rect.x * scale,
+              'y': region.rect.y * scale,
+              'w': region.rect.w * scale,
+              'h': region.rect.h * scale,
+            }
+          ],
+        });
+      }
+      if (mounted) setState(() {});
+      return;
+    }
+    if (type == 'rightclick') {
+      if (region == null) {
+        _toast('No recognizable widget at that spot in the live app.', ok: false);
+        return;
+      }
+      setState(() => _selected = region);
+      _showLivePickDialog(region);
+    }
+  }
+
+  /// Deepest (smallest) region containing [p], ignoring near-fullscreen ones.
+  ScreenRegion? _hitTest(CapturedScreen screen, Offset p) {
+    ScreenRegion? best;
+    var bestArea = double.infinity;
+    final screenArea = screen.width * screen.height;
+    for (final r in screen.regions) {
+      if (r.rect.area > screenArea * 0.85) continue;
+      if (!r.rect.contains(p.dx, p.dy)) continue;
+      if (r.rect.area < bestArea) {
+        bestArea = r.rect.area;
+        best = r;
+      }
+    }
+    return best;
+  }
+
+  void _showLivePickDialog(ScreenRegion r) {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Picked: ${r.label ?? r.widgetType}'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (r.text != null) Text('“${r.text}”', style: const TextStyle(fontSize: 13)),
+            if (r.colorHex != null) Text(r.colorHex!, style: const TextStyle(fontSize: 12, fontFamily: 'monospace')),
+            if (r.hasSource)
+              Text('${r.sourceFile}:${r.sourceLine}', style: const TextStyle(fontSize: 12, color: Colors.grey)),
+            const SizedBox(height: 12),
+            Wrap(spacing: 6, runSpacing: 6, children: [
+              _actionBtn(Icons.code, 'View code', () {
+                Navigator.pop(ctx);
+                _viewCode(r);
+              }),
+              _actionBtn(Icons.color_lens, 'Change color…', () {
+                Navigator.pop(ctx);
+                _colorDialog(r);
+              }),
+              _actionBtn(Icons.text_fields, 'Edit text…', () {
+                Navigator.pop(ctx);
+                _textDialog(r);
+              }),
+              _actionBtn(Icons.image_outlined, 'Insert image…', () {
+                Navigator.pop(ctx);
+                _imageDialog(r, VisualOpKind.insertImage);
+              }),
+              _actionBtn(Icons.photo_outlined, 'Replace image…', () {
+                Navigator.pop(ctx);
+                _imageDialog(r, VisualOpKind.replaceImage);
+              }),
+            ]),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+        ],
+      ),
+    );
+  }
   CapturedScreen _currentScreen() =>
       _map!.screens[math.min(_screenIdx, _map!.screens.length - 1)];
 
@@ -558,6 +976,36 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
                 label: const Text('Screens stale — refresh'),
               ),
             const Spacer(),
+            if (_liveStarting)
+              Padding(
+                padding: const EdgeInsets.only(right: 8),
+                child: Text(
+                  _liveStage ?? 'Starting live preview…',
+                  style: TextStyle(fontSize: 11, color: theme.hintColor),
+                ),
+              ),
+            if (_live == null)
+              OutlinedButton.icon(
+                onPressed: _liveStarting || _busy || _recapturing
+                    ? null
+                    : _startLive,
+                icon: const Icon(Icons.play_arrow_outlined, size: 16),
+                label: const Text('Live preview'),
+              )
+            else ...[
+              const SizedBox(width: 6),
+              OutlinedButton.icon(
+                onPressed: () => _stopLive(),
+                icon: const Icon(Icons.stop_outlined, size: 16),
+                label: Text('Live on :${_live!.port}'),
+              ),
+              IconButton(
+                icon: const Icon(Icons.open_in_browser, size: 16),
+                tooltip: 'Open in browser',
+                onPressed: () => openInBrowser(_live!.url),
+              ),
+            ],
+            const SizedBox(width: 6),
             if (_recapturing)
               const Padding(
                 padding: EdgeInsets.only(right: 10),
@@ -838,7 +1286,9 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
         const SizedBox(width: 6),
         Expanded(
           child: Text(
-            hover == null
+            _liveHover != null
+                ? 'In the live app: ${_describe(_liveHover!)}  —  right-click to edit'
+                : hover == null
                 ? 'Hover a widget to inspect it · right-click to edit · shift+drag to move (spacing)'
                 : _describe(hover),
             maxLines: 1,
@@ -1013,10 +1463,17 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
         Wrap(spacing: 6, runSpacing: 6, children: [
           _actionBtn(Icons.color_lens, 'Color', () => _colorDialog(r)),
           _actionBtn(Icons.text_fields, 'Text', () => _textDialog(r)),
+          _actionBtn(Icons.toc, 'Spacing', () => _paddingDialog(r)),
           _actionBtn(Icons.image_outlined, 'Insert image',
               () => _imageDialog(r, VisualOpKind.insertImage)),
           _actionBtn(Icons.photo_outlined, 'Replace image',
               () => _imageDialog(r, VisualOpKind.replaceImage)),
+          if (r.colorHex != null && _applyAllMatches(r).isNotEmpty)
+            _actionBtn(Icons.devices, 'Color → all ${_applyAllMatches(r).length}',
+                () => _colorDialog(r, allScope: true)),
+          if (r.text != null && _applyAllMatches(r).isNotEmpty)
+            _actionBtn(Icons.devices, 'Text → all ${_applyAllMatches(r).length}',
+                () => _textDialog(r, allScope: true)),
         ]),
       ],
     );
