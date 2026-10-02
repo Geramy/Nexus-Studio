@@ -186,6 +186,22 @@ copies the bytes into `assets/` and writes the code.
 
 Each phase is shippable on its own; Phase 0+1 delivers the product promise.
 
+### Status (2026-07-12)
+- **Phase 0 — DONE** (`6d3f07d`). Implemented as the **screenshot harness**
+  (pseudo-run): `debugGetCreateStack` was removed in Flutter 3.47.5, so the
+  harness records text + color + widget-chain per render object and Studio
+  resolves source lines with heuristics; the agent fallback covers misses.
+- **Phase 1 — DONE** (same commit): pick, color/text/image/move ops,
+  two-tier applier, commit + analyze + rollback, per-HEAD screen-map cache,
+  "Launch with Editor" entry on the Overview tab, Code/Visual toggle.
+- **Phase 2 — DONE** (`2bd53fc`): **browser tab** canvas (per your decision —
+  zero new platform deps): `LivePreviewSession` serves a
+  `flutter build web --debug` from the materialized workspace with an injected
+  bridge script (WebSocket) reporting hover/right-click/viewport; edits apply
+  to the real app, then rebuild-and-reload shows the result.
+- **Phase 3 — PARTIAL** (`2bd53fc`): setPadding op ✓, apply-to-all-screens
+  for repeated widgets ✓, inspector ✓; inline font-size edit pending.
+
 ## 6. Risks & honest hard parts
 
 1. **Widget→source fidelity.** Debug creation stacks give *a* file:line, but
