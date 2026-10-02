@@ -152,6 +152,15 @@ class _ProjectWorkspaceViewState extends ConsumerState<ProjectWorkspaceView>
       }
     });
 
+    // "Launch with Editor" (Overview) asks for the User Stories tab — which
+    // IS the Editor workspace once built — in VISUAL mode. The Editor itself
+    // consumes the same bump to flip to its Visual pane.
+    ref.listen<int>(requestVisualEditorProvider, (prev, next) {
+      if (next != (prev ?? 0) && _tabs.index != 0) {
+        _tabs.animateTo(0);
+      }
+    });
+
     if (_wizardOpenedForProject != projectId && setupStatus == 'notStarted') {
       _wizardOpenedForProject = projectId;
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -283,9 +292,53 @@ class _ProjectOverviewTab extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final row = ref.watch(projectRowProvider(projectId)).value;
+    final isBuilt = row?.orchestrationState == 'completed';
     return ListView(
       padding: const EdgeInsets.all(20),
       children: [
+        if (isBuilt) ...[
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Row(
+                children: [
+                  const Icon(Icons.touch_app_outlined, size: 34),
+                  const SizedBox(width: 14),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Visual Editor',
+                          style:
+                              TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          'See the finished screens and change colors, text, '
+                          'images and spacing by pointing — no code needed. '
+                          'Every edit is committed to the project.',
+                          style: TextStyle(
+                              fontSize: 12,
+                              color: Theme.of(context).hintColor),
+                        ),
+                      ],
+                    ),
+                  ),
+                  FilledButton.icon(
+                    onPressed: () => ref
+                        .read(requestVisualEditorProvider.notifier)
+                        .state++,
+                    icon: const Icon(Icons.auto_fix_high, size: 17),
+                    label: const Text('Launch with Editor'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 24),
+        ],
         const Text(
           'Orchestration',
           style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),

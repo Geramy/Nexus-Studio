@@ -994,6 +994,23 @@ class _ProjectCoordinatorChatScreenState
       }
     });
 
+    // The Visual Editor's tier-2 fallback pre-fills the composer with a precise
+    // task prompt when the user asks the assistant to make an edit.
+    ref.listen<String?>(
+      pendingEditorPromptProvider(widget.projectId),
+      (prev, next) {
+        if (next != null) {
+          ref
+              .read(pendingEditorPromptProvider(widget.projectId).notifier)
+              .state = null;
+          _messageController.text = next;
+          _messageController.selection = TextSelection.collapsed(
+            offset: next.length,
+          );
+        }
+      },
+    );
+
     // The chat is hosted by different agents by mode — label the header to match
     // (the Editor is NOT the Coordinator; it just reuses this chat surface).
     final agentLabel = widget.editorMode ? 'Editor' : 'Coordinator';

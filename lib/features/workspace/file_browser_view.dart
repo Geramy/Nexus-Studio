@@ -1054,7 +1054,7 @@ class _FileEditorPanelState extends ConsumerState<FileEditorPanel> {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
         if (selectedPath != _loadedPath || revChanged)
-          _open(fsAsync.value!, selectedPath);
+          _open(fsAsync.value!, selectedPath, projectId);
       });
     }
 
@@ -1176,7 +1176,7 @@ class _FileEditorPanelState extends ConsumerState<FileEditorPanel> {
     );
   }
 
-  Future<void> _open(Workspace fs, String? path) async {
+  Future<void> _open(Workspace fs, String? path, int projectId) async {
     if (path == null) {
       setState(() {
         _loadedPath = null;
@@ -1226,6 +1226,16 @@ class _FileEditorPanelState extends ConsumerState<FileEditorPanel> {
       if (!mounted) return;
       _editor.language = languageModeForPath(path);
       _editor.text = content;
+      // One-shot "jump to line" (Visual Editor → View code): highlight the
+      // requested line once the file is loaded, then consume the request.
+      final jump = ref.read(workspaceJumpLineProvider(projectId));
+      if (jump != null) {
+        ref.read(workspaceJumpLineProvider(projectId).notifier).state = null;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) return;
+          _selectLine(jump);
+        });
+      }
       setState(() {
         _dirty = false;
         _loading = false;
@@ -1238,6 +1248,18 @@ class _FileEditorPanelState extends ConsumerState<FileEditorPanel> {
         context,
       ).showSnackBar(SnackBar(content: Text('Open failed: $e')));
     }
+  }
+
+  void _selectLine(int line) {
+    final text = _editor.text;
+    final lines = text.split('\n');
+    final idx = (line - 1).clamp(0, lines.length - 1);
+    var offset = 0;
+    for (var i = 0; i < idx; i++) {
+      offset += lines[i].length + 1;
+    }
+    final end = offset + lines[idx].length;
+    _editor.selection = TextSelection(baseOffset: offset, extentOffset: end);
   }
 
   Future<void> _save(Workspace fs, int projectId) async {

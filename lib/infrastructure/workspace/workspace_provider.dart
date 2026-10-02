@@ -112,6 +112,20 @@ final selectedWorkspaceFileProvider = StateProvider.family<String?, int>(
   (ref, projectId) => null,
 );
 
+/// One-shot "jump to line" request for the right-panel editor (Visual Editor
+/// → "View code"): the line (1-based) to select once [path] is open. The
+/// editor consumes (resets to null) it after applying.
+final workspaceJumpLineProvider = StateProvider.family<int?, int>(
+  (ref, projectId) => null,
+);
+
+/// One-shot prompt the Visual Editor wants pre-filled into the editor chat
+/// composer (the "send the assistant this exact task" tier-2 fallback). The
+/// chat consumes (resets to null) it on the next build.
+final pendingEditorPromptProvider = StateProvider.family<String?, int>(
+  (ref, projectId) => null,
+);
+
 /// The branch the Code browser is VIEWING read-only — a running task's
 /// `task/<id>` so its in-progress (committed-but-unmerged) work is visible
 /// instead of only after merge. `null` = the live workspace (current branch).
