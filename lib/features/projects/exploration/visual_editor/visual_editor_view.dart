@@ -61,10 +61,21 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
   Offset _dragDelta = Offset.zero;
   bool _busy = false;
   bool _recapturing = false;
+
+  /// Set when a re-capture is requested while one is already running — a full
+  /// catch-up pass is re-armed so quick successive edits always converge.
+  bool _recapturePending = false;
   final List<VisualEditRecord> _records = [];
+
   /// In-memory undo store: recordId → file → original bytes.
   final Map<int, Map<String, List<int>>> _undoStore = {};
   int _capturedRevision = -1;
+
+  /// Instant canvas overlays for applied edits — painted over the (stale)
+  /// screenshot the moment an op lands, so the change is visible in real
+  /// time; cleared when the true re-capture replaces it with a fresh capture.
+  /// Keyed by region id.
+  final Map<String, _OptOverlay> _optimistic = {};
   bool _loading = true;
   String? _cacheDirPath;
   ScreenRegion? _dragRegion;
@@ -97,7 +108,9 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
       final projectId = widget.projectId;
       final git = await ref.read(gitEngineProvider(projectId).future);
       final head = (await git.headOid())?.substring(0, 7) ?? '';
-      ScreenMap? map = force ? null : await loadCachedScreenMap(projectId, head);
+      ScreenMap? map = force
+          ? null
+          : await loadCachedScreenMap(projectId, head);
       if (map == null) {
         map = await buildScreenMap(
           ws: await ref.read(workspaceFsProvider(projectId).future),
@@ -109,17 +122,19 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
         );
       }
       if (!mounted) return;
-      await _resolveSources(map);
-      _capturedRevision =
-          ref.read(workspaceRevisionProvider(projectId));
+      final resolved = await _resolveSources(map);
+      _capturedRevision = ref.read(workspaceRevisionProvider(projectId));
       _cacheDirPath = (await cacheDir(projectId, head)).path;
       setState(() {
-        _map = map;
+        _map = resolved;
+        _optimistic.clear(); // a fresh full capture supersedes any pre-paints
         _loading = false;
         _screenIdx = 0;
       });
     } catch (e) {
-      print('[VisualEditor] capture failed for project ${widget.projectId}: $e');
+      print(
+        '[VisualEditor] capture failed for project ${widget.projectId}: $e',
+      );
       if (e is ScreenMapError && e.log.isNotEmpty) {
         final lines = e.log.split('\n');
         final tail = lines.length > 40
@@ -138,29 +153,30 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
 
   /// Reverse-map every region to a source file:line using the workspace
   /// sources (text / color / widget-chain heuristics).
-  Future<void> _resolveSources(ScreenMap map) async {
-    final index =
-        await SourceIndex.build(await ref.read(workspaceFsProvider(widget.projectId).future));
+  Future<ScreenMap> _resolveSources(ScreenMap map) async {
+    final index = await SourceIndex.build(
+      await ref.read(workspaceFsProvider(widget.projectId).future),
+    );
     final screens = <CapturedScreen>[];
     for (final s in map.screens) {
       final regions = <ScreenRegion>[];
       for (final r in s.regions) {
         final loc = index.locate(s.route, r);
-        regions.add(loc == null
-            ? r
-            : r.copyWithSource(loc.$1, loc.$2));
+        regions.add(loc == null ? r : r.copyWithSource(loc.$1, loc.$2));
       }
-      screens.add(CapturedScreen(
-        route: s.route,
-        label: s.label,
-        pngFile: s.pngFile,
-        width: s.width,
-        height: s.height,
-        regions: regions,
-        error: s.error,
-      ));
+      screens.add(
+        CapturedScreen(
+          route: s.route,
+          label: s.label,
+          pngFile: s.pngFile,
+          width: s.width,
+          height: s.height,
+          regions: regions,
+          error: s.error,
+        ),
+      );
     }
-    _map = ScreenMap(
+    return ScreenMap(
       projectId: map.projectId,
       head: map.head,
       screens: screens,
@@ -185,7 +201,8 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
       if (regionFile != null) {
         originals[regionFile] = await ws.readBytes(regionFile);
       }
-      final isImageOp = op.kind == VisualOpKind.insertImage ||
+      final isImageOp =
+          op.kind == VisualOpKind.insertImage ||
           op.kind == VisualOpKind.replaceImage;
       if (isImageOp) {
         if (await ws.exists('/pubspec.yaml')) {
@@ -195,7 +212,8 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
 
       // Image ops: the user picked a host file; copy its bytes into the
       // workspace assets first.
-      if (isImageOp && op.assetPath != null &&
+      if (isImageOp &&
+          op.assetPath != null &&
           op.assetPath!.startsWith('/host:')) {
         final hostFile = File(op.assetPath!.substring('/host:'.length));
         final bytes = await hostFile.readAsBytes();
@@ -222,26 +240,28 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
       if (outcome.status == OpStatus.applied && regionFile != null) {
         _undoStore[rec.id] = originals;
       }
-      _toast(
-        switch (outcome.status) {
-          OpStatus.applied => 'Applied ✓ — re-capturing screens…',
-          OpStatus.rolledBack =>
-            'Rolled back (would not compile): ${outcome.reason ?? ''}',
-          OpStatus.needsAgent => 'Sent to the assistant — review & send in chat',
-        },
-        ok: outcome.status == OpStatus.applied,
-      );
+      _toast(switch (outcome.status) {
+        OpStatus.applied => 'Applied ✓ — re-capturing screens…',
+        OpStatus.rolledBack =>
+          'Rolled back (would not compile): ${outcome.reason ?? ''}',
+        OpStatus.needsAgent => 'Sent to the assistant — review & send in chat',
+      }, ok: outcome.status == OpStatus.applied);
 
       if (outcome.status == OpStatus.needsAgent) {
-        ref
-            .read(pendingEditorPromptProvider(projectId).notifier)
-            .state = outcome.agentPrompt;
+        ref.read(pendingEditorPromptProvider(projectId).notifier).state =
+            outcome.agentPrompt;
         widget.onOpenChat();
         return;
       }
 
       if (outcome.status == OpStatus.applied) {
-        unawaited(_recapture());
+        // Instant visual feedback: pre-paint the change on the canvas so the
+        // user sees it NOW; the true re-capture replaces it shortly after.
+        final ov = _optimisticFor(op);
+        if (ov != null) {
+          setState(() => _optimistic[op.region.id] = ov);
+        }
+        unawaited(_recapture(route: op.screenRoute));
         // Live preview (phase 2): rebuild the running web app and reload the
         // browser so the user sees the change on the live app.
         final live = _live;
@@ -257,26 +277,91 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
     }
   }
 
+  /// The instant canvas overlay for a just-applied [op] — or null when there
+  /// is nothing sensible to pre-paint (spacing / image ops).
+  _OptOverlay? _optimisticFor(VisualOp op) {
+    final r = op.region.rect;
+    switch (op.kind) {
+      case VisualOpKind.setColor:
+        final hex = op.colorHex ?? '';
+        if (!VisualEditorHelpers.validHex(hex)) return null;
+        final isText =
+            op.region.widgetType.contains('RenderParagraph') ||
+            op.region.text != null;
+        return _OptOverlay(
+          r,
+          VisualEditorHelpers.parse(hex),
+          !isText,
+          op.screenRoute,
+        );
+      case VisualOpKind.setText:
+        return _OptOverlay(
+          r,
+          Theme.of(context).colorScheme.primary,
+          false,
+          op.screenRoute,
+        );
+      case VisualOpKind.move:
+      case VisualOpKind.setPadding:
+      case VisualOpKind.insertImage:
+      case VisualOpKind.replaceImage:
+        return null;
+    }
+  }
+
   /// Re-run the harness after a change so the canvas reflects the new code.
-  Future<void> _recapture() async {
-    if (_recapturing) return;
+  /// When [route] is given, only that screen is re-pumped (the rest are
+  /// seeded from the previous capture) — much faster; falls back to a full
+  /// capture if the single-screen pass can't run.
+  Future<void> _recapture({String? route}) async {
+    if (_recapturing) {
+      _recapturePending = true; // a catch-up full pass will run when this one
+      return; // finishes, so this edit isn't silently skipped
+    }
     setState(() => _recapturing = true);
     try {
       final projectId = widget.projectId;
+      final ws = await ref.read(workspaceFsProvider(projectId).future);
       final git = await ref.read(gitEngineProvider(projectId).future);
       final head = (await git.headOid())?.substring(0, 7) ?? '';
-      final map = await buildScreenMap(
-        ws: await ref.read(workspaceFsProvider(projectId).future),
+      Future<ScreenMap> full() => buildScreenMap(
+        ws: ws,
         projectId: projectId,
         head: head,
         onProgress: (s) {
           if (mounted && _map != null) setState(() {}); // no-op, keep alive
         },
       );
+      ScreenMap map;
+      if (route != null) {
+        try {
+          map = await recaptureOneScreen(
+            ws: ws,
+            projectId: projectId,
+            head: head,
+            route: route,
+            onProgress: (s) {
+              if (mounted && _map != null) setState(() {});
+            },
+          );
+        } catch (_) {
+          map = await full(); // fall back to a full re-capture
+        }
+      } else {
+        map = await full();
+      }
       if (!mounted) return;
-      await _resolveSources(map);
+      final resolved = await _resolveSources(map);
       setState(() {
-        _map = map;
+        _map = resolved;
+        // Clear only the overlays for the screen(s) now freshly captured: a
+        // single-screen pass leaves the others (seeded) stale, so their
+        // pre-paints stay visible until they too are re-captured.
+        if (route == null) {
+          _optimistic.clear();
+        } else {
+          _optimistic.removeWhere((_, ov) => ov.route == route);
+        }
         _capturedRevision = ref.read(workspaceRevisionProvider(projectId));
       });
       _toast('Screens refreshed ✓');
@@ -284,14 +369,20 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
       if (mounted) _toast('Re-capture failed: $e', ok: false);
     } finally {
       if (mounted) setState(() => _recapturing = false);
+      if (_recapturePending && mounted) {
+        _recapturePending = false;
+        unawaited(_recapture()); // full pass to converge every screen
+      }
     }
   }
 
   Future<void> _undo(VisualEditRecord rec) async {
     final originals = _undoStore[rec.id];
     if (originals == null) {
-      _toast('Nothing to undo in this session (restart-safe undo is coming).',
-          ok: false);
+      _toast(
+        'Nothing to undo in this session (restart-safe undo is coming).',
+        ok: false,
+      );
       return;
     }
     setState(() => _busy = true);
@@ -301,9 +392,7 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
       for (final e in originals.entries) {
         await ws.writeBytes(e.key, e.value);
       }
-      await git.commitAll(
-        message: 'Undo visual edit: ${rec.opSummary}',
-      );
+      await git.commitAll(message: 'Undo visual edit: ${rec.opSummary}');
       ref.read(workspaceRevisionProvider(widget.projectId).notifier).state++;
       _toast('Undone ✓ — re-capturing…');
       unawaited(_recapture());
@@ -319,8 +408,10 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
   void _viewCode(ScreenRegion r) {
     final f = r.sourceFile;
     if (f == null || r.sourceLine == null) {
-      _toast('No source location found for this widget — ask the assistant instead.',
-          ok: false);
+      _toast(
+        'No source location found for this widget — ask the assistant instead.',
+        ok: false,
+      );
       return;
     }
     ref.read(selectedWorkspaceFileProvider(widget.projectId).notifier).state =
@@ -339,12 +430,30 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
         Offset.zero & MediaQuery.of(context).size,
       ),
       items: [
-        const PopupMenuItem(value: 0, child: _MenuItem('View code', Icons.code)),
-        const PopupMenuItem(value: 1, child: _MenuItem('Change color…', Icons.color_lens)),
-        const PopupMenuItem(value: 2, child: _MenuItem('Edit text…', Icons.text_fields)),
-        const PopupMenuItem(value: 3, child: _MenuItem('Insert image…', Icons.image_outlined)),
-        const PopupMenuItem(value: 4, child: _MenuItem('Replace image…', Icons.photo_outlined)),
-        const PopupMenuItem(value: 5, child: _MenuItem('Set spacing…', Icons.toc)),
+        const PopupMenuItem(
+          value: 0,
+          child: _MenuItem('View code', Icons.code),
+        ),
+        const PopupMenuItem(
+          value: 1,
+          child: _MenuItem('Change color…', Icons.color_lens),
+        ),
+        const PopupMenuItem(
+          value: 2,
+          child: _MenuItem('Edit text…', Icons.text_fields),
+        ),
+        const PopupMenuItem(
+          value: 3,
+          child: _MenuItem('Insert image…', Icons.image_outlined),
+        ),
+        const PopupMenuItem(
+          value: 4,
+          child: _MenuItem('Replace image…', Icons.photo_outlined),
+        ),
+        const PopupMenuItem(
+          value: 5,
+          child: _MenuItem('Set spacing…', Icons.toc),
+        ),
       ],
     ).then((v) {
       if (v == null) return;
@@ -409,47 +518,65 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
   void _finishColor(ScreenRegion r, String hex, {bool allScope = false}) {
     final matches = _applyAllMatches(r);
     if (matches.isEmpty || allScope) {
-      _applyOp(VisualOp(
-        kind: VisualOpKind.setColor,
-        region: r,
-        screenRoute: _currentScreen().route,
-        colorHex: hex,
-      ));
+      _applyOp(
+        VisualOp(
+          kind: VisualOpKind.setColor,
+          region: r,
+          screenRoute: _currentScreen().route,
+          colorHex: hex,
+        ),
+      );
       return;
     }
-    _askScope(r, matches.length, onSingle: () {
-      _applyOp(VisualOp(
-        kind: VisualOpKind.setColor,
-        region: r,
-        screenRoute: _currentScreen().route,
-        colorHex: hex,
-      ));
-    }, onAll: () {
-      _applyBatch(VisualOpKind.setColor, colorHex: hex);
-    });
+    _askScope(
+      r,
+      matches.length,
+      onSingle: () {
+        _applyOp(
+          VisualOp(
+            kind: VisualOpKind.setColor,
+            region: r,
+            screenRoute: _currentScreen().route,
+            colorHex: hex,
+          ),
+        );
+      },
+      onAll: () {
+        _applyBatch(VisualOpKind.setColor, colorHex: hex);
+      },
+    );
   }
 
   void _finishText(ScreenRegion r, String value, {bool allScope = false}) {
     final matches = _applyAllMatches(r);
     if (matches.isEmpty || allScope) {
-      _applyOp(VisualOp(
-        kind: VisualOpKind.setText,
-        region: r,
-        screenRoute: _currentScreen().route,
-        text: value,
-      ));
+      _applyOp(
+        VisualOp(
+          kind: VisualOpKind.setText,
+          region: r,
+          screenRoute: _currentScreen().route,
+          text: value,
+        ),
+      );
       return;
     }
-    _askScope(r, matches.length, onSingle: () {
-      _applyOp(VisualOp(
-        kind: VisualOpKind.setText,
-        region: r,
-        screenRoute: _currentScreen().route,
-        text: value,
-      ));
-    }, onAll: () {
-      _applyBatch(VisualOpKind.setText, text: value);
-    });
+    _askScope(
+      r,
+      matches.length,
+      onSingle: () {
+        _applyOp(
+          VisualOp(
+            kind: VisualOpKind.setText,
+            region: r,
+            screenRoute: _currentScreen().route,
+            text: value,
+          ),
+        );
+      },
+      onAll: () {
+        _applyBatch(VisualOpKind.setText, text: value);
+      },
+    );
   }
 
   void _askScope(
@@ -463,7 +590,7 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
       builder: (ctx) => AlertDialog(
         title: const Text('Apply to other screens?'),
         content: Text(
-          'This widget ("${r.label ?? r.widgetType}") also appears on ' 
+          'This widget ("${r.label ?? r.widgetType}") also appears on '
           '$count other screen${count == 1 ? '' : 's'}. Apply the change '
           'everywhere, or just here?',
         ),
@@ -545,9 +672,11 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
       }
       if (!mounted) return;
       ref.read(workspaceRevisionProvider(widget.projectId).notifier).state++;
-      _toast('Applied to $okCount of ${matches.length} matching widgets'
-          '${failCount > 0 ? ' — $failCount skipped (unsafe)' : ''}',
-          ok: failCount == 0);
+      _toast(
+        'Applied to $okCount of ${matches.length} matching widgets'
+        '${failCount > 0 ? ' — $failCount skipped (unsafe)' : ''}',
+        ok: failCount == 0,
+      );
       unawaited(_recapture());
       final live = _live;
       if (live != null && !live.isRebuilding) {
@@ -567,9 +696,9 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setDlg) => AlertDialog(
-          title: Text(kind == VisualOpKind.insertImage
-              ? 'Insert image'
-              : 'Replace image'),
+          title: Text(
+            kind == VisualOpKind.insertImage ? 'Insert image' : 'Replace image',
+          ),
           content: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -579,15 +708,17 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
                 style: TextStyle(fontSize: 12),
               ),
               const SizedBox(height: 8),
-              Row(children: [
-                Expanded(
-                  child: TextField(
-                    controller: controller,
-                    autofocus: true,
-                    onChanged: (v) => setDlg(() => hostPath = v.trim()),
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: controller,
+                      autofocus: true,
+                      onChanged: (v) => setDlg(() => hostPath = v.trim()),
+                    ),
                   ),
-                ),
-              ],),
+                ],
+              ),
               if (controller.text.trim().isNotEmpty &&
                   !File(_expandHome(controller.text.trim())).existsSync())
                 const Padding(
@@ -610,12 +741,14 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
                   : () {
                       final p = hostPath!;
                       Navigator.pop(ctx);
-                      _applyOp(VisualOp(
-                        kind: kind,
-                        region: r,
-                        screenRoute: _currentScreen().route,
-                        assetPath: '/host:$p',
-                      ));
+                      _applyOp(
+                        VisualOp(
+                          kind: kind,
+                          region: r,
+                          screenRoute: _currentScreen().route,
+                          assetPath: '/host:$p',
+                        ),
+                      );
                     },
               child: const Text('Use image'),
             ),
@@ -635,32 +768,37 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text('Pixels for top, right, bottom, left:',
-                style: TextStyle(fontSize: 12)),
+            const Text(
+              'Pixels for top, right, bottom, left:',
+              style: TextStyle(fontSize: 12),
+            ),
             const SizedBox(height: 8),
-            Row(children: [
-              for (final (label, c) in [
-                ('T', controllers[0]),
-                ('R', controllers[1]),
-                ('B', controllers[2]),
-                ('L', controllers[3]),
-              ])
-                Padding(
-                  padding: const EdgeInsets.only(right: 8),
-                  child: SizedBox(
-                    width: 64,
-                    child: TextField(
-                      controller: c,
-                      keyboardType:
-                          const TextInputType.numberWithOptions(decimal: true),
-                      decoration: InputDecoration(
-                        labelText: label,
-                        isDense: true,
+            Row(
+              children: [
+                for (final (label, c) in [
+                  ('T', controllers[0]),
+                  ('R', controllers[1]),
+                  ('B', controllers[2]),
+                  ('L', controllers[3]),
+                ])
+                  Padding(
+                    padding: const EdgeInsets.only(right: 8),
+                    child: SizedBox(
+                      width: 64,
+                      child: TextField(
+                        controller: c,
+                        keyboardType: const TextInputType.numberWithOptions(
+                          decimal: true,
+                        ),
+                        decoration: InputDecoration(
+                          labelText: label,
+                          isDense: true,
+                        ),
                       ),
                     ),
                   ),
-                ),
-            ]),
+              ],
+            ),
           ],
         ),
         actions: [
@@ -682,12 +820,14 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
                 return;
               }
               Navigator.pop(ctx);
-              _applyOp(VisualOp(
-                kind: VisualOpKind.setPadding,
-                region: r,
-                screenRoute: _currentScreen().route,
-                padding: (nums[0]!, nums[1]!, nums[2]!, nums[3]!),
-              ));
+              _applyOp(
+                VisualOp(
+                  kind: VisualOpKind.setPadding,
+                  region: r,
+                  screenRoute: _currentScreen().route,
+                  padding: (nums[0]!, nums[1]!, nums[2]!, nums[3]!),
+                ),
+              );
             },
             child: const Text('Apply'),
           ),
@@ -698,11 +838,13 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
 
   void _toast(String msg, {bool ok = true}) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: Text(msg),
-      backgroundColor: ok ? null : Theme.of(context).colorScheme.error,
-      duration: const Duration(seconds: 4),
-    ));
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(msg),
+        backgroundColor: ok ? null : Theme.of(context).colorScheme.error,
+        duration: const Duration(seconds: 4),
+      ),
+    );
   }
 
   @override
@@ -735,7 +877,9 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
         _liveStage = null;
       });
       await openInBrowser(session.url);
-      _toast('Live preview running: ${session.url} — right-click widgets in the browser.');
+      _toast(
+        'Live preview running: ${session.url} — right-click widgets in the browser.',
+      );
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -810,7 +954,7 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
               'y': region.rect.y * scale,
               'w': region.rect.w * scale,
               'h': region.rect.h * scale,
-            }
+            },
           ],
         });
       }
@@ -819,7 +963,10 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
     }
     if (type == 'rightclick') {
       if (region == null) {
-        _toast('No recognizable widget at that spot in the live app.', ok: false);
+        _toast(
+          'No recognizable widget at that spot in the live app.',
+          ok: false,
+        );
         return;
       }
       setState(() => _selected = region);
@@ -852,33 +999,45 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            if (r.text != null) Text('“${r.text}”', style: const TextStyle(fontSize: 13)),
-            if (r.colorHex != null) Text(r.colorHex!, style: const TextStyle(fontSize: 12, fontFamily: 'monospace')),
+            if (r.text != null)
+              Text('“${r.text}”', style: const TextStyle(fontSize: 13)),
+            if (r.colorHex != null)
+              Text(
+                r.colorHex!,
+                style: const TextStyle(fontSize: 12, fontFamily: 'monospace'),
+              ),
             if (r.hasSource)
-              Text('${r.sourceFile}:${r.sourceLine}', style: const TextStyle(fontSize: 12, color: Colors.grey)),
+              Text(
+                '${r.sourceFile}:${r.sourceLine}',
+                style: const TextStyle(fontSize: 12, color: Colors.grey),
+              ),
             const SizedBox(height: 12),
-            Wrap(spacing: 6, runSpacing: 6, children: [
-              _actionBtn(Icons.code, 'View code', () {
-                Navigator.pop(ctx);
-                _viewCode(r);
-              }),
-              _actionBtn(Icons.color_lens, 'Change color…', () {
-                Navigator.pop(ctx);
-                _colorDialog(r);
-              }),
-              _actionBtn(Icons.text_fields, 'Edit text…', () {
-                Navigator.pop(ctx);
-                _textDialog(r);
-              }),
-              _actionBtn(Icons.image_outlined, 'Insert image…', () {
-                Navigator.pop(ctx);
-                _imageDialog(r, VisualOpKind.insertImage);
-              }),
-              _actionBtn(Icons.photo_outlined, 'Replace image…', () {
-                Navigator.pop(ctx);
-                _imageDialog(r, VisualOpKind.replaceImage);
-              }),
-            ]),
+            Wrap(
+              spacing: 6,
+              runSpacing: 6,
+              children: [
+                _actionBtn(Icons.code, 'View code', () {
+                  Navigator.pop(ctx);
+                  _viewCode(r);
+                }),
+                _actionBtn(Icons.color_lens, 'Change color…', () {
+                  Navigator.pop(ctx);
+                  _colorDialog(r);
+                }),
+                _actionBtn(Icons.text_fields, 'Edit text…', () {
+                  Navigator.pop(ctx);
+                  _textDialog(r);
+                }),
+                _actionBtn(Icons.image_outlined, 'Insert image…', () {
+                  Navigator.pop(ctx);
+                  _imageDialog(r, VisualOpKind.insertImage);
+                }),
+                _actionBtn(Icons.photo_outlined, 'Replace image…', () {
+                  Navigator.pop(ctx);
+                  _imageDialog(r, VisualOpKind.replaceImage);
+                }),
+              ],
+            ),
           ],
         ),
         actions: [
@@ -890,6 +1049,7 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
       ),
     );
   }
+
   CapturedScreen _currentScreen() =>
       _map!.screens[math.min(_screenIdx, _map!.screens.length - 1)];
 
@@ -972,118 +1132,121 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
         Container(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
           decoration: BoxDecoration(
-            border: Border(
-              bottom: BorderSide(color: theme.dividerColor),
-            ),
+            border: Border(bottom: BorderSide(color: theme.dividerColor)),
           ),
-          child: Row(children: [
-            const Icon(Icons.photo_library_outlined, size: 18),
-            const SizedBox(width: 8),
-            Text('Visual Editor', style: theme.textTheme.titleSmall),
-            const SizedBox(width: 16),
-            if (stale && !_recapturing)
-              TextButton.icon(
-                onPressed: () => _recapture(),
-                icon: const Icon(Icons.refresh, size: 14),
-                label: const Text('Screens stale — refresh'),
-              ),
-            const Spacer(),
-            if (_liveStarting)
-              Padding(
-                padding: const EdgeInsets.only(right: 8),
-                child: Text(
-                  _liveStage ?? 'Starting live preview…',
-                  style: TextStyle(fontSize: 11, color: theme.hintColor),
+          child: Row(
+            children: [
+              const Icon(Icons.photo_library_outlined, size: 18),
+              const SizedBox(width: 8),
+              Text('Visual Editor', style: theme.textTheme.titleSmall),
+              const SizedBox(width: 16),
+              if (stale && !_recapturing)
+                TextButton.icon(
+                  onPressed: () => _recapture(),
+                  icon: const Icon(Icons.refresh, size: 14),
+                  label: const Text('Screens stale — refresh'),
                 ),
-              ),
-            if (_live == null)
-              OutlinedButton.icon(
-                onPressed: _liveStarting || _busy || _recapturing
-                    ? null
-                    : _startLive,
-                icon: const Icon(Icons.play_arrow_outlined, size: 16),
-                label: const Text('Live preview'),
-              )
-            else ...[
+              const Spacer(),
+              if (_liveStarting)
+                Padding(
+                  padding: const EdgeInsets.only(right: 8),
+                  child: Text(
+                    _liveStage ?? 'Starting live preview…',
+                    style: TextStyle(fontSize: 11, color: theme.hintColor),
+                  ),
+                ),
+              if (_live == null)
+                OutlinedButton.icon(
+                  onPressed: _liveStarting || _busy || _recapturing
+                      ? null
+                      : _startLive,
+                  icon: const Icon(Icons.play_arrow_outlined, size: 16),
+                  label: const Text('Live preview'),
+                )
+              else ...[
+                const SizedBox(width: 6),
+                OutlinedButton.icon(
+                  onPressed: () => _stopLive(),
+                  icon: const Icon(Icons.stop_outlined, size: 16),
+                  label: Text('Live on :${_live!.port}'),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.open_in_browser, size: 16),
+                  tooltip: 'Open in browser',
+                  onPressed: () => openInBrowser(_live!.url),
+                ),
+              ],
               const SizedBox(width: 6),
-              OutlinedButton.icon(
-                onPressed: () => _stopLive(),
-                icon: const Icon(Icons.stop_outlined, size: 16),
-                label: Text('Live on :${_live!.port}'),
-              ),
-              IconButton(
-                icon: const Icon(Icons.open_in_browser, size: 16),
-                tooltip: 'Open in browser',
-                onPressed: () => openInBrowser(_live!.url),
+              if (_recapturing)
+                const Padding(
+                  padding: EdgeInsets.only(right: 10),
+                  child: SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                ),
+              if (_busy)
+                const Padding(
+                  padding: EdgeInsets.only(right: 10),
+                  child: SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                ),
+              Tooltip(
+                message: 'Capture the screens again from the current code',
+                child: IconButton(
+                  icon: const Icon(Icons.refresh, size: 18),
+                  onPressed: _busy || _recapturing
+                      ? null
+                      : () => _load(force: true),
+                  tooltip: 'Re-capture screens',
+                ),
               ),
             ],
-            const SizedBox(width: 6),
-            if (_recapturing)
-              const Padding(
-                padding: EdgeInsets.only(right: 10),
-                child: SizedBox(
-                  width: 14,
-                  height: 14,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                ),
-              ),
-            if (_busy)
-              const Padding(
-                padding: EdgeInsets.only(right: 10),
-                child: SizedBox(
-                  width: 14,
-                  height: 14,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                ),
-              ),
-            Tooltip(
-              message: 'Capture the screens again from the current code',
-              child: IconButton(
-                icon: const Icon(Icons.refresh, size: 18),
-                onPressed: _busy || _recapturing ? null : () => _load(force: true),
-                tooltip: 'Re-capture screens',
-              ),
-            ),
-          ]),
+          ),
         ),
         Expanded(
-          child: Row(children: [
-            // Screens rail (drag-resizable).
-            SizedBox(
-              width: _railW,
-              child: ListView.builder(
-                padding: const EdgeInsets.all(8),
-                itemCount: map.screens.length,
-                itemBuilder: (context, i) => _railTile(i),
-              ),
-            ),
-            DraggableVerticalDivider(
-              onDelta: (dx) => setState(() {
-                _railW = (_railW + dx).clamp(96.0, 320.0);
-              }),
-            ),
-            // Canvas + status bar.
-            Expanded(
-              child: Column(children: [
-                Expanded(
-                  child: screen.error != null && screen.pngFile.isEmpty
-                      ? _screenError(screen)
-                      : _canvas(screen),
+          child: Row(
+            children: [
+              // Screens rail (drag-resizable).
+              SizedBox(
+                width: _railW,
+                child: ListView.builder(
+                  padding: const EdgeInsets.all(8),
+                  itemCount: map.screens.length,
+                  itemBuilder: (context, i) => _railTile(i),
                 ),
-                _statusBar(screen),
-              ]),
-            ),
-            DraggableVerticalDivider(
-              onDelta: (dx) => setState(() {
-                _inspW = (_inspW + dx).clamp(220.0, 560.0);
-              }),
-            ),
-            // Inspector + ops log (drag-resizable).
-            SizedBox(
-              width: _inspW,
-              child: _sidePanel(context, screen),
-            ),
-          ]),
+              ),
+              DraggableVerticalDivider(
+                onDelta: (dx) => setState(() {
+                  _railW = (_railW + dx).clamp(96.0, 320.0);
+                }),
+              ),
+              // Canvas + status bar.
+              Expanded(
+                child: Column(
+                  children: [
+                    Expanded(
+                      child: screen.error != null && screen.pngFile.isEmpty
+                          ? _screenError(screen)
+                          : _canvas(screen),
+                    ),
+                    _statusBar(screen),
+                  ],
+                ),
+              ),
+              DraggableVerticalDivider(
+                onDelta: (dx) => setState(() {
+                  _inspW = (_inspW + dx).clamp(220.0, 560.0);
+                }),
+              ),
+              // Inspector + ops log (drag-resizable).
+              SizedBox(width: _inspW, child: _sidePanel(context, screen)),
+            ],
+          ),
         ),
       ],
     );
@@ -1116,7 +1279,8 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
                 height: 66,
                 child: s.pngFile.isEmpty
                     ? const Center(
-                        child: Icon(Icons.broken_image_outlined, size: 18))
+                        child: Icon(Icons.broken_image_outlined, size: 18),
+                      )
                     : Image.file(
                         png,
                         width: 112,
@@ -1126,26 +1290,31 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
                       ),
               ),
               Padding(
-                padding: const EdgeInsets.symmetric(
-                    horizontal: 6, vertical: 4),
-                child: Row(children: [
-                  if (s.error != null)
-                    const Icon(Icons.warning_amber,
-                        size: 12, color: Colors.orange),
-                  const SizedBox(width: 4),
-                  Expanded(
-                    child: Text(
-                      s.label,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: 11,
-                        fontWeight:
-                            selected ? FontWeight.w700 : FontWeight.w400,
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                child: Row(
+                  children: [
+                    if (s.error != null)
+                      const Icon(
+                        Icons.warning_amber,
+                        size: 12,
+                        color: Colors.orange,
+                      ),
+                    const SizedBox(width: 4),
+                    Expanded(
+                      child: Text(
+                        s.label,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: selected
+                              ? FontWeight.w700
+                              : FontWeight.w400,
+                        ),
                       ),
                     ),
-                  ),
-                ]),
+                  ],
+                ),
               ),
             ],
           ),
@@ -1167,8 +1336,10 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
           children: [
             const Icon(Icons.broken_image_outlined, size: 32),
             const SizedBox(height: 8),
-            Text('This screen could not be captured.',
-                style: Theme.of(context).textTheme.bodyMedium),
+            Text(
+              'This screen could not be captured.',
+              style: Theme.of(context).textTheme.bodyMedium,
+            ),
             const SizedBox(height: 4),
             Text(
               (s.error ?? '').length > 160
@@ -1204,47 +1375,74 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
               onPointerDown: (e) => _canvasPointerDown(screen, e),
               onPointerUp: (_) => _shiftDragEnd(),
               onPointerCancel: (_) => _shiftDragEnd(),
-              child: Stack(children: [
-                Positioned(
-                  left: 0,
-                  top: 0,
-                  child: Image.file(
-                    _pngPath(screen),
-                    width: w,
-                    height: h,
-                    gaplessPlayback: true,
-                  ),
-                ),
-                // Hover outline (single, from canvas-level hit testing).
-                if (_hover != null)
+              child: Stack(
+                children: [
                   Positioned(
-                    left: _hover!.rect.x,
-                    top: _hover!.rect.y,
-                    width: _hover!.rect.w,
-                    height: _hover!.rect.h,
-                    child: Container(
-                      decoration: BoxDecoration(
-                        border: Border.all(
-                            color:
-                                Theme.of(context).colorScheme.primary, width: 2),
-                      ),
+                    left: 0,
+                    top: 0,
+                    child: Image.file(
+                      _pngPath(screen),
+                      width: w,
+                      height: h,
+                      gaplessPlayback: true,
                     ),
                   ),
-                // Move preview.
-                if (dragging && _selected != null)
-                  Positioned(
-                    left: _selected!.rect.x + _dragDelta.dx,
-                    top: _selected!.rect.y + _dragDelta.dy,
-                    width: _selected!.rect.w,
-                    height: _selected!.rect.h,
-                    child: Container(
-                      decoration: BoxDecoration(
-                        color: Colors.blue.withValues(alpha: 0.12),
-                        border: Border.all(color: Colors.blue, width: 1.5),
+                  // Optimistic edit overlays — the real-time layer painted the
+                  // instant an op lands, until the true re-capture replaces it.
+                  ...screen.regions.where((r) => _optimistic[r.id] != null).map(
+                    (r) {
+                      final ov = _optimistic[r.id]!;
+                      return Positioned(
+                        left: ov.rect.x,
+                        top: ov.rect.y,
+                        width: ov.rect.w,
+                        height: ov.rect.h,
+                        child: Container(
+                          decoration: BoxDecoration(
+                            color: ov.solid
+                                ? ov.color.withValues(alpha: 0.9)
+                                : ov.color.withValues(alpha: 0.32),
+                            border: Border.all(
+                              color: Theme.of(context).colorScheme.primary,
+                              width: 2,
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                  // Hover outline (single, from canvas-level hit testing).
+                  if (_hover != null)
+                    Positioned(
+                      left: _hover!.rect.x,
+                      top: _hover!.rect.y,
+                      width: _hover!.rect.w,
+                      height: _hover!.rect.h,
+                      child: Container(
+                        decoration: BoxDecoration(
+                          border: Border.all(
+                            color: Theme.of(context).colorScheme.primary,
+                            width: 2,
+                          ),
+                        ),
                       ),
                     ),
-                  ),
-              ]),
+                  // Move preview.
+                  if (dragging && _selected != null)
+                    Positioned(
+                      left: _selected!.rect.x + _dragDelta.dx,
+                      top: _selected!.rect.y + _dragDelta.dy,
+                      width: _selected!.rect.w,
+                      height: _selected!.rect.h,
+                      child: Container(
+                        decoration: BoxDecoration(
+                          color: Colors.blue.withValues(alpha: 0.12),
+                          border: Border.all(color: Colors.blue, width: 1.5),
+                        ),
+                      ),
+                    ),
+                ],
+              ),
             ),
           ),
         ),
@@ -1315,13 +1513,15 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
       _dragDelta = Offset.zero;
     });
     if (r == null || delta.distance < 8) return;
-    _applyOp(VisualOp(
-      kind: VisualOpKind.move,
-      region: r,
-      screenRoute: _currentScreen().route,
-      dx: delta.dx,
-      dy: delta.dy,
-    ));
+    _applyOp(
+      VisualOp(
+        kind: VisualOpKind.move,
+        region: r,
+        screenRoute: _currentScreen().route,
+        dx: delta.dx,
+        dy: delta.dy,
+      ),
+    );
   }
 
   Widget _statusBar(CapturedScreen screen) {
@@ -1331,32 +1531,34 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
       decoration: BoxDecoration(
         border: Border(top: BorderSide(color: Theme.of(context).dividerColor)),
       ),
-      child: Row(children: [
-        const SizedBox(width: 10),
-        Icon(
-          hover == null ? Icons.touch_app_outlined : Icons.crop_square,
-          size: 13,
-          color: Theme.of(context).hintColor,
-        ),
-        const SizedBox(width: 6),
-        Expanded(
-          child: Text(
-            _liveHover != null
-                ? 'In the live app: ${_describe(_liveHover!)}  —  right-click to edit'
-                : hover == null
-                ? 'Hover a widget to inspect it · right-click to edit · shift+drag to move (spacing)'
-                : _describe(hover),
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(fontSize: 11),
+      child: Row(
+        children: [
+          const SizedBox(width: 10),
+          Icon(
+            hover == null ? Icons.touch_app_outlined : Icons.crop_square,
+            size: 13,
+            color: Theme.of(context).hintColor,
           ),
-        ),
-        Text(
-          '${screen.regions.length} widgets',
-          style: TextStyle(fontSize: 11, color: Theme.of(context).hintColor),
-        ),
-        const SizedBox(width: 10),
-      ]),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              _liveHover != null
+                  ? 'In the live app: ${_describe(_liveHover!)}  —  right-click to edit'
+                  : hover == null
+                  ? 'Hover a widget to inspect it · right-click to edit · shift+drag to move (spacing)'
+                  : _describe(hover),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 11),
+            ),
+          ),
+          Text(
+            '${screen.regions.length} widgets',
+            style: TextStyle(fontSize: 11, color: Theme.of(context).hintColor),
+          ),
+          const SizedBox(width: 10),
+        ],
+      ),
     );
   }
 
@@ -1369,101 +1571,112 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
 
   Widget _sidePanel(BuildContext context, CapturedScreen screen) {
     final theme = Theme.of(context);
-    return Column(children: [
-      // Inspector.
-      Expanded(
-        flex: 3,
-        child: _selected == null
-            ? Center(
-                child: Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: Text(
-                    'Right-click a widget on the canvas to inspect and edit it.',
-                    style: TextStyle(
-                        fontSize: 12, color: theme.hintColor),
-                    textAlign: TextAlign.center,
-                  ),
-                ),
-              )
-            : _inspector(_selected!),
-      ),
-      const Divider(height: 1),
-      // Ops log.
-      Expanded(
-        flex: 2,
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
-              child: Text('Edit history', style: theme.textTheme.titleSmall),
-            ),
-            Expanded(
-              child: _records.isEmpty
-                  ? Center(
-                      child: Text('No edits yet.',
-                          style: TextStyle(
-                              fontSize: 12, color: theme.hintColor)))
-                  : ListView.builder(
-                      padding: const EdgeInsets.symmetric(horizontal: 8),
-                      itemCount: _records.length,
-                      itemBuilder: (context, i) {
-                        final rec = _records[i];
-                        return Container(
-                          margin: const EdgeInsets.only(bottom: 6),
-                          padding: const EdgeInsets.all(8),
-                          decoration: BoxDecoration(
-                            color: rec.ok
-                                ? theme.colorScheme.surfaceContainerLow
-                                : theme.colorScheme.errorContainer,
-                            borderRadius: BorderRadius.circular(6),
-                          ),
-                          child: Row(children: [
-                            Icon(
-                              rec.ok
-                                  ? Icons.check_circle_outline
-                                  : Icons.replay,
-                              size: 15,
-                            ),
-                            const SizedBox(width: 6),
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text(
-                                    rec.opSummary,
-                                    maxLines: 2,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: const TextStyle(fontSize: 11),
-                                  ),
-                                  if (rec.detail != null)
-                                    Text(
-                                      rec.detail!,
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: const TextStyle(
-                                          fontSize: 10,
-                                          color: Colors.grey),
-                                    ),
-                                ],
-                              ),
-                            ),
-                            if (rec.ok && i == 0 &&
-                                _undoStore.containsKey(rec.id))
-                              IconButton(
-                                icon: const Icon(Icons.undo, size: 15),
-                                tooltip: 'Undo this edit',
-                                onPressed: () => _undo(rec),
-                              ),
-                          ]),
-                        );
-                      },
+    return Column(
+      children: [
+        // Inspector.
+        Expanded(
+          flex: 3,
+          child: _selected == null
+              ? Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Text(
+                      'Right-click a widget on the canvas to inspect and edit it.',
+                      style: TextStyle(fontSize: 12, color: theme.hintColor),
+                      textAlign: TextAlign.center,
                     ),
-            ),
-          ],
+                  ),
+                )
+              : _inspector(_selected!),
         ),
-      ),
-    ]);
+        const Divider(height: 1),
+        // Ops log.
+        Expanded(
+          flex: 2,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+                child: Text('Edit history', style: theme.textTheme.titleSmall),
+              ),
+              Expanded(
+                child: _records.isEmpty
+                    ? Center(
+                        child: Text(
+                          'No edits yet.',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: theme.hintColor,
+                          ),
+                        ),
+                      )
+                    : ListView.builder(
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                        itemCount: _records.length,
+                        itemBuilder: (context, i) {
+                          final rec = _records[i];
+                          return Container(
+                            margin: const EdgeInsets.only(bottom: 6),
+                            padding: const EdgeInsets.all(8),
+                            decoration: BoxDecoration(
+                              color: rec.ok
+                                  ? theme.colorScheme.surfaceContainerLow
+                                  : theme.colorScheme.errorContainer,
+                              borderRadius: BorderRadius.circular(6),
+                            ),
+                            child: Row(
+                              children: [
+                                Icon(
+                                  rec.ok
+                                      ? Icons.check_circle_outline
+                                      : Icons.replay,
+                                  size: 15,
+                                ),
+                                const SizedBox(width: 6),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        rec.opSummary,
+                                        maxLines: 2,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: const TextStyle(fontSize: 11),
+                                      ),
+                                      if (rec.detail != null)
+                                        Text(
+                                          rec.detail!,
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: const TextStyle(
+                                            fontSize: 10,
+                                            color: Colors.grey,
+                                          ),
+                                        ),
+                                    ],
+                                  ),
+                                ),
+                                if (rec.ok &&
+                                    i == 0 &&
+                                    _undoStore.containsKey(rec.id))
+                                  IconButton(
+                                    icon: const Icon(Icons.undo, size: 15),
+                                    tooltip: 'Undo this edit',
+                                    onPressed: () => _undo(rec),
+                                  ),
+                              ],
+                            ),
+                          );
+                        },
+                      ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
   }
 
   Widget _inspector(ScreenRegion r) {
@@ -1471,65 +1684,88 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
     return ListView(
       padding: const EdgeInsets.all(12),
       children: [
-        Row(children: [
-          Expanded(
-            child: Text(
-              r.label ?? r.widgetType,
-              style: theme.textTheme.titleSmall,
-              overflow: TextOverflow.ellipsis,
-            ),
-          ),
-          if (r.hasSource)
-            Tooltip(
-              message: 'Open in the code editor',
-              child: IconButton(
-                icon: const Icon(Icons.code, size: 16),
-                tooltip: 'View code',
-                onPressed: () => _viewCode(r),
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                r.label ?? r.widgetType,
+                style: theme.textTheme.titleSmall,
+                overflow: TextOverflow.ellipsis,
               ),
             ),
-        ]),
+            if (r.hasSource)
+              Tooltip(
+                message: 'Open in the code editor',
+                child: IconButton(
+                  icon: const Icon(Icons.code, size: 16),
+                  tooltip: 'View code',
+                  onPressed: () => _viewCode(r),
+                ),
+              ),
+          ],
+        ),
         _kv('Type', r.widgetType),
         if (r.text != null) _kv('Text', r.text!),
         if (r.colorHex != null)
-          Row(children: [
-            const SizedBox(width: 34),
-            SizedBox(
-              width: 14,
-              height: 14,
-              child: ColoredBox(
-                color: _parseColor(r.colorHex!),
-                child: Container(
-                  decoration: BoxDecoration(
-                    border: Border.all(color: theme.dividerColor),
+          Row(
+            children: [
+              const SizedBox(width: 34),
+              SizedBox(
+                width: 14,
+                height: 14,
+                child: ColoredBox(
+                  color: _parseColor(r.colorHex!),
+                  child: Container(
+                    decoration: BoxDecoration(
+                      border: Border.all(color: theme.dividerColor),
+                    ),
                   ),
                 ),
               ),
-            ),
-            const SizedBox(width: 6),
-            Text(r.colorHex!,
-                style: const TextStyle(
-                    fontFamily: 'monospace', fontSize: 11)),
-          ]),
-        _kv('Box',
-            '${r.rect.x.round()},${r.rect.y.round()} ${r.rect.w.round()}×${r.rect.h.round()}'),
+              const SizedBox(width: 6),
+              Text(
+                r.colorHex!,
+                style: const TextStyle(fontFamily: 'monospace', fontSize: 11),
+              ),
+            ],
+          ),
+        _kv(
+          'Box',
+          '${r.rect.x.round()},${r.rect.y.round()} ${r.rect.w.round()}×${r.rect.h.round()}',
+        ),
         if (r.hasSource) _kv('Source', '${r.sourceFile}:${r.sourceLine}'),
         const SizedBox(height: 10),
-        Wrap(spacing: 6, runSpacing: 6, children: [
-          _actionBtn(Icons.color_lens, 'Color', () => _colorDialog(r)),
-          _actionBtn(Icons.text_fields, 'Text', () => _textDialog(r)),
-          _actionBtn(Icons.toc, 'Spacing', () => _paddingDialog(r)),
-          _actionBtn(Icons.image_outlined, 'Insert image',
-              () => _imageDialog(r, VisualOpKind.insertImage)),
-          _actionBtn(Icons.photo_outlined, 'Replace image',
-              () => _imageDialog(r, VisualOpKind.replaceImage)),
-          if (r.colorHex != null && _applyAllMatches(r).isNotEmpty)
-            _actionBtn(Icons.devices, 'Color → all ${_applyAllMatches(r).length}',
-                () => _colorDialog(r, allScope: true)),
-          if (r.text != null && _applyAllMatches(r).isNotEmpty)
-            _actionBtn(Icons.devices, 'Text → all ${_applyAllMatches(r).length}',
-                () => _textDialog(r, allScope: true)),
-        ]),
+        Wrap(
+          spacing: 6,
+          runSpacing: 6,
+          children: [
+            _actionBtn(Icons.color_lens, 'Color', () => _colorDialog(r)),
+            _actionBtn(Icons.text_fields, 'Text', () => _textDialog(r)),
+            _actionBtn(Icons.toc, 'Spacing', () => _paddingDialog(r)),
+            _actionBtn(
+              Icons.image_outlined,
+              'Insert image',
+              () => _imageDialog(r, VisualOpKind.insertImage),
+            ),
+            _actionBtn(
+              Icons.photo_outlined,
+              'Replace image',
+              () => _imageDialog(r, VisualOpKind.replaceImage),
+            ),
+            if (r.colorHex != null && _applyAllMatches(r).isNotEmpty)
+              _actionBtn(
+                Icons.devices,
+                'Color → all ${_applyAllMatches(r).length}',
+                () => _colorDialog(r, allScope: true),
+              ),
+            if (r.text != null && _applyAllMatches(r).isNotEmpty)
+              _actionBtn(
+                Icons.devices,
+                'Text → all ${_applyAllMatches(r).length}',
+                () => _textDialog(r, allScope: true),
+              ),
+          ],
+        ),
       ],
     );
   }
@@ -1542,13 +1778,13 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
         children: [
           SizedBox(
             width: 34,
-            child: Text(k, style: const TextStyle(fontSize: 11, color: Colors.grey)),
+            child: Text(
+              k,
+              style: const TextStyle(fontSize: 11, color: Colors.grey),
+            ),
           ),
           Expanded(
-            child: SelectableText(
-              v,
-              style: const TextStyle(fontSize: 11),
-            ),
+            child: SelectableText(v, style: const TextStyle(fontSize: 11)),
           ),
         ],
       ),
@@ -1565,9 +1801,7 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
 
   ui.Color _parseColor(String hex) {
     final h = hex.replaceAll('#', '');
-    return ui.Color(
-      int.parse(h.length == 8 ? h : 'FF$h', radix: 16),
-    );
+    return ui.Color(int.parse(h.length == 8 ? h : 'FF$h', radix: 16));
   }
 }
 
@@ -1582,11 +1816,9 @@ class _MenuItem extends StatelessWidget {
   final IconData icon;
   @override
   Widget build(BuildContext context) {
-    return Row(children: [
-      Icon(icon, size: 16),
-      const SizedBox(width: 10),
-      Text(label),
-    ]);
+    return Row(
+      children: [Icon(icon, size: 16), const SizedBox(width: 10), Text(label)],
+    );
   }
 }
 
@@ -1596,58 +1828,81 @@ class _ColorDialog extends StatelessWidget {
   final ValueChanged<String> onPick;
 
   static const _swatches = <String>[
-    '#1E1B4B', '#312E81', '#4C1D95', '#134E4A', '#14532D',
-    '#7F1D1D', '#713F12', '#422006', '#1F2937', '#111827',
-    '#FFFFFF', '#F9FAFB', '#E5E7EB', '#D1D5DB', '#FDE68A',
-    '#FCA5A5', '#BBF7D0', '#BFDBFE', '#FBCFE8', '#DDD6FE',
-    '#F59E0B', '#EF4444', '#10B981', '#3B82F6', '#8B5CF6', '#EC4899',
+    '#1E1B4B',
+    '#312E81',
+    '#4C1D95',
+    '#134E4A',
+    '#14532D',
+    '#7F1D1D',
+    '#713F12',
+    '#422006',
+    '#1F2937',
+    '#111827',
+    '#FFFFFF',
+    '#F9FAFB',
+    '#E5E7EB',
+    '#D1D5DB',
+    '#FDE68A',
+    '#FCA5A5',
+    '#BBF7D0',
+    '#BFDBFE',
+    '#FBCFE8',
+    '#DDD6FE',
+    '#F59E0B',
+    '#EF4444',
+    '#10B981',
+    '#3B82F6',
+    '#8B5CF6',
+    '#EC4899',
   ];
 
   @override
   Widget build(BuildContext context) {
     final controller = TextEditingController(text: current ?? '');
     return AlertDialog(
-        title: const Text('Change color'),
-        content: SizedBox(
-          width: 320,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              GridView.count(
-                crossAxisCount: 8,
-                shrinkWrap: true,
-                mainAxisSpacing: 6,
-                crossAxisSpacing: 6,
-                childAspectRatio: 1,
-                physics: const NeverScrollableScrollPhysics(),
-                children: [
-                  for (final hex in _swatches)
-                    GestureDetector(
-                      onTap: () {
-                        Navigator.pop(context);
-                        onPick(hex);
-                      },
-                      child: MouseRegion(
-                        cursor: SystemMouseCursors.click,
-                        child: Container(
-                          decoration: BoxDecoration(
-                            color: VisualEditorHelpers.parse(hex),
-                            border: Border.all(
-                              color: (current ?? '').toUpperCase() ==
-                                      hex.toUpperCase()
-                                  ? Colors.blue
-                                  : Colors.grey.shade400,
-                              width: 2,
-                            ),
-                            borderRadius: BorderRadius.circular(4),
+      title: const Text('Change color'),
+      content: SizedBox(
+        width: 320,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            GridView.count(
+              crossAxisCount: 8,
+              shrinkWrap: true,
+              mainAxisSpacing: 6,
+              crossAxisSpacing: 6,
+              childAspectRatio: 1,
+              physics: const NeverScrollableScrollPhysics(),
+              children: [
+                for (final hex in _swatches)
+                  GestureDetector(
+                    onTap: () {
+                      Navigator.pop(context);
+                      onPick(hex);
+                    },
+                    child: MouseRegion(
+                      cursor: SystemMouseCursors.click,
+                      child: Container(
+                        decoration: BoxDecoration(
+                          color: VisualEditorHelpers.parse(hex),
+                          border: Border.all(
+                            color:
+                                (current ?? '').toUpperCase() ==
+                                    hex.toUpperCase()
+                                ? Colors.blue
+                                : Colors.grey.shade400,
+                            width: 2,
                           ),
+                          borderRadius: BorderRadius.circular(4),
                         ),
                       ),
                     ),
-                ],
-              ),
-              const SizedBox(height: 12),
-              Row(children: [
+                  ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
                 Expanded(
                   child: TextField(
                     controller: controller,
@@ -1657,27 +1912,28 @@ class _ColorDialog extends StatelessWidget {
                     ),
                   ),
                 ),
-              ],),
-            ],
-          ),
+              ],
+            ),
+          ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () {
-              final v = controller.text.trim();
-              final hex = v.startsWith('#') ? v : '#$v';
-              if (VisualEditorHelpers.validHex(hex)) {
-                Navigator.pop(context);
-                onPick(hex.toUpperCase());
-              }
-            },
-            child: const Text('Apply'),
-          ),
-        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () {
+            final v = controller.text.trim();
+            final hex = v.startsWith('#') ? v : '#$v';
+            if (VisualEditorHelpers.validHex(hex)) {
+              Navigator.pop(context);
+              onPick(hex.toUpperCase());
+            }
+          },
+          child: const Text('Apply'),
+        ),
+      ],
     );
   }
 }
@@ -1688,8 +1944,18 @@ class VisualEditorHelpers {
 
   static ui.Color parse(String hex) {
     final h = hex.replaceAll('#', '');
-    return ui.Color(int.parse(
-        h.length >= 8 ? h : 'FF$h',
-        radix: 16));
+    return ui.Color(int.parse(h.length >= 8 ? h : 'FF$h', radix: 16));
   }
+}
+
+/// A transient paint applied to the canvas the instant an edit is applied —
+/// the "real-time" layer that stands in for the screenshot until the true
+/// re-capture lands. [solid] → near-opaque fill (a box's new background);
+/// not-solid → a translucent tint (a text region's new glyph colour).
+class _OptOverlay {
+  const _OptOverlay(this.rect, this.color, this.solid, this.route);
+  final RectBox rect;
+  final Color color;
+  final bool solid;
+  final String route; // the screen this overlay belongs to
 }
