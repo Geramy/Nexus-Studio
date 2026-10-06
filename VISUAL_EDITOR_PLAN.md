@@ -217,6 +217,25 @@ Each phase is shippable on its own; Phase 0+1 delivers the product promise.
   relabeled **Agent** (user-input-first, agent in the side). Also wrapped the
   editor's main `Row` in `Expanded` — it had unbounded height, which bled the
   canvas paint over the adjacent panels (the "glitching over other panels").
+- **Capture fidelity** (`5145418`): `pushNamed` left the previous route
+  painted beneath the new one, so the region walk captured the hidden
+  route-list. Switched to `pushReplacementNamed` (each screen is the sole
+  route). Region colour is now **pixel-sampled** from the rasterized image
+  (captures painted backgrounds from AppBar/ColoredBox/Container/buttons/
+  any widget, not just `RenderDecoratedBox`), and each text region records
+  its **glyph colour** (`textColor`) and each box its **first descendant
+  text** (`childText`) — both are strong source anchors.
+- **Deterministic edits without the AI** (`5145418`): simple changes — set
+  colour, retype text, nudge spacing — are now surgical one-line source edits
+  applied **instantly**, no agent round-trip. The agent is the fallback only
+  when no confident, well-anchored pattern exists. Matching is
+  **whole-file nearest-to-anchor** (replaced the fixed ±14-line window +
+  first-match that mis-targeted repeated colours); added text-colour and
+  background-colour ops with broad colour forms (`const Color`, `Colors.x`
+  [`.shadeN`], `Theme.of(...).colorScheme.x`). The pure String→String edit
+  ops live in `deterministic_edit_ops.dart` and are unit-tested against
+  realistic generated source. Post-edit guard is a ~50 ms `dart format`
+  parse-check (replaced materialize + `pub get` + `flutter analyze`).
 
 ## 6. Risks & honest hard parts
 
