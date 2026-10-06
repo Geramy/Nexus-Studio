@@ -115,6 +115,14 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
         _screenIdx = 0;
       });
     } catch (e) {
+      print('[VisualEditor] capture failed for project ${widget.projectId}: $e');
+      if (e is ScreenMapError && e.log.isNotEmpty) {
+        final lines = e.log.split('\n');
+        final tail = lines.length > 40
+            ? lines.sublist(lines.length - 40)
+            : lines;
+        print('[VisualEditor] harness log tail:\n${tail.join('\n')}');
+      }
       if (!mounted) return;
       setState(() {
         _loading = false;

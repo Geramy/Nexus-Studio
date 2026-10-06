@@ -101,6 +101,7 @@ Future<ScreenMap> buildScreenMap({
         '',
       );
     }
+    print('[ScreenMap] project=$projectId head=$head appDir=$appDir');
     final pubspecFile = File('$appDir${Platform.pathSeparator}pubspec.yaml');
     final pubspec = await pubspecFile.readAsString();
     final pkgName = parsePubspecName(pubspec);
@@ -145,7 +146,14 @@ Future<ScreenMap> buildScreenMap({
 
     final jsonFile = File('$outDir${Platform.pathSeparator}screens.json');
     final ok = await jsonFile.exists();
+    print('[ScreenMap] harness exit=${run.exitCode} jsonWritten=$ok '
+        'output=${run.output.length} chars');
     if (!ok || run.exitCode != 0) {
+      final lines = run.output.split('\n');
+      final tail = lines.length > 40
+          ? lines.sublist(lines.length - 40)
+          : lines;
+      print('[ScreenMap] FAILED — log tail:\n${tail.join('\n')}');
       throw ScreenMapError(
         ok
             ? 'Screen capture reported a failure (exit ${run.exitCode}).'

@@ -39,10 +39,17 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:$packageName/main.dart' as app;
+
+class HarnessRoute {
+  const HarnessRoute(this.name, this.label);
+  final String name;
+  final String label;
+}
 
 const String _outDir = r'$outDir';
 
@@ -57,6 +64,9 @@ Future<void> main() async {
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
+    await tester.runAsync(() async {
+      Directory(_outDir).createSync(recursive: true);
+    });
     _mockCommonPlugins();
     try {
       app.main();
@@ -66,6 +76,7 @@ Future<void> main() async {
     // Bounded settle — apps with endless animations must not hang us.
     for (var i = 0; i < 20; i++) {
       await tester.pump(const Duration(milliseconds: 120));
+      tester.takeException(); // drain — see per-route loop
     }
     final screens = <Map<String, dynamic>>[];
     var idx = 0;
@@ -82,14 +93,30 @@ Future<void> main() async {
           }
           nav.pushNamed(route.name);
         }
+        // Pump; DRAIN exceptions every frame. The app under capture may have
+        // real layout/render bugs (thrown every frame) — we record them on
+        // the screen and keep going; we never fail the capture over them.
+        String? exception;
         for (var i = 0; i < 25; i++) {
           await tester.pump(const Duration(milliseconds: 120));
+          final ex = tester.takeException();
+          if (ex != null) exception = ex.toString().split('\\n').first;
         }
-        final exception = tester.takeException();
-        final img = await _captureRoot(tester);
-        final bytes = (await img.toByteData(
-          format: ui.ImageByteFormat.png,
-        ))!.buffer.asUint8List();
+        // Rasterization is real async — it must run in a real-async zone or
+        // the fake-async test zone deadlocks (the classic golden-test hang).
+        final img = await tester.runAsync(() async {
+          final layer = tester.binding.renderView.debugLayer!;
+          if (layer is! OffsetLayer) {
+            throw StateError(
+                'unsupported root layer type \${layer.runtimeType}');
+          }
+          return layer.toImage(tester.binding.renderView.paintBounds);
+        });
+        final bytes = (await tester.runAsync(
+                () async => (await img!.toByteData(
+                            format: ui.ImageByteFormat.png))!
+                        .buffer
+                        .asUint8List()))!;
         await tester.runAsync(() async {
           await File('\$_outDir/\$pngName').writeAsBytes(bytes);
         });
@@ -111,6 +138,10 @@ Future<void> main() async {
         screens.add(_errScreen(route, '\$e'));
       }
     }
+    // Drain any final pending exceptions so the test framework never fails
+    // the capture over app-side render bugs.
+    Object? leftover;
+    while ((leftover = tester.takeException()) != null) {}
     await tester.runAsync(() async {
       await File('\$_outDir/screens.json')
           .writeAsString(jsonEncode(screens));
@@ -137,23 +168,6 @@ NavigatorState? _navigator(WidgetTester tester) {
   }
 }
 
-Future<ui.Image> _captureRoot(WidgetTester tester) async {
-  final view = tester.binding.renderView;
-  final layer = view.debugLayer!;
-  if (layer is OffsetLayer) {
-    return layer.toImage(view.paintBounds);
-  }
-  if (layer is ContainerLayer) {
-    return layer.toImage(RectOffset.fromLTWH(
-      0,
-      0,
-      view.paintBounds.width,
-      view.paintBounds.height,
-    ));
-  }
-  throw StateError('unsupported root layer type \${layer.runtimeType}');
-}
-
 /// Walk the element tree and record every meaningful RenderBox as a region:
 /// type, on-screen rect, rendered TEXT (for RenderParagraph), solid COLOR
 /// (for RenderDecoratedBox), and the WIDGET CHAIN (runtime type names up the
@@ -176,7 +190,7 @@ List<Map<String, dynamic>> _regions(WidgetTester tester, String screenId) {
           size.height <= 4000) {
         String? text;
         if (ro is RenderParagraph) {
-          text = ro.text.plainText.trim();
+          text = ro.text.toPlainText().trim();
           if (text.length > 80) text = text.substring(0, 80);
           if (text.isEmpty) text = null;
         }
@@ -188,12 +202,11 @@ List<Map<String, dynamic>> _regions(WidgetTester tester, String screenId) {
           }
         }
         final chain = <String>[];
-        Element? p = e;
-        for (var i = 0; i < 5 && p != null; i++) {
-          final t = p.widget.runtimeType.toString();
+        e.visitAncestorElements((anc) {
+          final t = anc.widget.runtimeType.toString();
           if (t.isNotEmpty && !chain.contains(t)) chain.add(t);
-          p = p.parent as Element?;
-        }
+          return chain.length < 5;
+        });
         final type = ro.runtimeType.toString();
         final tl = ro.localToGlobal(Offset.zero);
         final n2 = out.length;
