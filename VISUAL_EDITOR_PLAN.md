@@ -236,6 +236,19 @@ Each phase is shippable on its own; Phase 0+1 delivers the product promise.
   ops live in `deterministic_edit_ops.dart` and are unit-tested against
   realistic generated source. Post-edit guard is a ~50 ms `dart format`
   parse-check (replaced materialize + `pub get` + `flutter analyze`).
+- **Real-time feel — optimistic overlays + single-screen re-capture**
+  (`603693d`): the moment a colour/text edit lands, the new value is
+  **pre-painted on the canvas** (solid fill for a box's background,
+  translucent tint for a text region) so the change is visible *instantly*,
+  before the true re-capture replaces it — the "semi-real time" ask. After an
+  edit only the **touched route** is re-pumped (`recaptureOneScreen`); the
+  other screens are seeded from the most recent prior capture so the map
+  stays complete without re-running every one (falls back to a full capture
+  on any failure). Overlays clear only for the screens actually re-captured,
+  and a busy-skipped re-capture is **re-armed** so quick successive edits
+  always converge. Also fixed a latent bug: `_resolveSources` returned the
+  re-resolved map that `_load`/`_recapture` were then overwriting with the
+  unresolved capture (regions lost their source lines after any re-capture).
 
 ## 6. Risks & honest hard parts
 
