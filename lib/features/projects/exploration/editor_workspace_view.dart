@@ -16,12 +16,15 @@ library;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'dart:math' as math;
+
 import '../../../core/providers/database_provider.dart';
 import '../../docker/launch_project_dialog.dart';
 import '../../workspace/code_and_git_right_panel.dart';
 import '../../workspace/file_browser_view.dart';
 import '../orchestration/project_orchestrator.dart';
 import '../workspace_nav.dart';
+import 'draggable_divider.dart';
 import 'project_exploration_view.dart' show editorPromptProvider;
 import 'stories_chat_sidebar.dart';
 import 'visual_editor/visual_editor_view.dart';
@@ -42,13 +45,26 @@ class EditorWorkspaceView extends ConsumerStatefulWidget {
 
 class _EditorWorkspaceViewState extends ConsumerState<EditorWorkspaceView> {
   bool _visual = false;
+  // Drag-resizable panel widths.
+  double _treeW = 300;
+  double _chatW = 420;
+  // The Agent chat collapses to a slim rail — by default in Visual mode,
+  // where the canvas wants every pixel.
+  bool _chatCollapsed = false;
+
+  void _setVisual(bool v) {
+    setState(() {
+      _visual = v;
+      if (v) _chatCollapsed = true;
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     // "Launch with Editor" (Overview tab) bumps this; flip to the Visual pane.
     ref.listen<int>(requestVisualEditorProvider, (prev, next) {
-      if (next != (prev ?? 0)) setState(() => _visual = true);
+      if (next != (prev ?? 0)) _setVisual(true);
     });
     // Keep the orchestrator instance alive while the Editor is open, so the
     // Editor's `start_delegated_build` (which flips the project to `running`)
@@ -101,8 +117,8 @@ class _EditorWorkspaceViewState extends ConsumerState<EditorWorkspaceView> {
                 segments: const [
                   ButtonSegment(
                     value: false,
-                    icon: Icon(Icons.code, size: 16),
-                    label: Text('Code'),
+                    icon: Icon(Icons.auto_awesome, size: 16),
+                    label: Text('Agent'),
                   ),
                   ButtonSegment(
                     value: true,
@@ -111,8 +127,7 @@ class _EditorWorkspaceViewState extends ConsumerState<EditorWorkspaceView> {
                   ),
                 ],
                 selected: {_visual},
-                onSelectionChanged: (s) =>
-                    setState(() => _visual = s.first),
+                onSelectionChanged: (s) => _setVisual(s.first),
               ),
               const SizedBox(width: 12),
               FilledButton.icon(
@@ -127,48 +142,53 @@ class _EditorWorkspaceViewState extends ConsumerState<EditorWorkspaceView> {
             ],
           ),
         ),
-        // ── Body: file tree | code/visual | Editor chat ─────────────────────
+        // ── Body: [file tree |] Agent/Visual | Agent chat ──────────────────
+        // In Visual mode the file tree disappears (code IS what the canvas
+        // edits — no need for two views of the same thing) and the Agent chat
+        // collapses to a slim rail. Every border is drag-resizable.
         Expanded(
-          child: LayoutBuilder(
-            builder: (context, constraints) {
-              final wide = constraints.maxWidth >= 1150;
-              return Row(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  wide
-                      ? const SizedBox(width: 300, child: FileBrowserView())
-                      : Flexible(flex: 2, child: FileBrowserView()),
-                  const VerticalDivider(width: 1),
-                  Flexible(
-                    flex: 5,
-                    child: _visual
-                        ? VisualEditorView(
-                            key: ValueKey('visual-${widget.projectId}'),
-                            projectId: widget.projectId,
-                            onViewCode: () => setState(() => _visual = false),
-                            onOpenChat: () {}, // chat pane is already visible
-                          )
-                        : const CodeAndGitRightPanel(),
-                  ),
-                  const VerticalDivider(width: 1),
-                  wide
-                      ? SizedBox(
-                          width: 420,
-                          child: _EditorPromptPane(
-                            projectId: widget.projectId,
-                            projectName: widget.projectName,
-                          ),
-                        )
-                      : Flexible(
-                          flex: 3,
-                          child: _EditorPromptPane(
-                            projectId: widget.projectId,
-                            projectName: widget.projectName,
-                          ),
-                        ),
-                ],
-              );
-            },
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              if (!_visual) ...[
+                SizedBox(width: _treeW, child: const FileBrowserView()),
+                DraggableVerticalDivider(
+                  onDelta: (dx) => setState(() {
+                    _treeW = (_treeW + dx).clamp(220.0, 520.0);
+                  }),
+                ),
+              ],
+              Expanded(
+                child: _visual
+                    ? VisualEditorView(
+                        key: ValueKey('visual-${widget.projectId}'),
+                        projectId: widget.projectId,
+                        onViewCode: () => _setVisual(false),
+                        onOpenChat: () {}, // chat pane is right there
+                      )
+                    : const CodeAndGitRightPanel(),
+              ),
+              if (!_chatCollapsed)
+                DraggableVerticalDivider(
+                  onDelta: (dx) => setState(() {
+                    _chatW = (_chatW - dx).clamp(280.0, 640.0);
+                  }),
+                ),
+              _chatCollapsed
+                  ? _CollapsedAgentRail(
+                      onExpand: () =>
+                          setState(() => _chatCollapsed = false),
+                    )
+                  : SizedBox(
+                      width: _chatW,
+                      child: _EditorPromptPane(
+                        projectId: widget.projectId,
+                        projectName: widget.projectName,
+                        onCollapse: () =>
+                            setState(() => _chatCollapsed = true),
+                      ),
+                    ),
+            ],
           ),
         ),
       ],
@@ -176,26 +196,100 @@ class _EditorWorkspaceViewState extends ConsumerState<EditorWorkspaceView> {
   }
 }
 
-/// The editor's chat sidebar, wired to the project's editor prompt.
+/// The collapsed Agent chat: a slim rail so it's one click away in Visual
+/// mode without costing the canvas any meaningful space.
+class _CollapsedAgentRail extends StatelessWidget {
+  const _CollapsedAgentRail({required this.onExpand});
+  final VoidCallback onExpand;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Container(
+      width: 42,
+      decoration: BoxDecoration(
+        border: Border(left: BorderSide(color: theme.dividerColor)),
+      ),
+      child: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: Tooltip(
+              message: 'Show Agent chat',
+              child: IconButton(
+                iconSize: 18,
+                icon: const Icon(Icons.chat_bubble_outline),
+                onPressed: onExpand,
+              ),
+            ),
+          ),
+          const SizedBox(height: 6),
+          Transform.rotate(
+            angle: math.pi / 2,
+            child: Text(
+              'Agent',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.hintColor,
+                letterSpacing: 1.2,
+              ),
+            ),
+          ),
+          const Spacer(),
+        ],
+      ),
+    );
+  }
+}
+
+/// The editor's chat sidebar, wired to the project's editor prompt. A small
+/// collapse button tucks it into the slim rail (see [_CollapsedAgentRail]).
 class _EditorPromptPane extends ConsumerWidget {
-  const _EditorPromptPane({required this.projectId, required this.projectName});
+  const _EditorPromptPane({
+    required this.projectId,
+    required this.projectName,
+    required this.onCollapse,
+  });
   final int projectId;
   final String projectName;
+  final VoidCallback onCollapse;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final theme = Theme.of(context);
     final promptAsync = ref.watch(editorPromptProvider(
         (projectId: projectId, projectName: projectName)));
-    return promptAsync.when(
-      loading: () => const Center(child: CircularProgressIndicator()),
-      error: (e, _) => Center(child: Text('Editor error: $e')),
-      data: (prompt) => StoriesChatSidebar(
-        key: ValueKey('editor-sidebar-$projectId'),
-        projectId: projectId,
-        projectName: projectName,
-        editorMode: true,
-        systemPromptOverride: prompt,
-      ),
+    return Stack(
+      children: [
+        Positioned.fill(
+          child: promptAsync.when(
+            loading: () =>
+                const Center(child: CircularProgressIndicator()),
+            error: (e, _) => Center(child: Text('Editor error: $e')),
+            data: (prompt) => StoriesChatSidebar(
+              key: ValueKey('editor-sidebar-$projectId'),
+              projectId: projectId,
+              projectName: projectName,
+              editorMode: true,
+              systemPromptOverride: prompt,
+            ),
+          ),
+        ),
+        Positioned(
+          top: 4,
+          right: 4,
+          child: Tooltip(
+            message: 'Collapse Agent chat',
+            child: InkWell(
+              onTap: onCollapse,
+              child: Padding(
+                padding: const EdgeInsets.all(2),
+                child: Icon(Icons.chevron_right,
+                    size: 18, color: theme.hintColor),
+              ),
+            ),
+          ),
+        ),
+      ],
     );
   }
 }

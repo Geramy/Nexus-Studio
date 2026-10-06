@@ -22,6 +22,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../../infrastructure/workspace/git/git_engine_provider.dart';
 import '../../../../infrastructure/workspace/workspace_provider.dart';
+import '../draggable_divider.dart';
 import 'code_applier.dart';
 import 'live_preview_service.dart';
 import 'region_model.dart';
@@ -67,6 +68,9 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
   bool _loading = true;
   String? _cacheDirPath;
   ScreenRegion? _dragRegion;
+  // Drag-resizable inner panels (screens rail, inspector).
+  double _railW = 132;
+  double _inspW = 292;
   // Live preview (phase 2).
   LivePreviewSession? _live;
   bool _liveStarting = false;
@@ -1042,39 +1046,45 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
             ),
           ]),
         ),
-        Row(children: [
-          // Screens rail.
-          Container(
-            width: 132,
-            decoration: BoxDecoration(
-              border: Border(right: BorderSide(color: theme.dividerColor)),
-            ),
-            child: ListView.builder(
-              padding: const EdgeInsets.all(8),
-              itemCount: map.screens.length,
-              itemBuilder: (context, i) => _railTile(i),
-            ),
-          ),
-          // Canvas + status bar.
-          Expanded(
-            child: Column(children: [
-              Expanded(
-                child: screen.error != null && screen.pngFile.isEmpty
-                    ? _screenError(screen)
-                    : _canvas(screen),
+        Expanded(
+          child: Row(children: [
+            // Screens rail (drag-resizable).
+            SizedBox(
+              width: _railW,
+              child: ListView.builder(
+                padding: const EdgeInsets.all(8),
+                itemCount: map.screens.length,
+                itemBuilder: (context, i) => _railTile(i),
               ),
-              _statusBar(screen),
-            ]),
-          ),
-          // Inspector + ops log.
-          Container(
-            width: 292,
-            decoration: BoxDecoration(
-              border: Border(left: BorderSide(color: theme.dividerColor)),
             ),
-            child: _sidePanel(context, screen),
-          ),
-        ]),
+            DraggableVerticalDivider(
+              onDelta: (dx) => setState(() {
+                _railW = (_railW + dx).clamp(96.0, 320.0);
+              }),
+            ),
+            // Canvas + status bar.
+            Expanded(
+              child: Column(children: [
+                Expanded(
+                  child: screen.error != null && screen.pngFile.isEmpty
+                      ? _screenError(screen)
+                      : _canvas(screen),
+                ),
+                _statusBar(screen),
+              ]),
+            ),
+            DraggableVerticalDivider(
+              onDelta: (dx) => setState(() {
+                _inspW = (_inspW + dx).clamp(220.0, 560.0);
+              }),
+            ),
+            // Inspector + ops log (drag-resizable).
+            SizedBox(
+              width: _inspW,
+              child: _sidePanel(context, screen),
+            ),
+          ]),
+        ),
       ],
     );
   }
