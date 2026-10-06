@@ -201,6 +201,22 @@ Each phase is shippable on its own; Phase 0+1 delivers the product promise.
   to the real app, then rebuild-and-reload shows the result.
 - **Phase 3 — PARTIAL** (`2bd53fc`): setPadding op ✓, apply-to-all-screens
   for repeated widgets ✓, inspector ✓; inline font-size edit pending.
+- **Capture fix** (`06d041c`): the generated harness was written against older
+  Flutter APIs and never actually ran end-to-end. Fixed for Flutter 3.47.5
+  (`visitAncestorElements` for the widget chain, `InlineSpan.toPlainText()`,
+  `rendering.dart` import, `OffsetLayer.toImage` inside `tester.runAsync` —
+  the fake-async zone deadlocked the raster). Harness now DRAINS per-pump
+  exceptions so a buggy app screen (e.g. an `Expanded` inside `Padding`) is
+  captured + recorded as a per-screen error instead of failing the run. Added
+  visible `[ScreenMap]`/`[VisualEditor]` logging + log tail in the error UI.
+- **Space/UX pass** (`ead7b56`): in **Visual** mode the file tree (code) is
+  hidden — the canvas *is* the code view — and the Agent chat auto-collapses
+  to a slim rail. All panel borders are drag-resizable (new shared
+  `DraggableVerticalDivider`: file-tree/code, code/Agent-chat, and the
+  screens-rail/preview/inspector inside the visual editor). "Code" mode
+  relabeled **Agent** (user-input-first, agent in the side). Also wrapped the
+  editor's main `Row` in `Expanded` — it had unbounded height, which bled the
+  canvas paint over the adjacent panels (the "glitching over other panels").
 
 ## 6. Risks & honest hard parts
 
