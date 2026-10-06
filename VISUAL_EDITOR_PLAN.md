@@ -249,6 +249,31 @@ Each phase is shippable on its own; Phase 0+1 delivers the product promise.
   always converge. Also fixed a latent bug: `_resolveSources` returned the
   re-resolved map that `_load`/`_recapture` were then overwriting with the
   unresolved capture (regions lost their source lines after any re-capture).
+- **Colour edits that actually land + screen-background option** (this pass):
+  the old colour ops only matched a fixed set of colour *literals* (`Color(0x…)`,
+  `Colors.x`, `Theme.of().colorScheme.x`) inside `TextStyle(`/`backgroundColor:`,
+  so they missed the forms the generator actually emits — text colour set via
+  `textTheme.x?.copyWith(color: …)`, and colours that are theme constants
+  (`CasinoTheme.gold`), `…withValues(alpha: 0.15)`, or `scheme.onSurface`.
+  The colour ops are now **value-span based**: they find the `color:` / `backgroundColor:`
+  property and replace the value *whatever form it is in* by scanning to the
+  matching comma/paren (so any value token is handled, and we never need to
+  know the colour's source). Text colour now recognises `.copyWith(…)` as a
+  text-style container (not just `TextStyle(`), inserts a `color:` when a style
+  has none, and a box colour never mistakes a text-style colour for a fill.
+  Added a **screen-background** op: a "Set background…" menu item (the app's
+  own background can't be clicked to target it) that sets the page Scaffold's
+  `backgroundColor:` — matched at the Scaffold's **top depth level** so a nested
+  `Container(backgroundColor:…)` is never hit; a background **image** is offered
+  too and routes to the assistant (it's a structural wrap, not a one-line edit).
+  The **Edit-text** dialog now **pre-fills the current rendered text** (own text
+  or the box's first child text) so you confirm you picked the right element.
+  Diagnostics: the apply path now logs each op's target + whether a
+  deterministic match was found. Honest limit: **parameterised widgets** (e.g.
+  `_GameTile(title: 'Roulette')`) carry their rendered text as data, so the
+  locator anchors at the call site — far from the widget's style — and those
+  still fall through to the assistant. Six new unit tests cover the real forms.
+  83 tests pass, analyze clean.
 
 ## 6. Risks & honest hard parts
 

@@ -74,6 +74,37 @@ void main() {
       expect(out, contains('color: Color(0xFF0064D2)'));
       expect(out, isNot(contains('Colors.grey')));
     });
+
+    test(
+      'handles .copyWith(color: themeConstant) — the common generated form',
+      () {
+        const src = '''
+style: textTheme.titleMedium?.copyWith(
+  color: scheme.onSurface,
+  fontWeight: FontWeight.w700,
+),
+''';
+        final anchor = _lineOf(src, 'copyWith');
+        final out = setTextColorEdit(src, anchor: anchor, hex: '#FF0000');
+        expect(out, isNotNull);
+        expect(out, contains('color: Color(0xFFFF0000)'));
+        expect(out, isNot(contains('scheme.onSurface')));
+      },
+    );
+
+    test('replaces a custom theme constant (MyTheme.gold)', () {
+      const src = '''
+style: textTheme.bodyMedium?.copyWith(
+  color: CasinoTheme.gold,
+  fontWeight: FontWeight.w500,
+),
+''';
+      final anchor = _lineOf(src, 'copyWith');
+      final out = setTextColorEdit(src, anchor: anchor, hex: '#00FF00');
+      expect(out, isNotNull);
+      expect(out, contains('color: Color(0xFF00FF00)'));
+      expect(out, isNot(contains('CasinoTheme.gold')));
+    });
   });
 
   group('setBgColorEdit', () {
@@ -110,6 +141,63 @@ void main() {
       const src = 'Row(\n  children: const [Icon(Icons.add)],\n)';
       final out = setBgColorEdit(src, anchor: 2, hex: '#FF0000');
       expect(out, isNull);
+    });
+
+    test('swaps a .withValues(alpha: …) fill in full', () {
+      const src = '''
+  Container(
+    padding: const EdgeInsets.all(14),
+    decoration: BoxDecoration(
+      color: CasinoTheme.gold.withValues(alpha: 0.15),
+      borderRadius: BorderRadius.circular(18),
+    ),
+  )''';
+      final anchor = _lineOf(src, 'withValues');
+      final out = setBgColorEdit(src, anchor: anchor, hex: '#123456');
+      expect(out, isNotNull);
+      expect(out, contains('color: Color(0xFF123456)'));
+      expect(out, isNot(contains('withValues')));
+      // The neighbouring borderRadius is untouched.
+      expect(out, contains('borderRadius: BorderRadius.circular(18)'));
+    });
+
+    test('does not treat a text-style colour as a background', () {
+      const src = '''
+Text(
+  'Label',
+  style: TextStyle(color: Colors.white),
+)''';
+      final anchor = _lineOf(src, 'TextStyle');
+      // The only colour here is a text colour — no box background to paint.
+      final out = setBgColorEdit(src, anchor: anchor, hex: '#FF0000');
+      expect(out, isNull);
+    });
+  });
+
+  group('setBackgroundEdit', () {
+    test('inserts backgroundColor into a Scaffold that has none', () {
+      const src = '''
+return Scaffold(
+  appBar: AppBar(title: const Text('Home')),
+  body: const Center(child: Text('hi')),
+);''';
+      final anchor = _lineOf(src, 'Scaffold');
+      final out = setBackgroundEdit(src, anchor: anchor, hex: '#0A0A1A');
+      expect(out, isNotNull);
+      expect(out, contains('backgroundColor: Color(0xFF0A0A1A)'));
+    });
+
+    test('replaces an existing Scaffold backgroundColor', () {
+      const src = '''
+return Scaffold(
+  backgroundColor: Colors.black,
+  body: const Center(child: Text('hi')),
+);''';
+      final anchor = _lineOf(src, 'Scaffold');
+      final out = setBackgroundEdit(src, anchor: anchor, hex: '#123456');
+      expect(out, isNotNull);
+      expect(out, contains('backgroundColor: Color(0xFF123456)'));
+      expect(out, isNot(contains('Colors.black')));
     });
   });
 }

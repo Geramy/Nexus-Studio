@@ -305,6 +305,7 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
       case VisualOpKind.setPadding:
       case VisualOpKind.insertImage:
       case VisualOpKind.replaceImage:
+      case VisualOpKind.setBackground:
         return null;
     }
   }
@@ -454,6 +455,10 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
           value: 5,
           child: _MenuItem('Set spacing…', Icons.toc),
         ),
+        const PopupMenuItem(
+          value: 6,
+          child: _MenuItem('Set background…', Icons.wallpaper),
+        ),
       ],
     ).then((v) {
       if (v == null) return;
@@ -470,6 +475,8 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
           _imageDialog(r, VisualOpKind.replaceImage);
         case 5:
           _paddingDialog(r);
+        case 6:
+          _backgroundDialog(r);
       }
     });
   }
@@ -486,7 +493,10 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
   }
 
   void _textDialog(ScreenRegion r, {bool allScope = false}) {
-    final controller = TextEditingController(text: r.text ?? '');
+    // Pre-fill with the CURRENT rendered text — either the region's own
+    // text (a Text/RenderParagraph) or the first text inside it (a box) — so
+    // the user can confirm they picked the right element before retyping.
+    final controller = TextEditingController(text: r.text ?? r.childText ?? '');
     showDialog<void>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -512,6 +522,163 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
         ],
       ),
     );
+  }
+
+  /// Screen-level "set background": the user can't click the app's own
+  /// background to target it, so it lives in the region menu. Colour is
+  /// applied deterministically to the page's Scaffold; an image background is
+  /// a structural change and goes through the assistant.
+  void _backgroundDialog(ScreenRegion r) {
+    final pageFile = _pageFileFor(r);
+    if (pageFile == null) {
+      _toast(
+        "Couldn't find this screen's page to change its background.",
+        ok: false,
+      );
+      return;
+    }
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => SimpleDialog(
+        title: const Text('Set screen background'),
+        children: [
+          SimpleDialogOption(
+            onPressed: () {
+              Navigator.of(ctx).pop();
+              _backgroundColorDialog(r, pageFile);
+            },
+            child: const Row(
+              children: [
+                Icon(Icons.color_lens),
+                SizedBox(width: 10),
+                Text('Colour…'),
+              ],
+            ),
+          ),
+          SimpleDialogOption(
+            onPressed: () {
+              Navigator.of(ctx).pop();
+              _backgroundImageDialog(r, pageFile);
+            },
+            child: const Row(
+              children: [
+                Icon(Icons.image_outlined),
+                SizedBox(width: 10),
+                Text('Image…'),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _backgroundColorDialog(ScreenRegion r, String pageFile) {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => _ColorDialog(
+        current: null,
+        title: 'Set screen background',
+        onPick: (hex) => _finishBackground(r, pageFile, hex),
+      ),
+    );
+  }
+
+  void _backgroundImageDialog(ScreenRegion r, String pageFile) {
+    String? hostPath;
+    final controller = TextEditingController();
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDlg) => AlertDialog(
+          title: const Text('Set screen background image'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Paste the path of a PNG/JPG on this machine (e.g. ~/Pictures/bg.png):',
+                style: TextStyle(fontSize: 12),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: controller,
+                autofocus: true,
+                onChanged: (v) => setDlg(() => hostPath = v.trim()),
+              ),
+              if (controller.text.trim().isNotEmpty &&
+                  !File(_expandHome(controller.text.trim())).existsSync())
+                const Padding(
+                  padding: EdgeInsets.only(top: 6),
+                  child: Text(
+                    '⚠ that file does not exist',
+                    style: TextStyle(color: Colors.red, fontSize: 11),
+                  ),
+                ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: (hostPath == null || hostPath!.isEmpty)
+                  ? null
+                  : () {
+                      final p = hostPath!;
+                      Navigator.pop(ctx);
+                      _applyBackgroundImage(pageFile, p);
+                    },
+              child: const Text('Use image'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// A background image is a structural change, so it is routed to the
+  /// assistant with a precise prompt rather than the deterministic tier.
+  void _applyBackgroundImage(String pageFile, String hostPath) {
+    ref.read(pendingEditorPromptProvider(widget.projectId).notifier).state =
+        'Visual edit task: set this screen\'s BACKGROUND to the image at '
+        '$hostPath (copy it into the app\'s assets/ and reference it). '
+        'Wrap the page\'s body so the image fills the screen BEHIND the '
+        'existing UI (e.g. a Stack with Image.asset(…, fit: BoxFit.cover) '
+        'as the first child, or a Scaffold background). Page file: '
+        '$pageFile. Keep all existing UI on top and keep the file '
+        'compiling.';
+    widget.onOpenChat();
+  }
+
+  void _finishBackground(ScreenRegion r, String pageFile, String hex) {
+    final bg = ScreenRegion(
+      id: 'bg_${_screenIdx}',
+      widgetType: 'Scaffold',
+      rect: const RectBox(0, 0, 0, 0),
+      label: 'Screen background',
+      sourceFile: pageFile,
+      sourceLine: 1,
+    );
+    _applyOp(
+      VisualOp(
+        kind: VisualOpKind.setBackground,
+        region: bg,
+        screenRoute: _currentScreen().route,
+        colorHex: hex,
+      ),
+    );
+  }
+
+  /// The page (source) file for the current screen — the first resolved
+  /// region's sourceFile, falling back to [r]'s own.
+  String? _pageFileFor(ScreenRegion r) {
+    for (final reg in _currentScreen().regions) {
+      final f = reg.sourceFile;
+      if (reg.hasSource && f != null) return f;
+    }
+    return r.sourceFile;
   }
 
   /// Single-region or (when the widget repeats across screens) ask scope.
@@ -1823,9 +1990,14 @@ class _MenuItem extends StatelessWidget {
 }
 
 class _ColorDialog extends StatelessWidget {
-  const _ColorDialog({required this.current, required this.onPick});
+  const _ColorDialog({
+    required this.current,
+    required this.onPick,
+    this.title = 'Change color',
+  });
   final String? current;
   final ValueChanged<String> onPick;
+  final String title;
 
   static const _swatches = <String>[
     '#1E1B4B',
@@ -1860,7 +2032,7 @@ class _ColorDialog extends StatelessWidget {
   Widget build(BuildContext context) {
     final controller = TextEditingController(text: current ?? '');
     return AlertDialog(
-      title: const Text('Change color'),
+      title: Text(title),
       content: SizedBox(
         width: 320,
         child: Column(

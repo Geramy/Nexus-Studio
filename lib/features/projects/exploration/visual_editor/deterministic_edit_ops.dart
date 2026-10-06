@@ -14,11 +14,6 @@
 /// real generated source, and so [code_applier] can stay a thin orchestrator.
 library;
 
-/// A single recognisable colour VALUE (no property name): `Color(0x…)`,
-/// `Color.fromARGB(…)`, `Colors.x[.shadeN]`, or `Theme.of(...).colorScheme.x`.
-const String colorValueRe =
-    r'Color\(0x[0-9A-Fa-f]{6,8}\)|Color\.fromARGB\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*\d+\s*\)|Colors\.[A-Za-z]+(?:\.shade\d+)?|Theme\.of\([^)]*\)\.colorScheme\.[A-Za-z]+';
-
 /// Build the replacement literal for a picked hex (#RRGGBB or #AARRGGBB).
 String? colorLiteralForHex(String hex) {
   final h = hex.replaceAll('#', '').trim().toUpperCase();
@@ -55,7 +50,11 @@ int _matchingParen(String content, int openIdx) {
 /// The closest match of [re] to [anchor] (1-based line), within [maxDist]
 /// lines. Returns (match, matchLine) or null.
 (RegExpMatch, int)? _nearestMatch(
-    String content, RegExp re, int anchor, int maxDist) {
+  String content,
+  RegExp re,
+  int anchor,
+  int maxDist,
+) {
   RegExpMatch? best;
   var bestLine = 0;
   var bestDist = 1 << 30;
@@ -72,21 +71,114 @@ int _matchingParen(String content, int openIdx) {
   return (best, bestLine);
 }
 
-/// The identifier of the named property immediately before [at] in [body]
-/// (i.e. the `color` in `color: <value>`), or null.
-String? _propBefore(String body, int at) {
-  final m = RegExp(r'([A-Za-z_]+)\s*:\s*$').firstMatch(body.substring(0, at));
-  return m?.group(1);
+/// True if the character [c] is a Dart identifier character.
+bool _isIdentChar(String c) {
+  final u = c.codeUnitAt(0);
+  return (u >= 0x30 && u <= 0x39) ||
+      (u >= 0x41 && u <= 0x5A) ||
+      (u >= 0x61 && u <= 0x7A) ||
+      c == '_';
 }
 
-/// True if [idx] lies inside a `TextStyle( … )` call.
-bool _insideTextStyle(String content, int idx) {
-  final opens = [
-    for (final m in RegExp(r'TextStyle\(').allMatches(content.substring(0, idx)))
-      m.start
-  ];
-  if (opens.isEmpty) return false;
-  return _matchingParen(content, opens.last) > idx;
+bool _isWs(String c) => c == ' ' || c == '\t' || c == '\n' || c == '\r';
+
+/// Whether [idx] lies inside a `TextStyle( … )` or `.copyWith( … )` call —
+/// i.e. a TEXT-STYLE colour, as opposed to a box/background `color:`.
+bool _insideStyle(String content, int idx) {
+  for (final re in [RegExp(r'TextStyle\('), RegExp(r'\.copyWith\(')]) {
+    final opens = [
+      // The '(' is the last char of the `TextStyle(`/`.copyWith(` match.
+      for (final m in re.allMatches(content.substring(0, idx))) m.end - 1,
+    ];
+    if (opens.isEmpty) continue;
+    if (_matchingParen(content, opens.last) > idx) return true;
+  }
+  return false;
+}
+
+/// Every `color:` property in [content], excluding `backgroundColor:` (whose
+/// trailing `color` would otherwise match). Yields the `color\s*:\s*` match.
+Iterable<RegExpMatch> _colorProps(String content) sync* {
+  for (final m in RegExp(r'color\s*:\s*').allMatches(content)) {
+    if (m.start > 0 && _isIdentChar(content[m.start - 1])) continue;
+    yield m;
+  }
+}
+
+/// The end index of the value expression starting at [start]: scan forward
+/// tracking paren/bracket/brace depth until the next `,`, `;` or a closing
+/// `)`/`}` at depth 0. Handles ANY value form — `Color(0x…)`, `Colors.x`,
+/// `Theme.of(...).colorScheme.x`, `MyTheme.gold`,
+/// `MyTheme.gold.withValues(alpha: 0.15)`, `scheme.onSurface`, a bare var —
+/// so we never need to know the colour's source, only where it ends.
+int _valueEnd(String content, int start) {
+  var depth = 0;
+  for (var i = start; i < content.length; i++) {
+    final c = content[i];
+    if (c == '(' || c == '[' || c == '{') {
+      depth++;
+    } else if (c == ')' || c == ']' || c == '}') {
+      if (depth == 0) return i;
+      depth--;
+    } else if (depth == 0 && (c == ',' || c == ';')) {
+      return i;
+    }
+  }
+  return content.length;
+}
+
+/// The (start, end) span of the colour VALUE for a `…: <value>` property whose
+/// colon+whitespace ends at [afterColon] — skipping an optional `const ` and
+/// trailing whitespace, so the replacement leaves the surrounding code intact.
+(int, int) _valueSpan(String content, int afterColon) {
+  var s = afterColon;
+  // Skip leading whitespace (callers may pass the index right after ':').
+  while (s < content.length && _isWs(content[s])) {
+    s++;
+  }
+  final bound = s + 16 > content.length ? content.length : s + 16;
+  final constM = RegExp(r'const\s+').firstMatch(content.substring(s, bound));
+  if (constM != null) s += constM.end;
+  var e = _valueEnd(content, s);
+  while (e > s && _isWs(content[e - 1])) {
+    e--;
+  }
+  return (s, e);
+}
+
+/// Within [content][bodyStart..bodyEnd) (a call's argument body), the
+/// (propStart, afterColon) of [prop] occurring at DEPTH 0 — i.e. a direct
+/// argument of that call, not a property of a nested widget. Returns null if
+/// absent. This is what lets "set background" target the Scaffold's own
+/// `backgroundColor:` and not a `Container(backgroundColor:…)` inside it.
+(int, int)? _findPropAtDepth0(
+  String content,
+  int bodyStart,
+  int bodyEnd,
+  String prop,
+) {
+  var depth = 0;
+  var i = bodyStart;
+  while (i < bodyEnd) {
+    final c = content[i];
+    if (c == '(' || c == '[' || c == '{') {
+      depth++;
+    } else if (c == ')' || c == ']' || c == '}') {
+      depth--;
+    } else if (depth == 0 &&
+        content.startsWith(prop, i) &&
+        (i == 0 || !_isIdentChar(content[i - 1]))) {
+      var j = i + prop.length;
+      while (j < bodyEnd && (content[j] == ' ' || content[j] == '\t')) {
+        j++;
+      }
+      if (j < bodyEnd && content[j] == ':') {
+        return (i, j + 1);
+      }
+    }
+    i++;
+  }
+  return null;
 }
 
 String _fmt(double v) {
@@ -97,7 +189,11 @@ String _fmt(double v) {
 /// Replace the first string argument of the nearest `prefix('…')` call to
 /// [anchor] (within 12 lines).
 String? _replaceStringArg(
-    String content, int anchor, RegExp openRe, String newInner) {
+  String content,
+  int anchor,
+  RegExp openRe,
+  String newInner,
+) {
   final m = _nearestMatch(content, openRe, anchor, 12);
   if (m == null) return null;
   final quote = m.$1.group(1)!;
@@ -126,10 +222,18 @@ String? setTextEdit(
   if (cur.length >= 3) {
     final probe = cur.length > 40 ? cur.substring(0, 40) : cur;
     final byText = _nearestMatch(
-        content, RegExp("Text\\(\\s*['\"]" + RegExp.escape(probe)), anchor, 60);
+      content,
+      RegExp("Text\\(\\s*['\"]" + RegExp.escape(probe)),
+      anchor,
+      60,
+    );
     if (byText != null) {
       final lit = _nearestMatch(
-          content, RegExp("['\"]" + RegExp.escape(probe)), byText.$2, 3);
+        content,
+        RegExp("['\"]" + RegExp.escape(probe)),
+        byText.$2,
+        3,
+      );
       if (lit != null) {
         final m = lit.$1;
         final quote = content[m.start];
@@ -148,11 +252,18 @@ String? setTextEdit(
     }
   }
   return _replaceStringArg(
-      content, anchor, RegExp("Text\\(\\s*(['\"])"), newText);
+    content,
+    anchor,
+    RegExp("Text\\(\\s*(['\"])"),
+    newText,
+  );
 }
 
-/// Recolor the GLYPHS of a text region: nearest `TextStyle(…)` to [anchor];
-/// swap its `color:` value if present, else insert one.
+/// Recolor the GLYPHS of a text region: the `color:` property of the nearest
+/// text style (`TextStyle(…)` or `…copyWith(…)`) to [anchor]. Swaps the value
+/// whatever form it is in (Color/Colors/MyTheme.x/.withValues/var). Returns
+/// null when the text has no explicit colour of its own (inherits the theme)
+/// — the caller then falls back to the assistant.
 String? setTextColorEdit(
   String content, {
   required int anchor,
@@ -160,29 +271,55 @@ String? setTextColorEdit(
 }) {
   final newColor = colorLiteralForHex(hex);
   if (newColor == null) return null;
-  final ts = _nearestMatch(content, RegExp(r'TextStyle\('), anchor, 8);
-  if (ts == null) return null;
-  final openParen = ts.$1.end - 1; // the '(' of TextStyle(
-  final closeParen = _matchingParen(content, openParen);
-  if (closeParen < 0) return null;
-  final bodyStart = openParen + 1;
-  final body = content.substring(bodyStart, closeParen);
-  final cm = RegExp(colorValueRe).firstMatch(body);
-  if (cm != null && _propBefore(body, cm.start) == 'color') {
-    final valStart = bodyStart + cm.start;
-    final valEnd = bodyStart + cm.end;
-    return content.substring(0, valStart) +
-        newColor +
-        content.substring(valEnd);
+  (int, int)? best;
+  var bestDist = 1 << 30;
+  for (final m in _colorProps(content)) {
+    if (!_insideStyle(content, m.start))
+      continue; // must be a text-style colour
+    final line = _lineAt(content, m.start);
+    final dist = (line - anchor).abs();
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = _valueSpan(content, m.end);
+    }
   }
-  // No colour yet — insert it right after TextStyle(
-  return content.substring(0, bodyStart) +
+  if (best != null && bestDist <= 14) {
+    return content.substring(0, best.$1) +
+        newColor +
+        content.substring(best.$2);
+  }
+  // No explicit colour yet — insert one into the nearest text style.
+  final styleOpen = _nearestStyle(content, anchor, 14);
+  if (styleOpen == null) return null;
+  final insertAt = styleOpen + 1; // just after the '('
+  return content.substring(0, insertAt) +
       'color: $newColor, ' +
-      content.substring(bodyStart);
+      content.substring(insertAt);
 }
 
-/// Repaint a BOX's background: the nearest `backgroundColor:`/`color:` that is
-/// NOT inside a TextStyle, to [anchor] (within 40 lines).
+/// Index of the '(' of the nearest `TextStyle(` / `.copyWith(` to [anchor],
+/// within [maxDist] lines, or null.
+int? _nearestStyle(String content, int anchor, int maxDist) {
+  int? bestOpen;
+  var bestDist = 1 << 30;
+  for (final re in [RegExp(r'TextStyle\('), RegExp(r'\.copyWith\(')]) {
+    for (final m in re.allMatches(content)) {
+      final open = m.end - 1; // the '('
+      final line = _lineAt(content, open);
+      final dist = (line - anchor).abs();
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestOpen = open;
+      }
+    }
+  }
+  if (bestOpen == null || bestDist > maxDist) return null;
+  return bestOpen;
+}
+
+/// Repaint a BOX's background: the nearest `backgroundColor:` — or a `color:`
+/// that is NOT a text-style colour (a Container/Card/BoxDecoration/Icon fill)
+/// — to [anchor]. The value is replaced whatever form it is in.
 String? setBgColorEdit(
   String content, {
   required int anchor,
@@ -190,29 +327,65 @@ String? setBgColorEdit(
 }) {
   final newColor = colorLiteralForHex(hex);
   if (newColor == null) return null;
-  // Allow an optional `const ` before the value (generated code often writes
-  // `backgroundColor: const Color(…)`); it stays in place when we swap the value.
-  final re = RegExp(
-      '(?:backgroundColor|color)\\s*:\\s*(?:const\\s+)?(' + colorValueRe + ')');
-  RegExpMatch? best;
+  (int, int)? best;
   var bestDist = 1 << 30;
-  for (final m in re.allMatches(content)) {
-    if (_insideTextStyle(content, m.start)) continue;
+  // `backgroundColor:` is unambiguously a background.
+  for (final m in RegExp(r'backgroundColor\s*:\s*').allMatches(content)) {
     final line = _lineAt(content, m.start);
     final dist = (line - anchor).abs();
     if (dist < bestDist) {
       bestDist = dist;
-      best = m;
+      best = _valueSpan(content, m.end);
+    }
+  }
+  // `color:` that is not a text-style colour (box / decoration / icon fill).
+  for (final m in _colorProps(content)) {
+    if (_insideStyle(content, m.start)) continue;
+    final line = _lineAt(content, m.start);
+    final dist = (line - anchor).abs();
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = _valueSpan(content, m.end);
     }
   }
   if (best == null || bestDist > 40) return null;
-  // Group 1 is the trailing colour value, so it ends at the match end.
-  final val = best.group(1)!;
-  final valEnd = best.end;
-  final valStart = valEnd - val.length;
-  return content.substring(0, valStart) +
-      newColor +
-      content.substring(valEnd);
+  return content.substring(0, best.$1) + newColor + content.substring(best.$2);
+}
+
+/// Set a SCREEN's background colour: the nearest `Scaffold(` to [anchor]; swap
+/// its `backgroundColor:` if present, else insert one right after `Scaffold(`.
+/// This is the reliable, screen-level "change the background" the user can't
+/// reach by clicking (the background sits behind every region).
+String? setBackgroundEdit(
+  String content, {
+  required int anchor,
+  required String hex,
+}) {
+  final newColor = colorLiteralForHex(hex);
+  if (newColor == null) return null;
+  final scaffold = _nearestMatch(content, RegExp(r'Scaffold\('), anchor, 400);
+  if (scaffold == null) return null;
+  final openParen = scaffold.$1.end - 1; // the '(' of Scaffold(
+  final closeParen = _matchingParen(content, openParen);
+  if (closeParen < 0) return null;
+  final bodyStart = openParen + 1;
+  // Only a Scaffold-LEVEL backgroundColor (depth 0), never a nested widget's.
+  final hit = _findPropAtDepth0(
+    content,
+    bodyStart,
+    closeParen,
+    'backgroundColor',
+  );
+  if (hit != null) {
+    final span = _valueSpan(content, hit.$2);
+    return content.substring(0, span.$1) +
+        newColor +
+        content.substring(span.$2);
+  }
+  // No backgroundColor yet — insert one as the first Scaffold argument.
+  return content.substring(0, bodyStart) +
+      'backgroundColor: $newColor, ' +
+      content.substring(bodyStart);
 }
 
 /// Replace an `Image.asset` path near [anchor].
@@ -224,7 +397,11 @@ String? replaceImageEdit(
   final asset = assetPath.replaceAll(RegExp(r'^/'), '');
   if (asset.isEmpty) return null;
   return _replaceStringArg(
-      content, anchor, RegExp("Image\\.asset\\(\\s*(['\"])"), asset);
+    content,
+    anchor,
+    RegExp("Image\\.asset\\(\\s*(['\"])"),
+    asset,
+  );
 }
 
 /// Move: nearest `Positioned(left:, top:)` or `Offset(x, y)` to [anchor].
@@ -235,11 +412,11 @@ String? moveEdit(
   required double dy,
 }) {
   final a = _nearestMatch(
-      content,
-      RegExp(
-          r'left:\s*([+-]?\d+(?:\.\d+)?)\s*,\s*top:\s*([+-]?\d+(?:\.\d+)?)'),
-      anchor,
-      20);
+    content,
+    RegExp(r'left:\s*([+-]?\d+(?:\.\d+)?)\s*,\s*top:\s*([+-]?\d+(?:\.\d+)?)'),
+    anchor,
+    20,
+  );
   if (a != null) {
     final m = a.$1;
     final nl = _fmt(double.parse(m.group(1)!) + dx);
@@ -249,10 +426,11 @@ String? moveEdit(
         content.substring(m.start + m.end);
   }
   final b = _nearestMatch(
-      content,
-      RegExp(r'Offset\(\s*([+-]?\d+(?:\.\d+)?)\s*,\s*([+-]?\d+(?:\.\d+)?)\s*\)'),
-      anchor,
-      20);
+    content,
+    RegExp(r'Offset\(\s*([+-]?\d+(?:\.\d+)?)\s*,\s*([+-]?\d+(?:\.\d+)?)\s*\)'),
+    anchor,
+    20,
+  );
   if (b != null) {
     final m = b.$1;
     final nx = _fmt(double.parse(m.group(1)!) + dx);
@@ -276,10 +454,11 @@ String? setPaddingEdit(
   final b = _fmt(padding.$3);
   final l = _fmt(padding.$4);
   final m = _nearestMatch(
-      content,
-      RegExp(r'EdgeInsets\.(?:all|only|symmetric|fromLTRB)\(\s*[^)]*\)'),
-      anchor,
-      24);
+    content,
+    RegExp(r'EdgeInsets\.(?:all|only|symmetric|fromLTRB)\(\s*[^)]*\)'),
+    anchor,
+    24,
+  );
   if (m == null) return null;
   final mm = m.$1;
   return content.substring(0, mm.start) +

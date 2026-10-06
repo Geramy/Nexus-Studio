@@ -21,15 +21,14 @@ class RectBox {
 
   double get area => w * h;
 
-  Map<String, dynamic> toJson() =>
-      {'x': x, 'y': y, 'w': w, 'h': h};
+  Map<String, dynamic> toJson() => {'x': x, 'y': y, 'w': w, 'h': h};
 
   factory RectBox.fromJson(Map<String, dynamic> j) => RectBox(
-        (j['x'] as num).toDouble(),
-        (j['y'] as num).toDouble(),
-        (j['w'] as num).toDouble(),
-        (j['h'] as num).toDouble(),
-      );
+    (j['x'] as num).toDouble(),
+    (j['y'] as num).toDouble(),
+    (j['w'] as num).toDouble(),
+    (j['h'] as num).toDouble(),
+  );
 }
 
 /// One pickable region of a screen.
@@ -88,49 +87,49 @@ class ScreenRegion {
   bool get hasSource => sourceFile != null && sourceLine != null;
 
   ScreenRegion copyWithSource(String? file, int? line) => ScreenRegion(
-        id: id,
-        widgetType: widgetType,
-        rect: rect,
-        label: label,
-        sourceFile: file,
-        sourceLine: line,
-        depth: depth,
-        colorHex: colorHex,
-        textColorHex: textColorHex,
-        text: text,
-        childText: childText,
-        chain: chain,
-      );
+    id: id,
+    widgetType: widgetType,
+    rect: rect,
+    label: label,
+    sourceFile: file,
+    sourceLine: line,
+    depth: depth,
+    colorHex: colorHex,
+    textColorHex: textColorHex,
+    text: text,
+    childText: childText,
+    chain: chain,
+  );
 
   Map<String, dynamic> toJson() => {
-        'id': id,
-        't': widgetType,
-        if (label != null) 'label': label,
-        if (sourceFile != null) 'file': sourceFile,
-        if (sourceLine != null) 'line': sourceLine,
-        'r': rect.toJson(),
-        'd': depth,
-        if (colorHex != null) 'color': colorHex,
-        if (textColorHex != null) 'textColor': textColorHex,
-        if (text != null) 'text': text,
-        if (childText != null) 'childText': childText,
-        if (chain.isNotEmpty) 'chain': chain,
-      };
+    'id': id,
+    't': widgetType,
+    if (label != null) 'label': label,
+    if (sourceFile != null) 'file': sourceFile,
+    if (sourceLine != null) 'line': sourceLine,
+    'r': rect.toJson(),
+    'd': depth,
+    if (colorHex != null) 'color': colorHex,
+    if (textColorHex != null) 'textColor': textColorHex,
+    if (text != null) 'text': text,
+    if (childText != null) 'childText': childText,
+    if (chain.isNotEmpty) 'chain': chain,
+  };
 
   factory ScreenRegion.fromJson(Map<String, dynamic> j) => ScreenRegion(
-        id: j['id'] as String,
-        widgetType: j['t'] as String,
-        label: j['label'] as String?,
-        sourceFile: j['file'] as String?,
-        sourceLine: j['line'] as int?,
-        rect: RectBox.fromJson(j['r'] as Map<String, dynamic>),
-        depth: (j['d'] as int?) ?? 0,
-        colorHex: j['color'] as String?,
-        textColorHex: j['textColor'] as String?,
-        text: j['text'] as String?,
-        childText: j['childText'] as String?,
-        chain: (j['chain'] as List?)?.cast<String>() ?? const [],
-      );
+    id: j['id'] as String,
+    widgetType: j['t'] as String,
+    label: j['label'] as String?,
+    sourceFile: j['file'] as String?,
+    sourceLine: j['line'] as int?,
+    rect: RectBox.fromJson(j['r'] as Map<String, dynamic>),
+    depth: (j['d'] as int?) ?? 0,
+    colorHex: j['color'] as String?,
+    textColorHex: j['textColor'] as String?,
+    text: j['text'] as String?,
+    childText: j['childText'] as String?,
+    chain: (j['chain'] as List?)?.cast<String>() ?? const [],
+  );
 }
 
 /// A captured screen of the app.
@@ -153,27 +152,28 @@ class CapturedScreen {
   final String? error; // set when this screen failed to capture
 
   Map<String, dynamic> toJson() => {
-        'route': route,
-        'label': label,
-        'png': pngFile,
-        'w': width,
-        'h': height,
-        if (error != null) 'error': error,
-        'regions': regions.map((r) => r.toJson()).toList(),
-      };
+    'route': route,
+    'label': label,
+    'png': pngFile,
+    'w': width,
+    'h': height,
+    if (error != null) 'error': error,
+    'regions': regions.map((r) => r.toJson()).toList(),
+  };
 
   factory CapturedScreen.fromJson(Map<String, dynamic> j) => CapturedScreen(
-        route: j['route'] as String,
-        label: j['label'] as String,
-        pngFile: j['png'] as String,
-        width: j['w'] as int,
-        height: j['h'] as int,
-        error: j['error'] as String?,
-        regions: (j['regions'] as List?)
-                ?.map((r) => ScreenRegion.fromJson(r as Map<String, dynamic>))
-                .toList() ??
-            const [],
-      );
+    route: j['route'] as String,
+    label: j['label'] as String,
+    pngFile: j['png'] as String,
+    width: j['w'] as int,
+    height: j['h'] as int,
+    error: j['error'] as String?,
+    regions:
+        (j['regions'] as List?)
+            ?.map((r) => ScreenRegion.fromJson(r as Map<String, dynamic>))
+            .toList() ??
+        const [],
+  );
 }
 
 /// The full screen map for a project at a given git HEAD.
@@ -190,18 +190,17 @@ class ScreenMap {
   final List<CapturedScreen> screens;
   final String? log; // harness/build log tail (for surfacing failures)
 
-  CapturedScreen? firstGood() =>
-      screens.where((s) => s.error == null).cast<CapturedScreen?>().firstWhere(
-            (s) => s != null,
-            orElse: () => null,
-          );
+  CapturedScreen? firstGood() => screens
+      .where((s) => s.error == null)
+      .cast<CapturedScreen?>()
+      .firstWhere((s) => s != null, orElse: () => null);
 
   String toJson() => jsonEncode({
-        'v': 1,
-        'project': projectId,
-        'head': head,
-        'screens': screens.map((s) => s.toJson()).toList(),
-      });
+    'v': 1,
+    'project': projectId,
+    'head': head,
+    'screens': screens.map((s) => s.toJson()).toList(),
+  });
 
   factory ScreenMap.fromJson(String src) {
     final j = jsonDecode(src) as Map<String, dynamic>;
@@ -216,7 +215,15 @@ class ScreenMap {
 }
 
 /// A visual edit operation (what the user did) and the result of applying it.
-enum VisualOpKind { setColor, setText, insertImage, replaceImage, move, setPadding }
+enum VisualOpKind {
+  setColor,
+  setText,
+  insertImage,
+  replaceImage,
+  move,
+  setPadding,
+  setBackground,
+}
 
 class VisualOp {
   const VisualOp({
@@ -257,6 +264,8 @@ class VisualOp {
         final p = padding!;
         return 'set padding of $where to '
             '(t ${p.$1.round()}, r ${p.$2.round()}, b ${p.$3.round()}, l ${p.$4.round()})';
+      case VisualOpKind.setBackground:
+        return 'set the screen background to $colorHex';
     }
   }
 }
@@ -279,30 +288,31 @@ class VisualEditRecord {
   final String opSummary;
   final String headBefore;
   final String headAfter;
+
   /// Files the op changed (path → size of the ORIGINAL bytes stored).
   final Map<String, int> touchedFiles;
   final bool ok;
   final String? detail; // e.g. "rolled back — analyzer errors"
 
   Map<String, dynamic> toJson() => {
-        'id': id,
-        'time': timeMs,
-        'op': opSummary,
-        'before': headBefore,
-        'after': headAfter,
-        'files': touchedFiles,
-        'ok': ok,
-        if (detail != null) 'detail': detail,
-      };
+    'id': id,
+    'time': timeMs,
+    'op': opSummary,
+    'before': headBefore,
+    'after': headAfter,
+    'files': touchedFiles,
+    'ok': ok,
+    if (detail != null) 'detail': detail,
+  };
 
   factory VisualEditRecord.fromJson(Map<String, dynamic> j) => VisualEditRecord(
-        id: j['id'] as int,
-        timeMs: j['time'] as int,
-        opSummary: j['op'] as String,
-        headBefore: j['before'] as String,
-        headAfter: j['after'] as String,
-        touchedFiles: (j['files'] as Map?)?.cast<String, int>() ?? const {},
-        ok: j['ok'] as bool,
-        detail: j['detail'] as String?,
-      );
+    id: j['id'] as int,
+    timeMs: j['time'] as int,
+    opSummary: j['op'] as String,
+    headBefore: j['before'] as String,
+    headAfter: j['after'] as String,
+    touchedFiles: (j['files'] as Map?)?.cast<String, int>() ?? const {},
+    ok: j['ok'] as bool,
+    detail: j['detail'] as String?,
+  );
 }

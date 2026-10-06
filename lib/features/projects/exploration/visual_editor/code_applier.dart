@@ -59,8 +59,14 @@ Future<ApplierOutcome> applyVisualOp({
   if (edit == null) {
     return ApplierOutcome(
       status: OpStatus.needsAgent,
-      record: _record(op, headBefore, headBefore, const {}, false,
-          'Needs the assistant'),
+      record: _record(
+        op,
+        headBefore,
+        headBefore,
+        const {},
+        false,
+        'Needs the assistant',
+      ),
       agentPrompt: _agentPrompt(op),
       reason: 'No safe deterministic pattern found',
     );
@@ -81,8 +87,14 @@ Future<ApplierOutcome> applyVisualOp({
     await ws.writeBytes(edit.filePath, original);
     return ApplierOutcome(
       status: OpStatus.rolledBack,
-      record: _record(op, headBefore, headBefore, touched, false,
-          'Commit failed: $e'),
+      record: _record(
+        op,
+        headBefore,
+        headBefore,
+        touched,
+        false,
+        'Commit failed: $e',
+      ),
       commitMessage: commitMessage,
       analyzerOutput: 'Commit failed: $e',
     );
@@ -160,31 +172,50 @@ Future<_DeterministicEdit?> _deterministicEditAsync({
 
   final next = switch (op.kind) {
     VisualOpKind.setText => setTextEdit(
-        content,
-        anchor: anchor,
-        currentText: op.region.text,
-        newText: op.text ?? '',
-      ),
+      content,
+      anchor: anchor,
+      currentText: op.region.text,
+      newText: op.text ?? '',
+    ),
     VisualOpKind.setColor =>
-        (op.region.widgetType.contains('RenderParagraph') ||
-                op.region.text != null)
-            ? setTextColorEdit(content, anchor: anchor, hex: op.colorHex ?? '')
-            : setBgColorEdit(content, anchor: anchor, hex: op.colorHex ?? ''),
+      (op.region.widgetType.contains('RenderParagraph') ||
+              op.region.text != null)
+          ? setTextColorEdit(content, anchor: anchor, hex: op.colorHex ?? '')
+          : setBgColorEdit(content, anchor: anchor, hex: op.colorHex ?? ''),
     VisualOpKind.insertImage => null,
     VisualOpKind.replaceImage => replaceImageEdit(
-        content, anchor: anchor, assetPath: op.assetPath ?? ''),
-    VisualOpKind.move => moveEdit(content, anchor: anchor, dx: op.dx, dy: op.dy),
-    VisualOpKind.setPadding => op.padding == null
-        ? null
-        : setPaddingEdit(content, anchor: anchor, padding: op.padding!),
+      content,
+      anchor: anchor,
+      assetPath: op.assetPath ?? '',
+    ),
+    VisualOpKind.move => moveEdit(
+      content,
+      anchor: anchor,
+      dx: op.dx,
+      dy: op.dy,
+    ),
+    VisualOpKind.setPadding =>
+      op.padding == null
+          ? null
+          : setPaddingEdit(content, anchor: anchor, padding: op.padding!),
+    VisualOpKind.setBackground => setBackgroundEdit(
+      content,
+      anchor: anchor,
+      hex: op.colorHex ?? '',
+    ),
   };
+  print(
+    '[VisualEditor] ${op.kind.name} @ ${file}:$anchor → ${next == null ? "NO deterministic match (→ agent)" : "match found"}',
+  );
   return next == null ? null : _DeterministicEdit(file, next);
 }
 
 /// Precise prompt for the assistant (tier 2): what, where, with context.
 String _agentPrompt(VisualOp op) {
   final r = op.region;
-  final where = r.hasSource ? '${r.sourceFile}:${r.sourceLine}' : 'unknown file';
+  final where = r.hasSource
+      ? '${r.sourceFile}:${r.sourceLine}'
+      : 'unknown file';
   final box = r.rect;
   final boxDesc =
       '(${box.x.round()}, ${box.y.round()}, ${box.w.round()}×${box.h.round()})';
@@ -201,6 +232,8 @@ String _agentPrompt(VisualOp op) {
       'Visual edit task: move the ${r.label ?? r.widgetType} at $where (screen region $boxDesc) by (${op.dx.round()}, ${op.dy.round()}) pixels — change the surrounding padding/margin/Positioned/alignment, do NOT freeform-position the widget. Edit only the minimal lines needed; keep the file compiling.',
     VisualOpKind.setPadding =>
       'Visual edit task: set the padding of the ${r.label ?? r.widgetType} at $where (screen region $boxDesc) to top ${op.padding!.$1.round()}, right ${op.padding!.$2.round()}, bottom ${op.padding!.$3.round()}, left ${op.padding!.$4.round()} — adjust the nearest EdgeInsets/padding/margin, keep the layout sane. Edit only the minimal lines needed; keep the file compiling.',
+    VisualOpKind.setBackground =>
+      'Visual edit task: change this screen\'s BACKGROUND colour to ${op.colorHex} at $where. Set the page Scaffold\'s `backgroundColor:` (or the top-level background) — do not restyle individual widgets. Edit only the minimal lines needed; keep the file compiling.',
   };
 }
 
@@ -233,11 +266,13 @@ Future<_Analysis> _analyzeChanged(Workspace ws, List<String> files) async {
       );
       buffer.writeln(run.output);
       if (run.exitCode != 0) {
-        errors.addAll(run.output
-            .split('\n')
-            .where((l) => l.trim().isNotEmpty)
-            .take(6)
-            .toList());
+        errors.addAll(
+          run.output
+              .split('\n')
+              .where((l) => l.trim().isNotEmpty)
+              .take(6)
+              .toList(),
+        );
       }
     } finally {
       try {
@@ -253,9 +288,14 @@ Future<_Analysis> _analyzeChanged(Workspace ws, List<String> files) async {
 Future<void> ensureAssetInPubspec(Workspace ws, String assetPath) async {
   const pubspecPath = '/pubspec.yaml';
   if (!await ws.exists(pubspecPath)) return;
-  final raw = utf8.decode(await ws.readBytes(pubspecPath), allowMalformed: true);
+  final raw = utf8.decode(
+    await ws.readBytes(pubspecPath),
+    allowMalformed: true,
+  );
   final clean = assetPath.replaceAll(RegExp(r'^/'), '');
-  final dir = clean.contains('/') ? clean.substring(0, clean.lastIndexOf('/')) : '';
+  final dir = clean.contains('/')
+      ? clean.substring(0, clean.lastIndexOf('/'))
+      : '';
   final hasDir = dir.isNotEmpty && raw.contains('- $dir/');
   final hasFile = raw.contains('- $clean');
   if (hasDir || hasFile) return;
@@ -264,13 +304,18 @@ Future<void> ensureAssetInPubspec(Workspace ws, String assetPath) async {
   if (flutterM == null) {
     next = '$raw\nflutter:\n  assets:\n    - $clean\n';
   } else {
-    final assetsM = RegExp(r'^(\s*)assets:\s*$', multiLine: true).firstMatch(raw);
+    final assetsM = RegExp(
+      r'^(\s*)assets:\s*$',
+      multiLine: true,
+    ).firstMatch(raw);
     if (assetsM == null) {
-      next = raw.substring(0, flutterM.end) +
+      next =
+          raw.substring(0, flutterM.end) +
           '  assets:\n    - $clean\n' +
           raw.substring(flutterM.end);
     } else {
-      next = raw.substring(0, assetsM.end) +
+      next =
+          raw.substring(0, assetsM.end) +
           '  - $clean\n' +
           raw.substring(assetsM.end);
     }
