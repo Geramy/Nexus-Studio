@@ -43,7 +43,9 @@ class ScreenRegion {
     this.sourceLine,
     this.depth = 0,
     this.colorHex,
+    this.textColorHex,
     this.text,
+    this.childText,
     this.chain = const [],
   });
 
@@ -71,8 +73,17 @@ class ScreenRegion {
   final RectBox rect;
   final int depth; // tree depth — smaller (deeper tree) wins hit-tests
 
-  /// When the harness could extract it (a DecoratedBox with a solid color).
+  /// When the harness could extract it (sampled painted background / a
+  /// DecoratedBox solid fill).
   final String? colorHex;
+
+  /// The rendered glyph colour of a text region (RenderParagraph style).
+  /// Drives "set text colour" — a one-line TextStyle(color:) edit.
+  final String? textColorHex;
+
+  /// First rendered text inside this region (for boxes: the label a
+  /// card/button/header shows) — a strong grep anchor for the source.
+  final String? childText;
 
   bool get hasSource => sourceFile != null && sourceLine != null;
 
@@ -85,7 +96,9 @@ class ScreenRegion {
         sourceLine: line,
         depth: depth,
         colorHex: colorHex,
+        textColorHex: textColorHex,
         text: text,
+        childText: childText,
         chain: chain,
       );
 
@@ -98,7 +111,9 @@ class ScreenRegion {
         'r': rect.toJson(),
         'd': depth,
         if (colorHex != null) 'color': colorHex,
+        if (textColorHex != null) 'textColor': textColorHex,
         if (text != null) 'text': text,
+        if (childText != null) 'childText': childText,
         if (chain.isNotEmpty) 'chain': chain,
       };
 
@@ -111,7 +126,9 @@ class ScreenRegion {
         rect: RectBox.fromJson(j['r'] as Map<String, dynamic>),
         depth: (j['d'] as int?) ?? 0,
         colorHex: j['color'] as String?,
+        textColorHex: j['textColor'] as String?,
         text: j['text'] as String?,
+        childText: j['childText'] as String?,
         chain: (j['chain'] as List?)?.cast<String>() ?? const [],
       );
 }

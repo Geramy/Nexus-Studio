@@ -122,28 +122,17 @@ class SourceIndex {
             ? classes[pageClass]!.first.$1
             : null;
 
-    // 1) Rendered text → literal search.
-    final text = (region.text ?? '').trim();
-    if (text.length >= 4) {
-      final probe = text.length > 30 ? text.substring(0, 30) : text;
-      final escaped = RegExp.escape(probe);
-      final re = RegExp("['\"]$escaped");
-      final candidates = <(String, int)>[];
-      for (final f in files.values) {
-        final m = re.firstMatch(f.content);
-        if (m != null) {
-          final line = f.content.substring(0, m.start).split('\n').length;
-          candidates.add((f.path, line));
-        }
-      }
-      if (candidates.length == 1) return candidates.first;
-      if (candidates.length > 1) {
-        // Prefer the screen's page file, then the first.
-        for (final c in candidates) {
-          if (c.$1 == pageFile) return c;
-        }
-        return candidates.first;
-      }
+    // 1) Rendered text → literal search. A region's own text is the strongest
+    //    anchor; for boxes, the text they CONTAIN (childText) is next.
+    final own = (region.text ?? '').trim();
+    if (own.length >= 4) {
+      final hit = _findText(own, pageFile);
+      if (hit != null) return hit;
+    }
+    final child = (region.childText ?? '').trim();
+    if (child.length >= 4) {
+      final hit = _findText(child, pageFile);
+      if (hit != null) return hit;
     }
 
     // 2) Solid color → exact literal search.
@@ -203,6 +192,28 @@ class SourceIndex {
       if (locs != null && locs.isNotEmpty) return locs.first;
     }
     return null;
+  }
+
+  /// Find a rendered [text] string literal in the sources. Returns the best
+  /// (file, line) — preferring [pageFile], else the first file where it appears.
+  (String, int)? _findText(String text, String? pageFile) {
+    final probe = text.length > 30 ? text.substring(0, 30) : text;
+    final escaped = RegExp.escape(probe);
+    final re = RegExp("['\"]$escaped");
+    final candidates = <(String, int)>[];
+    for (final f in files.values) {
+      final m = re.firstMatch(f.content);
+      if (m != null) {
+        final line = f.content.substring(0, m.start).split('\n').length;
+        candidates.add((f.path, line));
+      }
+    }
+    if (candidates.isEmpty) return null;
+    if (candidates.length == 1) return candidates.first;
+    for (final c in candidates) {
+      if (c.$1 == pageFile) return c;
+    }
+    return candidates.first;
   }
 
   static Future<bool> _isProbablyBinary(List<int> bytes) async {

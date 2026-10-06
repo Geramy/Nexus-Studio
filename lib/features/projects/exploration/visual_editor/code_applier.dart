@@ -14,13 +14,13 @@
 library;
 
 import 'dart:convert';
+import 'dart:io';
 
-import '../../../../infrastructure/build/workspace_materializer.dart';
 import '../../../../infrastructure/exec/captured_run.dart';
 import '../../../../infrastructure/workspace/git/nxtprj_git_engine.dart';
 import '../../../../infrastructure/workspace/workspace.dart';
+import 'deterministic_edit_ops.dart';
 import 'region_model.dart';
-import 'screen_map_service.dart';
 
 enum OpStatus { applied, rolledBack, needsAgent }
 
@@ -46,8 +46,6 @@ class _DeterministicEdit {
   final String filePath;
   final String newContent;
 }
-
-const _window = 14; // ± lines around the source line
 
 /// Apply [op] to the live workspace. Caller passes pre-asset-written state:
 /// for image ops, [op.assetPath] must already exist in [ws].
@@ -145,169 +143,43 @@ VisualEditRecord _record(
   );
 }
 
-/// The deterministic tier: find a safe literal to change near the region's
-/// source line. Returns null when no confident pattern exists.
+/// The deterministic tier: a surgical edit anchored on the region's source
+/// line. All the string surgery lives in [deterministic_edit_ops] (pure,
+/// unit-tested); here we just read the file, pick the right op, and hand back
+/// the new content. Returns null when no confident, well-anchored pattern
+/// exists — the caller then falls back to the agent.
 Future<_DeterministicEdit?> _deterministicEditAsync({
   required Workspace ws,
   required VisualOp op,
 }) async {
   final file = op.region.sourceFile;
-  final line = op.region.sourceLine;
-  if (file == null || line == null) return null;
+  final anchor = op.region.sourceLine;
+  if (file == null || anchor == null) return null;
   final bytes = await ws.readBytes(file);
   final content = utf8.decode(bytes, allowMalformed: true);
-  final lines = content.split('\n');
-  final lo = (line - _window).clamp(0, lines.length);
-  final hi = (line + _window).clamp(0, lines.length);
-  var windowStart = 0;
-  for (var i = 0; i < lo; i++) {
-    windowStart += lines[i].length + 1;
-  }
-  final windowText = lines.sublist(lo, hi).join('\n');
 
-  switch (op.kind) {
-    case VisualOpKind.setColor:
-      final hex = (op.colorHex ?? '').replaceAll('#', '');
-      if (hex.length < 6) return null;
-      final replacement = 'Color(0x${_alpha(hex)}${hex.substring(0, 6).toUpperCase()})';
-      // Prefer an EXACT match of the region's current color, else the first
-      // color literal in the window.
-      RegExpMatch? range;
-      if (op.region.colorHex != null) {
-        range = RegExp(
-          'Color\\(0x[0-9A-Fa-f]{6,8}\\)',
-        ).firstMatch(windowText);
-      }
-      range ??= RegExp(_colorTokenRe).firstMatch(windowText);
-      if (range == null) return null;
-      final at = windowStart + range.start;
-      final next =
-          content.substring(0, at) + replacement + content.substring(at + range.end);
-      return _DeterministicEdit(file, next);
-
-    case VisualOpKind.setText:
-      final re = RegExp("Text\\(\\s*(['\"])");
-      final m = re.firstMatch(windowText);
-      if (m == null) return null;
-      final quote = m.group(1)!;
-      // The literal's content starts right after the opening quote.
-      final contentStart = windowStart + m.end;
-      final closeIdx = windowText.indexOf(quote, m.end);
-      if (closeIdx < 0) return null;
-      final escaped = (op.text ?? '')
-          .replaceAll(r'\', r'\\')
-          .replaceAll('\$', r'\$')
-          .replaceAll(quote, '\\$quote');
-      final next = content.substring(0, contentStart) +
-          escaped +
-          content.substring(windowStart + closeIdx);
-      return _DeterministicEdit(file, next);
-
-    case VisualOpKind.insertImage:
-      return null; // structural — always the agent
-
-    case VisualOpKind.replaceImage:
-      final re = RegExp("Image\\.asset\\(\\s*(['\"])");
-      final m = re.firstMatch(windowText);
-      final asset = (op.assetPath ?? '').replaceAll(RegExp(r'^/'), '');
-      if (m == null || asset.isEmpty) return null;
-      final contentStart = windowStart + m.end;
-      final quote = m.group(1)!;
-      final closeIdx = windowText.indexOf(quote, m.end);
-      if (closeIdx < 0) return null;
-      final next = content.substring(0, contentStart) +
-          asset +
-          content.substring(windowStart + closeIdx);
-      return _DeterministicEdit(file, next);
-
-    case VisualOpKind.move:
-      final dx = op.dx;
-      final dy = op.dy;
-      RegExpMatch? m =
-          RegExp(r'left:\s*([+-]?\d+(?:\.\d+)?)\s*,\s*top:\s*([+-]?\d+(?:\.\d+)?)')
-              .firstMatch(windowText);
-      if (m != null) {
-        final nl = _fmt((double.parse(m.group(1)!) + dx));
-        final nt = _fmt((double.parse(m.group(2)!) + dy));
-        final at = windowStart + m.start;
-        final next = content.substring(0, at) +
-            'left: $nl, top: $nt' +
-            content.substring(at + m.end);
-        return _DeterministicEdit(file, next);
-      }
-      m = RegExp(r'Offset\(\s*([+-]?\d+(?:\.\d+)?)\s*,\s*([+-]?\d+(?:\.\d+)?)\s*\)')
-          .firstMatch(windowText);
-      if (m != null) {
-        final nx = _fmt((double.parse(m.group(1)!) + dx));
-        final ny = _fmt((double.parse(m.group(2)!) + dy));
-        final at = windowStart + m.start;
-        final next = content.substring(0, at) +
-            'Offset($nx, $ny)' +
-            content.substring(at + m.end);
-        return _DeterministicEdit(file, next);
-      }
-      return null;
-
-    case VisualOpKind.setPadding:
-      final p = op.padding;
-      if (p == null) return null;
-      final t = _fmt(p.$1);
-      final rt = _fmt(p.$2);
-      final b = _fmt(p.$3);
-      final l = _fmt(p.$4);
-      RegExpMatch? m =
-          RegExp(r'EdgeInsets\.all\(\s*[+-]?\d+(?:\.\d+)?\s*\)')
-              .firstMatch(windowText);
-      if (m != null) {
-        final at = windowStart + m.start;
-        final next = content.substring(0, at) +
-            'EdgeInsets.fromLTRB($l, $t, $rt, $b)' +
-            content.substring(at + m.end);
-        return _DeterministicEdit(file, next);
-      }
-      m = RegExp(
-        r'EdgeInsets\.symmetric\(\s*horizontal:\s*[+-]?\d+(?:\.\d+)?\s*,\s*vertical:\s*[+-]?\d+(?:\.\d+)?\s*\)|EdgeInsets\.symmetric\(\s*vertical:\s*[+-]?\d+(?:\.\d+)?\s*,\s*horizontal:\s*[+-]?\d+(?:\.\d+)?\s*\)',
-      ).firstMatch(windowText);
-      if (m != null) {
-        final at = windowStart + m.start;
-        final next = content.substring(0, at) +
-            'EdgeInsets.fromLTRB($l, $t, $rt, $b)' +
-            content.substring(at + m.end);
-        return _DeterministicEdit(file, next);
-      }
-      m = RegExp(
-        r'EdgeInsets\.fromLTRB\(\s*[+-]?\d+(?:\.\d+)?\s*,\s*[+-]?\d+(?:\.\d+)?\s*,\s*[+-]?\d+(?:\.\d+)?\s*,\s*[+-]?\d+(?:\.\d+)?\s*\)',
-      ).firstMatch(windowText);
-      if (m != null) {
-        final at = windowStart + m.start;
-        final next = content.substring(0, at) +
-            'EdgeInsets.fromLTRB($l, $t, $rt, $b)' +
-            content.substring(at + m.end);
-        return _DeterministicEdit(file, next);
-      }
-      m = RegExp(r'EdgeInsets\.only\(\s*(?:\w+:\s*[+-]?\d+(?:\.\d+)?\s*,\s*)+\)')
-          .firstMatch(windowText);
-      if (m != null) {
-        final at = windowStart + m.start;
-        final next = content.substring(0, at) +
-            'EdgeInsets.fromLTRB($l, $t, $rt, $b)' +
-            content.substring(at + m.end);
-        return _DeterministicEdit(file, next);
-      }
-      return null;
-  }
+  final next = switch (op.kind) {
+    VisualOpKind.setText => setTextEdit(
+        content,
+        anchor: anchor,
+        currentText: op.region.text,
+        newText: op.text ?? '',
+      ),
+    VisualOpKind.setColor =>
+        (op.region.widgetType.contains('RenderParagraph') ||
+                op.region.text != null)
+            ? setTextColorEdit(content, anchor: anchor, hex: op.colorHex ?? '')
+            : setBgColorEdit(content, anchor: anchor, hex: op.colorHex ?? ''),
+    VisualOpKind.insertImage => null,
+    VisualOpKind.replaceImage => replaceImageEdit(
+        content, anchor: anchor, assetPath: op.assetPath ?? ''),
+    VisualOpKind.move => moveEdit(content, anchor: anchor, dx: op.dx, dy: op.dy),
+    VisualOpKind.setPadding => op.padding == null
+        ? null
+        : setPaddingEdit(content, anchor: anchor, padding: op.padding!),
+  };
+  return next == null ? null : _DeterministicEdit(file, next);
 }
-
-String _fmt(double v) {
-  final s = v.toStringAsFixed(1);
-  return s.endsWith('.0') ? s.substring(0, s.length - 2) : s;
-}
-
-const _colorTokenRe =
-    r'Colors\.[A-Za-z]+|Color\(0x[0-9A-Fa-f]{6,8}\)|Color\.fromARGB\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*\d+\s*\)';
-
-String _alpha(String hex) =>
-    hex.length >= 8 ? hex.substring(6, 8).toUpperCase() : 'FF';
 
 /// Precise prompt for the assistant (tier 2): what, where, with context.
 String _agentPrompt(VisualOp op) {
@@ -338,34 +210,42 @@ class _Analysis {
   final String raw;
 }
 
-/// Materialize the (just-committed) workspace and run the analyzer over the
-/// changed files.
+/// Fast guard: the deterministic edits only rewrite string/colour/number
+/// literals, so a PARSE check is sufficient (no new identifiers are
+/// introduced, so a type check can't surface anything extra). We write the
+/// edited file to a temp path and run `dart format --output=none` — a ~50 ms
+/// parse check that needs no materialization or pub get. This keeps the
+/// edit→see-it loop near-instant instead of a full rebuild.
 Future<_Analysis> _analyzeChanged(Workspace ws, List<String> files) async {
-  final materializer = WorkspaceMaterializer();
-  final mat = await materializer.materialize(ws, tag: 'visualcheck');
-  try {
-    final appDir = findFlutterAppDir(mat.path) ?? mat.path;
-    final relFiles = files
-        .map((f) => f.replaceAll(RegExp(r'^/'), ''))
-        .where((f) => f.startsWith('lib/') || f == 'pubspec.yaml')
-        .toList();
-    if (relFiles.isEmpty) return const _Analysis([], '');
-    final script = 'flutter pub get >/dev/null 2>&1; flutter analyze ' +
-        relFiles.map((f) => '"$f"').join(' ');
-    final run = await runCaptured(
-      script,
-      workingDirectory: appDir,
-      timeout: const Duration(minutes: 10),
-    );
-    final errors = run.output
-        .split('\n')
-        .where((l) => l.contains(' error ') || l.startsWith('error'))
-        .take(8)
-        .toList();
-    return _Analysis(errors, run.output);
-  } finally {
-    await mat.dispose();
+  final errors = <String>[];
+  final buffer = StringBuffer();
+  for (final f in files) {
+    final rel = f.replaceAll(RegExp(r'^/'), '');
+    if (!rel.startsWith('lib/') || !rel.endsWith('.dart')) continue;
+    final bytes = await ws.readBytes(f);
+    final tmp = Directory.systemTemp.createTempSync('nexus_fmt_');
+    final tmpFile = File('${tmp.path}${Platform.pathSeparator}check.dart');
+    try {
+      tmpFile.writeAsBytesSync(bytes);
+      final run = await runCaptured(
+        'dart format --output=none "${tmpFile.path}"',
+        timeout: const Duration(seconds: 30),
+      );
+      buffer.writeln(run.output);
+      if (run.exitCode != 0) {
+        errors.addAll(run.output
+            .split('\n')
+            .where((l) => l.trim().isNotEmpty)
+            .take(6)
+            .toList());
+      }
+    } finally {
+      try {
+        tmp.deleteSync(recursive: true);
+      } catch (_) {}
+    }
   }
+  return _Analysis(errors, buffer.toString());
 }
 
 /// Make sure [assetPath] (workspace path, e.g. /assets/gen_1.png) is declared

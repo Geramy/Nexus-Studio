@@ -1194,63 +1194,100 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
         child: SizedBox(
           width: w,
           height: h,
-          child: Stack(children: [
-            Positioned(
-              left: 0,
-              top: 0,
-              child: Image.file(
-                _pngPath(screen),
-                width: w,
-                height: h,
-                gaplessPlayback: true,
-              ),
+          child: MouseRegion(
+            onExit: (_) {
+              if (_hover != null) setState(() => _hover = null);
+            },
+            child: Listener(
+              behavior: HitTestBehavior.opaque,
+              onPointerMove: (e) => _canvasPointerMove(screen, e.localPosition),
+              onPointerDown: (e) => _canvasPointerDown(screen, e),
+              onPointerUp: (_) => _shiftDragEnd(),
+              onPointerCancel: (_) => _shiftDragEnd(),
+              child: Stack(children: [
+                Positioned(
+                  left: 0,
+                  top: 0,
+                  child: Image.file(
+                    _pngPath(screen),
+                    width: w,
+                    height: h,
+                    gaplessPlayback: true,
+                  ),
+                ),
+                // Hover outline (single, from canvas-level hit testing).
+                if (_hover != null)
+                  Positioned(
+                    left: _hover!.rect.x,
+                    top: _hover!.rect.y,
+                    width: _hover!.rect.w,
+                    height: _hover!.rect.h,
+                    child: Container(
+                      decoration: BoxDecoration(
+                        border: Border.all(
+                            color:
+                                Theme.of(context).colorScheme.primary, width: 2),
+                      ),
+                    ),
+                  ),
+                // Move preview.
+                if (dragging && _selected != null)
+                  Positioned(
+                    left: _selected!.rect.x + _dragDelta.dx,
+                    top: _selected!.rect.y + _dragDelta.dy,
+                    width: _selected!.rect.w,
+                    height: _selected!.rect.h,
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: Colors.blue.withValues(alpha: 0.12),
+                        border: Border.all(color: Colors.blue, width: 1.5),
+                      ),
+                    ),
+                  ),
+              ]),
             ),
-            // Regions — shallow (big) first, deep (specific) last = on top.
-            for (final r in screen.regions)
-              _RegionOverlay(
-                region: r,
-                isDragActive: _dragOrigin != null,
-                onHover: (reg) => setState(() => _hover = reg),
-                onUnhover: () => setState(() {
-                  if (_hover == r) _hover = null;
-                }),
-                onRightClick: (ctx, pos, reg) => _openRegionMenu(ctx, pos, reg),
-                onShiftDragStart: (reg, pos) => _shiftDragStart(reg, pos),
-                onShiftDragMove: (pos) => _shiftDragMove(pos),
-                onShiftDragEnd: () => _shiftDragEnd(),
-              ),
-            // Hover outline (drawn above all regions).
-            if (_hover != null)
-              Positioned(
-                left: _hover!.rect.x,
-                top: _hover!.rect.y,
-                width: _hover!.rect.w,
-                height: _hover!.rect.h,
-                child: Container(
-                  decoration: BoxDecoration(
-                    border: Border.all(
-                        color: Theme.of(context).colorScheme.primary, width: 2),
-                  ),
-                ),
-              ),
-            // Move preview.
-            if (dragging && _selected != null)
-              Positioned(
-                left: _selected!.rect.x + _dragDelta.dx,
-                top: _selected!.rect.y + _dragDelta.dy,
-                width: _selected!.rect.w,
-                height: _selected!.rect.h,
-                child: Container(
-                  decoration: BoxDecoration(
-                    color: Colors.blue.withValues(alpha: 0.12),
-                    border: Border.all(color: Colors.blue, width: 1.5),
-                  ),
-                ),
-              ),
-          ]),
+          ),
         ),
       ),
     );
+  }
+
+  /// The most specific (smallest) region containing [p] — overlapping
+  /// regions (a text box inside its container) never fight over hover.
+  ScreenRegion? _hitRegion(CapturedScreen screen, Offset p) {
+    ScreenRegion? best;
+    for (final r in screen.regions) {
+      final rc = r.rect;
+      if (p.dx < rc.x || p.dy < rc.y) continue;
+      if (p.dx > rc.x + rc.w || p.dy > rc.y + rc.h) continue;
+      if (best == null || rc.area < best.rect.area) best = r;
+    }
+    return best;
+  }
+
+  void _canvasPointerMove(CapturedScreen screen, Offset p) {
+    if (_dragOrigin != null) {
+      _shiftDragMove(p);
+      return;
+    }
+    final hit = _hitRegion(screen, p);
+    if (!identical(hit, _hover)) {
+      setState(() => _hover = hit);
+    }
+  }
+
+  void _canvasPointerDown(CapturedScreen screen, PointerEvent e) {
+    final p = e.localPosition;
+    if ((e.buttons & kSecondaryButton) != 0) {
+      final r = _hitRegion(screen, p);
+      if (r != null) _openRegionMenu(context, e.position, r);
+      return;
+    }
+    if ((e.buttons & kPrimaryButton) != 0 &&
+        HardwareKeyboard.instance.isShiftPressed) {
+      final r = _hitRegion(screen, p);
+      if (r != null) _shiftDragStart(r, p);
+    }
   }
 
   void _shiftDragStart(ScreenRegion r, Offset screenPos) {
@@ -1534,87 +1571,10 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
   }
 }
 
-/// A pickable region overlay.
-class _RegionOverlay extends StatefulWidget {
-  const _RegionOverlay({
-    required this.region,
-    required this.isDragActive,
-    required this.onHover,
-    required this.onUnhover,
-    required this.onRightClick,
-    required this.onShiftDragStart,
-    required this.onShiftDragMove,
-    required this.onShiftDragEnd,
-  });
-
-  final ScreenRegion region;
-  final bool isDragActive;
-  final ValueChanged<ScreenRegion?> onHover;
-  final VoidCallback onUnhover;
-  final void Function(BuildContext, Offset, ScreenRegion) onRightClick;
-  final void Function(ScreenRegion, Offset) onShiftDragStart;
-  final ValueChanged<Offset> onShiftDragMove;
-  final VoidCallback onShiftDragEnd;
-
-  @override
-  State<_RegionOverlay> createState() => _RegionOverlayState();
-}
-
-class _RegionOverlayState extends State<_RegionOverlay> {
-  bool _dragging = false;
-
-  bool get _shiftDown => HardwareKeyboard.instance.isShiftPressed;
-
-  /// Region-local → screen-space position.
-  Offset _screenPos(PointerEvent e) =>
-      e.localPosition + Offset(widget.region.rect.x, widget.region.rect.y);
-
-  @override
-  Widget build(BuildContext context) {
-    final r = widget.region;
-    return Positioned(
-      left: r.rect.x,
-      top: r.rect.y,
-      width: r.rect.w,
-      height: r.rect.h,
-      child: MouseRegion(
-        onEnter: (_) => widget.onHover(r),
-        onExit: (_) {
-          if (!_dragging) widget.onUnhover();
-        },
-        child: Listener(
-          behavior: HitTestBehavior.translucent,
-          onPointerDown: (e) {
-            if ((e.buttons & kSecondaryButton) != 0) {
-              widget.onRightClick(context, e.position, r);
-              return;
-            }
-            if (!_shiftDown) return;
-            if ((e.buttons & kPrimaryButton) == 0) return;
-            _dragging = true;
-            widget.onShiftDragStart(r, _screenPos(e));
-          },
-          onPointerMove: (e) {
-            if (_dragging) widget.onShiftDragMove(_screenPos(e));
-          },
-          onPointerUp: (e) {
-            if (_dragging) {
-              _dragging = false;
-              widget.onShiftDragEnd();
-            }
-          },
-          onPointerCancel: (e) {
-            if (_dragging) {
-              _dragging = false;
-              widget.onShiftDragEnd();
-            }
-          },
-          child: const SizedBox.expand(),
-        ),
-      ),
-    );
-  }
-}
+/// (Region picking now happens at the CANVAS level — see
+/// `_canvasPointerMove`/`_canvasPointerDown`/`_hitRegion` — which gives one
+/// deterministic "most specific region under the pointer" instead of every
+/// overlapping region's own MouseRegion fighting over hover.)
 
 class _MenuItem extends StatelessWidget {
   const _MenuItem(this.label, this.icon);
@@ -1646,8 +1606,7 @@ class _ColorDialog extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final controller = TextEditingController(text: current ?? '');
-    return StatefulBuilder(
-      builder: (context, setDlg) => AlertDialog(
+    return AlertDialog(
         title: const Text('Change color'),
         content: SizedBox(
           width: 320,
@@ -1664,12 +1623,15 @@ class _ColorDialog extends StatelessWidget {
                 children: [
                   for (final hex in _swatches)
                     GestureDetector(
-                      onTap: () => setDlg(() {}),
+                      onTap: () {
+                        Navigator.pop(context);
+                        onPick(hex);
+                      },
                       child: MouseRegion(
                         cursor: SystemMouseCursors.click,
                         child: Container(
-                          color: VisualEditorHelpers.parse(hex),
                           decoration: BoxDecoration(
+                            color: VisualEditorHelpers.parse(hex),
                             border: Border.all(
                               color: (current ?? '').toUpperCase() ==
                                       hex.toUpperCase()
@@ -1716,7 +1678,6 @@ class _ColorDialog extends StatelessWidget {
             child: const Text('Apply'),
           ),
         ],
-      ),
     );
   }
 }

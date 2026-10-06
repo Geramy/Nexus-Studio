@@ -66,6 +66,7 @@ Future<void> main() async {
     addTearDown(tester.view.resetDevicePixelRatio);
     await tester.runAsync(() async {
       Directory(_outDir).createSync(recursive: true);
+      await _loadTestFonts();
     });
     _mockCommonPlugins();
     try {
@@ -91,7 +92,12 @@ Future<void> main() async {
             screens.add(_errScreen(route, 'no Navigator found'));
             continue;
           }
-          nav.pushNamed(route.name);
+          // REPLACE, don't push: a plain pushNamed leaves the previous route
+          // painted *beneath* the new one in the render tree, and the region
+          // walk below would then capture the hidden screen (e.g. a home
+          // route-list) instead of the visible one. Replacing makes each screen
+          // the only route, so the captured regions match what's on screen.
+          nav.pushReplacementNamed(route.name);
         }
         // Pump; DRAIN exceptions every frame. The app under capture may have
         // real layout/render bugs (thrown every frame) — we record them on
@@ -117,14 +123,22 @@ Future<void> main() async {
                             format: ui.ImageByteFormat.png))!
                         .buffer
                         .asUint8List()))!;
+        // Raw RGBA for per-region pixel sampling — this is how we learn the
+        // ACTUAL painted background of each region (AppBar, ColoredBox,
+        // Container, buttons, …) regardless of which widget painted it.
+        final raw = (await tester.runAsync(
+                () async => (await img!.toByteData(
+                            format: ui.ImageByteFormat.rawRgba))!
+                        .buffer
+                        .asUint8List()))!;
         await tester.runAsync(() async {
           await File('\$_outDir/\$pngName').writeAsBytes(bytes);
         });
-        final regions = _regions(tester, 's\$idx');
         final w = tester.view.physicalSize!.width ~/
             tester.view.devicePixelRatio;
         final h = tester.view.physicalSize!.height ~/
             tester.view.devicePixelRatio;
+        final regions = _regions(tester, 's\$idx', raw, w, h);
         screens.add({
           'route': route.name,
           'label': label,
@@ -160,6 +174,40 @@ Map<String, dynamic> _errScreen(HarnessRoute route, String err) => {
       'regions': <Map<String, dynamic>>[],
     };
 
+/// Load real fonts before pumping: the test environment renders text with
+/// the Ahem font (uniform black squares) unless real font data is loaded for
+/// the family it resolves to. In this SDK the default test family is
+/// 'monospace', so Roboto is loaded under that name (verified: distinct
+/// pixel count 98 → 246) as well as under 'Roboto' and 'Ahem' for safety,
+/// and MaterialIcons so icons aren't boxes either.
+Future<void> _loadTestFonts() async {
+  final root = Platform.environment['FLUTTER_ROOT'];
+  if (root == null) return;
+  final dir = '\$root/bin/cache/artifacts/material_fonts';
+  const faces = [
+    'Roboto-Regular.ttf',
+    'Roboto-Bold.ttf',
+    'Roboto-Italic.ttf',
+    'Roboto-BoldItalic.ttf',
+  ];
+  for (final file in faces) {
+    final f = File('\$dir/\$file');
+    if (!await f.exists()) continue;
+    final bytes = f.readAsBytesSync();
+    for (final family in const ['monospace', 'Roboto', 'Ahem']) {
+      final loader = FontLoader(family)
+        ..addFont(Future.value(ByteData.view(bytes.buffer)));
+      await loader.load();
+    }
+  }
+  final icons = File('\$dir/MaterialIcons-Regular.otf');
+  if (await icons.exists()) {
+    final loader = FontLoader('MaterialIcons')
+      ..addFont(Future.value(ByteData.view(icons.readAsBytesSync().buffer)));
+    await loader.load();
+  }
+}
+
 NavigatorState? _navigator(WidgetTester tester) {
   try {
     return tester.state<NavigatorState>(find.byType(Navigator).first);
@@ -168,13 +216,38 @@ NavigatorState? _navigator(WidgetTester tester) {
   }
 }
 
+/// First non-empty rendered text in [e]'s render subtree (bounded) — the
+/// label a card/button/header shows. Null if the subtree has no text.
+String? _firstDescendantText(Element e) {
+  String? found;
+  var visited = 0;
+  void walk(Element el) {
+    if (found != null || visited > 60) return;
+    visited++;
+    final ro = el.renderObject;
+    if (ro is RenderParagraph) {
+      final t = ro.text.toPlainText().trim();
+      if (t.isNotEmpty) {
+        found = t.length > 60 ? t.substring(0, 60) : t;
+        return;
+      }
+    }
+    el.visitChildElements(walk);
+  }
+
+  e.visitChildElements(walk);
+  return found;
+}
+
 /// Walk the element tree and record every meaningful RenderBox as a region:
-/// type, on-screen rect, rendered TEXT (for RenderParagraph), solid COLOR
-/// (for RenderDecoratedBox), and the WIDGET CHAIN (runtime type names up the
-/// parent chain) — the Studio uses those to reverse-map the region to a source
-/// file:line (text literals and exact color values are greppable in the app's
-/// code).
-List<Map<String, dynamic>> _regions(WidgetTester tester, String screenId) {
+/// type, on-screen rect, rendered TEXT (for RenderParagraph), TEXT COLOR
+/// (glyph style), the painted BACKGROUND COLOR (sampled from the raster,
+/// with a RenderDecoratedBox solid fill as an exact fallback), and the WIDGET
+/// CHAIN (runtime type names up the parent chain) — the Studio uses those to
+/// reverse-map the region to a source file:line (text literals and exact color
+/// values are greppable in the app's code).
+List<Map<String, dynamic>> _regions(
+    WidgetTester tester, String screenId, List<int> raw, int w, int h) {
   final out = <Map<String, dynamic>>[];
   final root = tester.binding.rootElement;
   if (root == null) return out;
@@ -189,17 +262,33 @@ List<Map<String, dynamic>> _regions(WidgetTester tester, String screenId) {
           size.width <= 4000 &&
           size.height <= 4000) {
         String? text;
+        String? textColor;
         if (ro is RenderParagraph) {
           text = ro.text.toPlainText().trim();
           if (text.length > 80) text = text.substring(0, 80);
           if (text.isEmpty) text = null;
+          final tc = ro.text.style?.color;
+          if (tc != null) textColor = _hex(tc);
         }
-        String? color;
+        final type = ro.runtimeType.toString();
+        final tl = ro.localToGlobal(Offset.zero);
+        // Painted background: sample the actual pixels (captures backgrounds
+        // from AppBar/ColoredBox/Container/buttons/any widget). A solid
+        // RenderDecoratedBox fill is used verbatim when present (exact).
+        String? color = _modeColor(raw, w, h, tl.dx, tl.dy, size.width, size.height);
         if (ro is RenderDecoratedBox) {
           final d = ro.decoration;
           if (d is BoxDecoration && d.color != null) {
             color = _hex(d.color!);
           }
+        }
+        // For non-text regions (cards, buttons, headers) record the first
+        // descendant text — a strong anchor the Studio greps to find this
+        // widget's source, since a repeated background colour alone is
+        // ambiguous.
+        String? childText;
+        if (ro is! RenderParagraph) {
+          childText = _firstDescendantText(e);
         }
         final chain = <String>[];
         e.visitAncestorElements((anc) {
@@ -207,15 +296,15 @@ List<Map<String, dynamic>> _regions(WidgetTester tester, String screenId) {
           if (t.isNotEmpty && !chain.contains(t)) chain.add(t);
           return chain.length < 5;
         });
-        final type = ro.runtimeType.toString();
-        final tl = ro.localToGlobal(Offset.zero);
         final n2 = out.length;
         out.add({
           'id': '\$screenId-\${n2.toString().padLeft(3, '0')}',
           't': type,
           'label': _labelFor(type),
           if (text != null) 'text': text,
+          if (textColor != null) 'textColor': textColor,
           if (color != null) 'color': color,
+          if (childText != null) 'childText': childText,
           'chain': chain,
           'r': {
             'x': tl.dx,
@@ -278,6 +367,57 @@ List<Map<String, dynamic>> _regions(WidgetTester tester, String screenId) {
 
 String _hex(ui.Color c) =>
     '#\${(c.value & 0xFFFFFF).toRadixString(16).padLeft(6, '0').toUpperCase()}';
+
+/// Sample the raw RGBA [raw] (w×h, row-major) over the rect and return the
+/// most common (mode) colour as #RRGGBB — for a solid region this is the
+/// painted background; text glyphs / anti-aliased edges are a minority of the
+/// samples so the background wins. Returns null if nothing sampleable.
+String? _modeColor(
+    List<int> raw, int w, int h, double x, double y, double rw, double rh) {
+  if (raw.isEmpty || w <= 0 || h <= 0 || rw < 4 || rh < 4) return null;
+  final counts = <int, int>{};
+  int total = 0;
+  void add(int px, int py) {
+    if (px < 0 || py < 0 || px >= w || py >= h) return;
+    final i = (py * w + px) * 4;
+    if (i + 3 >= raw.length) return;
+    // Skip fully-transparent pixels (not painted).
+    if (raw[i + 3] < 200) return;
+    final key = (raw[i] << 16) | (raw[i + 1] << 8) | raw[i + 2];
+    counts[key] = (counts[key] ?? 0) + 1;
+    total++;
+  }
+  // Sample a small grid across the region (capped), dense enough that a solid
+  // fill dominates the mode, sparse enough to stay fast.
+  final cols = (rw / 12).clamp(1, 6).round();
+  final rows = (rh / 12).clamp(1, 6).round();
+  for (var r = 0; r < rows; r++) {
+    for (var c = 0; c < cols; c++) {
+      final px = (x + rw * (c + 0.5) / cols).round();
+      final py = (y + rh * (r + 0.5) / rows).round();
+      add(px, py);
+    }
+  }
+  if (total == 0) return null;
+  int bestKey = 0;
+  var bestCount = 0;
+  counts.forEach((k, c) {
+    if (c > bestCount) {
+      bestCount = c;
+      bestKey = k;
+    }
+  });
+  // Require a clear majority; otherwise the region is busy (mixed) and a
+  // single colour would be misleading.
+  if (bestCount * 2 < total) return null;
+  final r = (bestKey >> 16) & 0xFF;
+  final g = (bestKey >> 8) & 0xFF;
+  final b = bestKey & 0xFF;
+  return '#'
+      '\${r.toRadixString(16).padLeft(2, '0').toUpperCase()}'
+      '\${g.toRadixString(16).padLeft(2, '0').toUpperCase()}'
+      '\${b.toRadixString(16).padLeft(2, '0').toUpperCase()}';
+}
 
 String _slug(String s) =>
     s.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]+'), '_').replaceAll(RegExp(r'^_+|_+\$'), '');
