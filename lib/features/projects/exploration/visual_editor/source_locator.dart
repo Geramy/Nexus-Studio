@@ -48,8 +48,7 @@ const _namedColors = <String, String>{
 };
 
 class _SrcFile {
-  _SrcFile(this.path, this.content)
-      : lines = content.split('\n');
+  _SrcFile(this.path, this.content) : lines = content.split('\n');
   final String path;
   final String content;
   final List<String> lines;
@@ -85,9 +84,10 @@ class SourceIndex {
       if (norm.endsWith('/app_routes.dart')) routesSrc = content;
     }
     // Class index.
-    final classRe =
-        RegExp(r'^\s*(?:abstract\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)',
-            multiLine: true);
+    final classRe = RegExp(
+      r'^\s*(?:abstract\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)',
+      multiLine: true,
+    );
     for (final f in files.values) {
       for (final m in classRe.allMatches(f.content)) {
         final name = m.group(1)!;
@@ -98,13 +98,17 @@ class SourceIndex {
     // Route → page class.
     final routeToPageClass = <String, String>{};
     if (routesSrc != null) {
-      final re = RegExp("['\"](/[^'\"]*)['\"]\\s*:\\s*[^,]{0,80}?=>\\s*([A-Za-z_][A-Za-z0-9_]*)\\(");
+      final re = RegExp(
+        "['\"](/[^'\"]*)['\"]\\s*:\\s*[^,]{0,80}?=>\\s*([A-Za-z_][A-Za-z0-9_]*)\\(",
+      );
       for (final m in re.allMatches(routesSrc)) {
         routeToPageClass[m.group(1)!] = m.group(2)!;
       }
       // `NamedRoute`-style maps: '/x': Builder(...).build — capture the
       // trailing `XPage()` when it appears on the same entry line.
-      final re2 = RegExp("['\"](/[^'\"]*)['\"]\\s*:[^\\n]*?([A-Z][A-Za-z0-9_]*)\\(");
+      final re2 = RegExp(
+        "['\"](/[^'\"]*)['\"]\\s*:[^\\n]*?([A-Z][A-Za-z0-9_]*)\\(",
+      );
       for (final m in re2.allMatches(routesSrc)) {
         routeToPageClass.putIfAbsent(m.group(1)!, () => m.group(2)!);
       }
@@ -119,8 +123,8 @@ class SourceIndex {
     final pageFile = pageClass == null
         ? null
         : classes[pageClass]?.isNotEmpty == true
-            ? classes[pageClass]!.first.$1
-            : null;
+        ? classes[pageClass]!.first.$1
+        : null;
 
     // 1) Rendered text → literal search. A region's own text is the strongest
     //    anchor; for boxes, the text they CONTAIN (childText) is next.
@@ -138,11 +142,7 @@ class SourceIndex {
     // 2) Solid color → exact literal search.
     final hex = (region.colorHex ?? '').replaceAll('#', '').toUpperCase();
     if (hex.length == 6) {
-      final patterns = <String>[
-        '0x$hex)',
-        '0xFF$hex)',
-        '0xFF$hex',
-      ];
+      final patterns = <String>['0x$hex)', '0xFF$hex)', '0xFF$hex'];
       final r = int.parse(hex.substring(0, 2), radix: 16);
       final g = int.parse(hex.substring(2, 4), radix: 16);
       final b = int.parse(hex.substring(4, 6), radix: 16);
@@ -157,8 +157,7 @@ class SourceIndex {
         for (final f in files.values) {
           final m = re.firstMatch(f.content);
           if (m != null) {
-            final line =
-                f.content.substring(0, m.start).split('\n').length;
+            final line = f.content.substring(0, m.start).split('\n').length;
             if (!candidates.any((c) => c.$1 == f.path)) {
               candidates.add((f.path, line));
             }
@@ -194,26 +193,129 @@ class SourceIndex {
     return null;
   }
 
-  /// Find a rendered [text] string literal in the sources. Returns the best
-  /// (file, line) — preferring [pageFile], else the first file where it appears.
+  /// Find where [text] is RENDERED and anchor on the ACTUAL widget that holds
+  /// its style — so a colour/text edit lands straight on the page. Three
+  /// passes, strongest first:
+  ///
+  ///   1. The text is a literal directly inside a `Text('…')` / `Text.rich`.
+  ///   2. The text is data passed to a widget — `_W(title: '…')`. Anchor to
+  ///      the `Text` inside `_W`'s build (that's where the style lives), not
+  ///      the call site.
+  ///   3. Any other string literal, EXCLUDING route-map entry lines (a route
+  ///      path rendered as text must not anchor to `app_routes.dart`).
   (String, int)? _findText(String text, String? pageFile) {
-    final probe = text.length > 30 ? text.substring(0, 30) : text;
+    final probe = text.length > 40 ? text.substring(0, 40) : text;
     final escaped = RegExp.escape(probe);
-    final re = RegExp("['\"]$escaped");
-    final candidates = <(String, int)>[];
+
+    // Pass 1 — a `Text('…')` / `Text.rich('…')` whose literal IS the text.
+    final directRe = RegExp("Text\\s*(?:\\.\\w+\\s*)?\\(\\s*['\"]$escaped");
+    final direct = _rank(_scanAll(directRe), pageFile);
+    if (direct != null) return direct;
+
+    // Pass 2 — the text is a value passed to a widget; resolve to the `Text`
+    // inside that widget's build. `param:` must be the FIRST argument (right
+    // after the paren) so we match `_W(title: '…')` and not an outer call like
+    // `ListView(children: … _W(title: '…') …)`.
+    final callRe = RegExp(
+      "\\b([_A-Za-z][A-Za-z0-9_]*)\\s*\\(\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*:\\s*['\"]$escaped",
+    );
+    for (final f in files.values) {
+      for (final m in callRe.allMatches(f.content)) {
+        final resolved = _resolveWidgetText(m.group(1)!, m.group(2)!);
+        if (resolved != null) return resolved;
+      }
+    }
+
+    // Pass 3 — any other literal, EXCLUDING route-map entry lines. Page file
+    // first, then any file. (The old "last resort" re-scanned without the
+    // route exclusion and could anchor a route path back to app_routes.dart.)
+    (String, int)? anyFile;
+    for (final f in files.values) {
+      for (final m in RegExp("['\"]$escaped").allMatches(f.content)) {
+        if (_isRouteEntryLine(f, m.start)) continue;
+        final line = f.content.substring(0, m.start).split('\n').length;
+        if (f.path == pageFile) return (f.path, line);
+        anyFile ??= (f.path, line);
+      }
+    }
+    return anyFile;
+  }
+
+  /// First match of [re] in every source file → [(file, line)].
+  List<(String, int)> _scanAll(RegExp re) {
+    final out = <(String, int)>[];
     for (final f in files.values) {
       final m = re.firstMatch(f.content);
       if (m != null) {
         final line = f.content.substring(0, m.start).split('\n').length;
-        candidates.add((f.path, line));
+        out.add((f.path, line));
       }
     }
-    if (candidates.isEmpty) return null;
-    if (candidates.length == 1) return candidates.first;
-    for (final c in candidates) {
-      if (c.$1 == pageFile) return c;
+    return out;
+  }
+
+  /// Pick the best candidate: [pageFile] wins, else the first.
+  (String, int)? _rank(List<(String, int)> c, String? pageFile) {
+    if (c.isEmpty) return null;
+    if (pageFile != null) {
+      for (final x in c) {
+        if (x.$1 == pageFile) return x;
+      }
     }
-    return candidates.first;
+    return c.first;
+  }
+
+  /// Resolve a parameterised widget `_W(param: '…')` to the `Text` inside
+  /// `_W`'s build (preferring the one fed by [param]), so the anchor sits on
+  /// the real styled widget. Returns null if the class/Text can't be found.
+  (String, int)? _resolveWidgetText(String widget, String param) {
+    final locs = classes[widget];
+    if (locs == null || locs.isEmpty) return null;
+    for (final (file, _) in locs) {
+      final content = files[file]?.content;
+      if (content == null) continue;
+      // Find the class declaration by OFFSET (the stored class line can drift
+      // by a blank line) and take its body up to the next top-level class.
+      final cm = RegExp(
+        '^(?:\\s*)class\\s+$widget\\b',
+        multiLine: true,
+      ).firstMatch(content);
+      if (cm == null) continue;
+      final bodyStart = cm.end;
+      var bodyEnd = content.length;
+      for (final m in RegExp(
+        r'^\s*class\s+',
+        multiLine: true,
+      ).allMatches(content, bodyStart)) {
+        bodyEnd = m.start;
+        break;
+      }
+      final seg = content.substring(bodyStart, bodyEnd);
+      // Prefer the Text fed by [param]; else the first Text in the body.
+      final pick =
+          RegExp("Text\\s*\\(\\s*$param\\b").firstMatch(seg) ??
+          RegExp("Text\\s*\\(").firstMatch(seg);
+      if (pick == null) continue;
+      final line = content
+          .substring(0, bodyStart + pick.start)
+          .split('\n')
+          .length;
+      return (file, line);
+    }
+    return null;
+  }
+
+  /// True if the line containing [idx] is a route-map entry — e.g.
+  /// `'/task-11-x': (_) => XPage()` — so a route path rendered as text doesn't
+  /// anchor to the route table instead of the widget.
+  bool _isRouteEntryLine(_SrcFile f, int idx) {
+    if (f.path.endsWith('/app_routes.dart')) return true;
+    final lineStart = f.content.lastIndexOf('\n', idx) + 1;
+    var lineEnd = f.content.indexOf('\n', idx);
+    if (lineEnd < 0) lineEnd = f.content.length;
+    final line = f.content.substring(lineStart, lineEnd);
+    return RegExp(r'''['"]/[^'"]*['"]\s*:''').hasMatch(line) ||
+        line.contains('=>');
   }
 
   static Future<bool> _isProbablyBinary(List<int> bytes) async {
