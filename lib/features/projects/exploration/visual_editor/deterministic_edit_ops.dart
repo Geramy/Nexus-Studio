@@ -475,6 +475,61 @@ String? setBackgroundEdit(
       content.substring(bodyStart);
 }
 
+/// Set the screen BACKGROUND to an IMAGE: wrap the Scaffold's `body:` value in
+/// a Stack with the image filling the screen BEHIND the existing UI. Returns
+/// the new content, or null when the page has no Scaffold body to wrap (the
+/// caller then falls back to the assistant — with the image already copied into
+/// the workspace, so it CAN complete).
+String? setBackgroundImageEdit(
+  String content, {
+  required int anchor,
+  required String assetPath,
+}) {
+  final asset = assetPath.replaceAll(RegExp(r'^/'), '');
+  if (asset.isEmpty) {
+    _dbg('setBackgroundImage: empty asset path');
+    return null;
+  }
+  final scaffold = _nearestMatch(content, RegExp(r'Scaffold\('), anchor, 400);
+  if (scaffold == null) {
+    _dbg(
+      'setBackgroundImage: no Scaffold( within 400 lines of anchor=$anchor',
+    );
+    return null;
+  }
+  final openParen = scaffold.$1.end - 1;
+  final closeParen = _matchingParen(content, openParen);
+  if (closeParen < 0) {
+    _dbg('setBackgroundImage: Scaffold( has an unmatched paren');
+    return null;
+  }
+  final hit = _findPropAtDepth0(content, openParen + 1, closeParen, 'body');
+  if (hit == null) {
+    _dbg('setBackgroundImage: Scaffold has no depth-0 body: argument');
+    return null;
+  }
+  // Capture the FULL body value (keeping any `const` on the inner widget — it
+  // stays valid inside the new Stack). No `const` skip here, unlike _valueSpan.
+  var s = hit.$2;
+  while (s < content.length && _isWs(content[s])) {
+    s++;
+  }
+  var e = _valueEnd(content, s);
+  while (e > s && _isWs(content[e - 1])) {
+    e--;
+  }
+  final bodyExpr = content.substring(s, e);
+  if (bodyExpr.isEmpty) {
+    _dbg('setBackgroundImage: Scaffold body: value is empty');
+    return null;
+  }
+  final wrapped = 'Stack(children: [\n'
+      "        Positioned.fill(child: Image.asset('$asset', fit: BoxFit.cover)),\n"
+      '        $bodyExpr,\n'
+      '      ])';
+  return content.substring(0, s) + wrapped + content.substring(e);
+}
+
 /// Replace an `Image.asset` path near [anchor].
 String? replaceImageEdit(
   String content, {

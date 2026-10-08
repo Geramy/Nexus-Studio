@@ -203,4 +203,78 @@ return Scaffold(
       expect(out, isNot(contains('Colors.black')));
     });
   });
+
+  group('setBackgroundImageEdit', () {
+    test('wraps a multi-line body in a Stack with the image behind it', () {
+      const src = '''
+class Home extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Home')),
+      body: SingleChildScrollView(
+        child: Column(
+          children: [
+            const Text('item one'),
+            const Text('item two'),
+          ],
+        ),
+      ),
+    );
+  }
+}''';
+      final anchor = _lineOf(src, 'Scaffold');
+      final out = setBackgroundImageEdit(
+        src,
+        anchor: anchor,
+        assetPath: '/assets/visual_123.png',
+      );
+      expect(out, isNotNull);
+      expect(
+        out,
+        contains(
+          "Image.asset('assets/visual_123.png', fit: BoxFit.cover)",
+        ),
+      );
+      expect(out, contains('Positioned.fill('));
+      expect(out, contains('body: Stack(children: ['));
+      // original body preserved inside the stack
+      expect(out, contains("const Text('item one')"));
+      expect(out, contains('SingleChildScrollView('));
+    });
+
+    test('keeps a `const` inner body valid', () {
+      const src = '''
+return Scaffold(
+  appBar: AppBar(title: const Text('Home')),
+  body: const Center(child: Text('hi')),
+);''';
+      final anchor = _lineOf(src, 'Scaffold');
+      final out = setBackgroundImageEdit(
+        src,
+        anchor: anchor,
+        assetPath: '/assets/bg.jpg',
+      );
+      expect(out, isNotNull);
+      expect(
+        out,
+        contains("Image.asset('assets/bg.jpg', fit: BoxFit.cover)"),
+      );
+      expect(out, contains('const Center('));
+      expect(out, contains('body: Stack(children: ['));
+    });
+
+    test('returns null when there is no Scaffold body to wrap', () {
+      const src = '''
+return Center(child: Text('no scaffold here'));
+''';
+      final anchor = _lineOf(src, 'Center');
+      final out = setBackgroundImageEdit(
+        src,
+        anchor: anchor,
+        assetPath: '/assets/x.png',
+      );
+      expect(out, isNull);
+    });
+  });
 }

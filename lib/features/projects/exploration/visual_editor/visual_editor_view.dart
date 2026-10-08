@@ -203,7 +203,8 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
       }
       final isImageOp =
           op.kind == VisualOpKind.insertImage ||
-          op.kind == VisualOpKind.replaceImage;
+          op.kind == VisualOpKind.replaceImage ||
+          op.kind == VisualOpKind.setBackground;
       if (isImageOp) {
         if (await ws.exists('/pubspec.yaml')) {
           originals['/pubspec.yaml'] = await ws.readBytes('/pubspec.yaml');
@@ -240,12 +241,19 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
       if (outcome.status == OpStatus.applied && regionFile != null) {
         _undoStore[rec.id] = originals;
       }
-      _toast(switch (outcome.status) {
-        OpStatus.applied => 'Applied ✓ — re-capturing screens…',
-        OpStatus.rolledBack =>
-          'Rolled back (would not compile): ${outcome.reason ?? ''}',
-        OpStatus.needsAgent => 'Sent to the assistant — review & send in chat',
-      }, ok: outcome.status == OpStatus.applied);
+      final repeatNote =
+          outcome.status == OpStatus.applied ? _repeatNote(op) : null;
+      _toast(
+        switch (outcome.status) {
+          OpStatus.applied => repeatNote == null
+            ? 'Applied ✓ — re-capturing screens…'
+            : 'Applied ✓ — $repeatNote — re-capturing…',
+          OpStatus.rolledBack =>
+            'Rolled back (would not compile): ${outcome.reason ?? ''}',
+          OpStatus.needsAgent => 'Sent to the assistant — review & send in chat',
+        },
+        ok: outcome.status == OpStatus.applied,
+      );
 
       if (outcome.status == OpStatus.needsAgent) {
         ref.read(pendingEditorPromptProvider(projectId).notifier).state =
@@ -275,6 +283,27 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
     } finally {
       if (mounted) setState(() => _busy = false);
     }
+  }
+
+  /// When this region's source widget renders MULTIPLE times on this screen
+  /// (a list / for-loop), a one-line edit changes ALL of them — tell the user
+  /// so "I recoloured one but they all changed" isn't a surprise.
+  String? _repeatNote(VisualOp op) {
+    final f = op.region.sourceFile;
+    final l = op.region.sourceLine;
+    if (f == null || l == null) return null;
+    final screen = _map?.screens
+        .where((s) => s.route == op.screenRoute)
+        .cast<CapturedScreen?>()
+        .firstWhere((s) => s != null, orElse: () => null);
+    if (screen == null) return null;
+    final count = screen.regions
+        .where((r) => r.sourceFile == f && r.sourceLine == l)
+        .length;
+    if (count > 1) {
+      return 'this element repeats $count×, so the change applies to all of them';
+    }
+    return null;
   }
 
   /// The instant canvas overlay for a just-applied [op] — or null when there
@@ -353,8 +382,10 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
       }
       if (!mounted) return;
       final resolved = await _resolveSources(map);
+      final newCache = (await cacheDir(projectId, head)).path;
       setState(() {
         _map = resolved;
+        _cacheDirPath = newCache; // follow the new HEAD's cache dir (stale otherwise)
         // Clear only the overlays for the screen(s) now freshly captured: a
         // single-screen pass leaves the others (seeded) stale, so their
         // pre-paints stay visible until they too are re-captured.
@@ -638,18 +669,33 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
     );
   }
 
-  /// A background image is a structural change, so it is routed to the
-  /// assistant with a precise prompt rather than the deterministic tier.
+  /// Set the screen background to an image. The host file is copied into the
+  /// workspace assets + registered in pubspec by [_applyOp] (so the asset
+  /// exists even if the deterministic wrap declines), then a deterministic
+  /// Stack-wrap is attempted; only on decline does it fall back to the
+  /// assistant — which now has the image in-workspace to reference.
   void _applyBackgroundImage(String pageFile, String hostPath) {
-    ref.read(pendingEditorPromptProvider(widget.projectId).notifier).state =
-        'Visual edit task: set this screen\'s BACKGROUND to the image at '
-        '$hostPath (copy it into the app\'s assets/ and reference it). '
-        'Wrap the page\'s body so the image fills the screen BEHIND the '
-        'existing UI (e.g. a Stack with Image.asset(…, fit: BoxFit.cover) '
-        'as the first child, or a Scaffold background). Page file: '
-        '$pageFile. Keep all existing UI on top and keep the file '
-        'compiling.';
-    widget.onOpenChat();
+    final host = File(_expandHome(hostPath));
+    if (!host.existsSync()) {
+      _toast('Image not found: $hostPath', ok: false);
+      return;
+    }
+    final bg = ScreenRegion(
+      id: 'bgimg_${_screenIdx}',
+      widgetType: 'Scaffold',
+      rect: const RectBox(0, 0, 0, 0),
+      label: 'Screen background',
+      sourceFile: pageFile,
+      sourceLine: 1,
+    );
+    _applyOp(
+      VisualOp(
+        kind: VisualOpKind.setBackground,
+        region: bg,
+        screenRoute: _currentScreen().route,
+        assetPath: '/host:$hostPath',
+      ),
+    );
   }
 
   void _finishBackground(ScreenRegion r, String pageFile, String hex) {
