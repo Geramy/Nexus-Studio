@@ -327,28 +327,44 @@ Future<void> ensureAssetInPubspec(Workspace ws, String assetPath) async {
   final dir = clean.contains('/')
       ? clean.substring(0, clean.lastIndexOf('/'))
       : '';
-  final hasDir = dir.isNotEmpty && raw.contains('- $dir/');
+  // A directory is "registered" only if a line is EXACTLY `- assets/` (trailing
+  // slash, end of line). `- assets/file.png` is a specific file and does NOT
+  // cover other files in the same directory (the old substring check
+  // `raw.contains('- $dir/')` matched file entries and silently skipped them).
+  final dirRe = dir.isNotEmpty
+      ? RegExp('^\\s*-\\s*' + RegExp.escape(dir) + '/\\s*\$', multiLine: true)
+      : null;
+  final hasDir = dirRe != null && dirRe.hasMatch(raw);
   final hasFile = raw.contains('- $clean');
   if (hasDir || hasFile) return;
   String next;
+  // Insert a NEW line: the offset just after the next newline from [from], so
+  // we never merge onto the matched token's own line (the old code inserted at
+  // match.end, right after `flutter:`, producing an invalid `flutter:  assets:`).
+  int startOfNextLine(String s, int from) {
+    final nl = s.indexOf('\n', from);
+    return nl < 0 ? s.length : nl + 1;
+  }
+
   final flutterM = RegExp(r'^flutter:\s*$', multiLine: true).firstMatch(raw);
   if (flutterM == null) {
-    next = '$raw\nflutter:\n  assets:\n    - $clean\n';
+    next = '${raw.trimRight()}\nflutter:\n  assets:\n    - $clean\n';
   } else {
+    final flutterNext = startOfNextLine(raw, flutterM.end);
     final assetsM = RegExp(
       r'^(\s*)assets:\s*$',
       multiLine: true,
     ).firstMatch(raw);
     if (assetsM == null) {
-      next =
-          raw.substring(0, flutterM.end) +
+      next = raw.substring(0, flutterNext) +
           '  assets:\n    - $clean\n' +
-          raw.substring(flutterM.end);
+          raw.substring(flutterNext);
     } else {
-      next =
-          raw.substring(0, assetsM.end) +
-          '  - $clean\n' +
-          raw.substring(assetsM.end);
+      final assetNext = startOfNextLine(raw, assetsM.end);
+      final indent = assetsM.group(1) ?? '  ';
+      next = raw.substring(0, assetNext) +
+          '$indent  - $clean\n' +
+          raw.substring(assetNext);
     }
   }
   await ws.writeBytes(pubspecPath, next.codeUnits);
