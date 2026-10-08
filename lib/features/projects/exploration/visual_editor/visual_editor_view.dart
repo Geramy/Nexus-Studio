@@ -18,6 +18,7 @@ import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show HardwareKeyboard;
 import 'package:flutter/gestures.dart' show kPrimaryButton, kSecondaryButton;
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../../infrastructure/workspace/git/git_engine_provider.dart';
@@ -238,8 +239,12 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
       ref.read(workspaceRevisionProvider(projectId).notifier).state++;
       final rec = outcome.record;
       _records.insert(0, rec);
-      if (outcome.status == OpStatus.applied && regionFile != null) {
-        _undoStore[rec.id] = originals;
+      if (outcome.status == OpStatus.applied) {
+        // Merge the region-file + pubspec originals with the ACTUAL touched
+        // file(s) the applier reported — for a cross-file route reorder that
+        // is the routes map, not the page the user pointed at.
+        final undoFiles = {...originals, ...outcome.fileOriginals};
+        if (undoFiles.isNotEmpty) _undoStore[rec.id] = undoFiles;
       }
       final repeatNote =
           outcome.status == OpStatus.applied ? _repeatNote(op) : null;
@@ -640,55 +645,87 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
   }
 
   void _backgroundImageDialog(ScreenRegion r, String pageFile) {
-    String? hostPath;
+    var hostPath = '';
     final controller = TextEditingController();
     showDialog<void>(
       context: context,
       builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setDlg) => AlertDialog(
-          title: const Text('Set screen background image'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                'Paste the path of a PNG/JPG on this machine (e.g. ~/Pictures/bg.png):',
-                style: TextStyle(fontSize: 12),
-              ),
-              const SizedBox(height: 8),
-              TextField(
-                controller: controller,
-                autofocus: true,
-                onChanged: (v) => setDlg(() => hostPath = v.trim()),
-              ),
-              if (controller.text.trim().isNotEmpty &&
-                  !File(_expandHome(controller.text.trim())).existsSync())
-                const Padding(
-                  padding: EdgeInsets.only(top: 6),
-                  child: Text(
-                    '⚠ that file does not exist',
-                    style: TextStyle(color: Colors.red, fontSize: 11),
-                  ),
+        builder: (ctx, setDlg) {
+          Future<void> browse() async {
+            try {
+              final picked = await FilePicker.platform.pickFiles(
+                dialogTitle: 'Choose a background image',
+                type: FileType.image,
+              );
+              final path = picked?.files.single.path;
+              if (path != null && mounted) {
+                controller.text = path;
+                setDlg(() => hostPath = path);
+              }
+            } catch (_) {/* cancelled */}
+          }
+
+          final trimmed = hostPath.trim();
+          final exists =
+              trimmed.isNotEmpty && File(_expandHome(trimmed)).existsSync();
+          return AlertDialog(
+            title: const Text('Set screen background image'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Pick a PNG/JPG to use as this screen’s background:',
+                  style: TextStyle(fontSize: 12),
                 ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: controller,
+                        decoration: const InputDecoration(
+                          isDense: true,
+                          labelText: 'Image file',
+                        ),
+                        onChanged: (v) => setDlg(() => hostPath = v),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    FilledButton.tonalIcon(
+                      onPressed: browse,
+                      icon: const Icon(Icons.folder_open, size: 18),
+                      label: const Text('Browse…'),
+                    ),
+                  ],
+                ),
+                if (trimmed.isNotEmpty && !exists)
+                  const Padding(
+                    padding: EdgeInsets.only(top: 6),
+                    child: Text(
+                      '⚠ that file does not exist',
+                      style: TextStyle(color: Colors.red, fontSize: 11),
+                    ),
+                  ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: exists
+                    ? () {
+                        Navigator.pop(ctx);
+                        _applyBackgroundImage(pageFile, _expandHome(trimmed));
+                      }
+                    : null,
+                child: const Text('Use image'),
+              ),
             ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              onPressed: (hostPath == null || hostPath!.isEmpty)
-                  ? null
-                  : () {
-                      final p = hostPath!;
-                      Navigator.pop(ctx);
-                      _applyBackgroundImage(pageFile, p);
-                    },
-              child: const Text('Use image'),
-            ),
-          ],
-        ),
+          );
+        },
       ),
     );
   }
@@ -927,70 +964,102 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
   }
 
   void _imageDialog(ScreenRegion r, VisualOpKind kind) {
-    String? hostPath;
     final controller = TextEditingController();
+    var hostPath = '';
+    final isInsert = kind == VisualOpKind.insertImage;
     showDialog<void>(
       context: context,
       builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setDlg) => AlertDialog(
-          title: Text(
-            kind == VisualOpKind.insertImage ? 'Insert image' : 'Replace image',
-          ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                'Paste the path of a PNG/JPG on this machine (e.g. ~/Pictures/bg.png):',
-                style: TextStyle(fontSize: 12),
-              ),
-              const SizedBox(height: 8),
-              Row(
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: controller,
-                      autofocus: true,
-                      onChanged: (v) => setDlg(() => hostPath = v.trim()),
+        builder: (ctx, setDlg) {
+          // Native OS file chooser — the desktop file explorer the user expects.
+          Future<void> browse() async {
+            try {
+              final picked = await FilePicker.platform.pickFiles(
+                dialogTitle: isInsert ? 'Choose an image to insert' : 'Choose a replacement image',
+                type: FileType.image,
+              );
+              final path = picked?.files.single.path;
+              if (path != null && mounted) {
+                controller.text = path;
+                setDlg(() => hostPath = path);
+              }
+            } catch (_) {/* user cancelled the chooser */}
+          }
+
+          final trimmed = hostPath.trim();
+          final exists =
+              trimmed.isNotEmpty && File(_expandHome(trimmed)).existsSync();
+          return AlertDialog(
+            title: Text(isInsert ? 'Insert image' : 'Replace image'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  isInsert
+                      ? 'Pick a PNG/JPG on this machine to insert:'
+                      : 'Pick a PNG/JPG to replace this image with:',
+                  style: const TextStyle(fontSize: 12),
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: controller,
+                        decoration: const InputDecoration(
+                          isDense: true,
+                          labelText: 'Image file',
+                        ),
+                        onChanged: (v) => setDlg(() => hostPath = v),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    FilledButton.tonalIcon(
+                      onPressed: browse,
+                      icon: const Icon(Icons.folder_open, size: 18),
+                      label: const Text('Browse…'),
+                    ),
+                  ],
+                ),
+                if (trimmed.isNotEmpty && !exists)
+                  const Padding(
+                    padding: EdgeInsets.only(top: 6),
+                    child: Text(
+                      '⚠ that file does not exist',
+                      style: TextStyle(color: Colors.red, fontSize: 11),
                     ),
                   ),
-                ],
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Cancel'),
               ),
-              if (controller.text.trim().isNotEmpty &&
-                  !File(_expandHome(controller.text.trim())).existsSync())
-                const Padding(
-                  padding: EdgeInsets.only(top: 6),
-                  child: Text(
-                    '⚠ that file does not exist',
-                    style: TextStyle(color: Colors.red, fontSize: 11),
-                  ),
-                ),
+              FilledButton(
+                onPressed: exists
+                    ? () {
+                        // Expand any ~ so File() can actually find it (the old
+                        // code passed a raw ~/… path to File and silently
+                        // produced no image).
+                        final p = _expandHome(trimmed);
+                        Navigator.pop(ctx);
+                        _applyOp(
+                          VisualOp(
+                            kind: kind,
+                            region: r,
+                            screenRoute: _currentScreen().route,
+                            assetPath: '/host:$p',
+                          ),
+                        );
+                      }
+                    : null,
+                child: const Text('Use image'),
+              ),
             ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              onPressed: (hostPath == null || hostPath!.isEmpty)
-                  ? null
-                  : () {
-                      final p = hostPath!;
-                      Navigator.pop(ctx);
-                      _applyOp(
-                        VisualOp(
-                          kind: kind,
-                          region: r,
-                          screenRoute: _currentScreen().route,
-                          assetPath: '/host:$p',
-                        ),
-                      );
-                    },
-              child: const Text('Use image'),
-            ),
-          ],
-        ),
+          );
+        },
       ),
     );
   }

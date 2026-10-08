@@ -349,6 +349,56 @@ child: Column(
     });
   });
 
+  group('reorderRouteEdit', () {
+    const routes = '''
+final Map<String, WidgetBuilder> appRoutes = {
+  '/task-1': (_) => A(),
+  '/task-2': (_) => B(),
+  '/task-3': (_) => C()
+};''';
+
+    test('moves a route up', () {
+      final out = reorderRouteEdit(routes, '/task-2', true);
+      expect(out, isNotNull);
+      expect(out!.indexOf("'/task-2'"), lessThan(out.indexOf("'/task-1'")));
+    });
+
+    test('moves a route down', () {
+      final out = reorderRouteEdit(routes, '/task-1', false);
+      expect(out, isNotNull);
+      expect(out!.indexOf("'/task-1'"), greaterThan(out.indexOf("'/task-2'")));
+    });
+
+    test('keeps the map parseable (trailing commas after swap)', () {
+      // Move the last entry (no trailing comma) up; both swapped lines must
+      // carry a comma so the map literal stays valid Dart.
+      final out = reorderRouteEdit(routes, '/task-3', true);
+      expect(out, isNotNull);
+      for (final l in out!.split('\n')) {
+        if (l.contains("'/task-2'") || l.contains("'/task-3'")) {
+          expect(l.trimRight().endsWith(','), isTrue,
+              reason: 'entry lost its trailing comma: $l');
+        }
+      }
+    });
+
+    test('declines when already at the top', () {
+      expect(reorderRouteEdit(routes, '/task-1', true), isNull);
+    });
+
+    test('declines when already at the bottom', () {
+      expect(reorderRouteEdit(routes, '/task-3', false), isNull);
+    });
+
+    test('declines when the label is not a route path', () {
+      expect(reorderRouteEdit(routes, 'task-1', true), isNull);
+    });
+
+    test('declines when the route is not present', () {
+      expect(reorderRouteEdit(routes, '/nope', true), isNull);
+    });
+  });
+
   group('setTextColorEdit on Tab labels', () {
     test('inserts labelColor + unselectedLabelColor when absent', () {
       const src = '''

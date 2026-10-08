@@ -896,6 +896,60 @@ String? reorderEdit(
   return out;
 }
 
+/// Reorder a route entry inside the app's routes map (e.g. the `appRoutes`
+/// `Map<String, WidgetBuilder>`). [routePath] is the exact route shown on the
+/// home menu (e.g. '/task-2-admin_moderation'); each entry is one
+/// `  '/path': (_) => Page(),` line. Swaps the matching line with the one
+/// above ([up]) or below, keeping both well-formed (trailing comma).
+///
+/// This is the deterministic answer to "move this home-menu item up/down": the
+/// menu renders `for (final route in appRoutes.keys) Text(route)`, so the real
+/// order lives in the routes map (a different file than the page that shows it).
+String? reorderRouteEdit(String content, String routePath, bool up) {
+  final path = routePath.trim();
+  if (!path.startsWith('/')) {
+    _dbg('reorderRoute: "$routePath" is not a route path (does not start with "/")');
+    return null;
+  }
+  final lines = content.split('\n');
+  // A route-entry line: optional indent, a quoted string key, then a colon.
+  final entryRe = RegExp("^\\s*(['\"])([^'\"]+)\\1\\s*:");
+  var idx = -1;
+  var count = 0;
+  for (var i = 0; i < lines.length; i++) {
+    final m = entryRe.firstMatch(lines[i]);
+    if (m != null && m.group(2) == path) {
+      idx = i;
+      count++;
+    }
+  }
+  if (idx < 0) {
+    _dbg('reorderRoute: no route key "$path" in this file');
+    return null;
+  }
+  if (count > 1) {
+    _dbg('reorderRoute: route "$path" appears $count times — ambiguous');
+    return null;
+  }
+  final j = up ? idx - 1 : idx + 1;
+  if (j < 0 || j >= lines.length) {
+    _dbg('reorderRoute: "$path" is already at the ${up ? "top" : "bottom"}');
+    return null;
+  }
+  if (!entryRe.hasMatch(lines[j])) {
+    _dbg('reorderRoute: neighbour line is not a route entry — refusing');
+    return null;
+  }
+  // Normalise both to carry a single trailing comma (valid in a map literal),
+  // then swap the two lines in place.
+  String comma(String l) =>
+      '${l.replaceFirst(RegExp(r',\s*$'), '').trimRight()},';
+  final out = List<String>.of(lines);
+  out[j] = comma(lines[idx]);
+  out[idx] = comma(lines[j]);
+  return out.join('\n');
+}
+
 /// Padding: nearest `EdgeInsets.*` to [anchor], normalised to fromLTRB.
 /// [padding] is (top, right, bottom, left).
 String? setPaddingEdit(

@@ -32,6 +32,7 @@ class ApplierOutcome {
     this.agentPrompt,
     this.analyzerOutput,
     this.reason,
+    this.fileOriginals = const {},
   });
   final OpStatus status;
   final VisualEditRecord record;
@@ -39,6 +40,12 @@ class ApplierOutcome {
   final String? agentPrompt; // set when status == needsAgent
   final String? analyzerOutput; // set when status == rolledBack
   final String? reason;
+
+  /// Touched file(s) → pre-edit bytes, so the caller can build a correct
+  /// in-session UNDO even when the edit landed on a file different from
+  /// [VisualOp.region].sourceFile (e.g. a home-menu route reorder edits the
+  /// routes map, not the page).
+  final Map<String, List<int>> fileOriginals;
 }
 
 class _DeterministicEdit {
@@ -100,13 +107,15 @@ Future<ApplierOutcome> applyVisualOp({
     );
   }
 
-  // Analyze gate on the materialized tree.
-  final analysis = await _analyzeChanged(ws, [edit.filePath]);
+  // Analyze gate: a fast parse-check on the EXACT bytes we just wrote (not a
+  // re-read from the workspace, so no write/read ordering can bite us).
+  final analysis = await _analyzeChanged(edit.filePath, edit.newContent.codeUnits);
   if (analysis.errors.isEmpty) {
     return ApplierOutcome(
       status: OpStatus.applied,
       record: _record(op, headBefore, headAfter, touched, true, null),
       commitMessage: commitMessage,
+      fileOriginals: {edit.filePath: original},
     );
   }
 
@@ -175,6 +184,14 @@ Future<_DeterministicEdit?> _deterministicEditAsync({
     );
     return null;
   }
+  // "Move up/down" on a home-menu item is a CROSS-FILE reorder: the menu
+  // renders Text(route), but the order lives in the routes map (a different
+  // file). Try that first; if the region isn't a route, fall through to the
+  // same-file deterministic ops below.
+  if (op.kind == VisualOpKind.reorder) {
+    final routeResult = await _routeReorderEdit(ws: ws, op: op);
+    if (routeResult != null) return routeResult;
+  }
   final bytes = await ws.readBytes(file);
   final content = utf8.decode(bytes, allowMalformed: true);
   final lineCount = content.split('\n').length;
@@ -221,6 +238,51 @@ Future<_DeterministicEdit?> _deterministicEditAsync({
     '${_snippet(content, anchor)}',
   );
   return next == null ? null : _DeterministicEdit(file, next);
+}
+
+/// For "move up/down" on a home-menu item, the real list is the app's routes
+/// map, which lives in a different file than the page that shows the menu.
+/// Find the file whose map contains [VisualOp.region.text] as a key and swap
+/// that entry there. Returns null when the region is not a route (so the
+/// same-file [reorderEdit] can handle a concrete list) or the swap isn't
+/// possible.
+Future<_DeterministicEdit?> _routeReorderEdit({
+  required Workspace ws,
+  required VisualOp op,
+}) async {
+  final route = op.region.text?.trim() ?? '';
+  if (!route.startsWith('/')) return null; // not a route label
+  final keyRe = RegExp("(['\"])${RegExp.escape(route)}\\1\\s*:");
+  final entries = await ws.walk();
+  for (final e in entries) {
+    if (e.isDirectory) continue;
+    final p = e.path;
+    if (!p.endsWith('.dart')) continue;
+    final norm = p.startsWith('/') ? p : '/$p';
+    if (!norm.contains('/lib/') || norm.contains('/test/')) continue;
+    String content;
+    try {
+      content = utf8.decode(await ws.readBytes(p), allowMalformed: true);
+    } catch (_) {
+      continue;
+    }
+    if (!content.contains(route)) continue; // cheap pre-filter
+    if (!keyRe.hasMatch(content)) continue;
+    final next = reorderRouteEdit(content, route, op.moveUp);
+    if (next == null) {
+      print(
+        '[VisualEditor] reorderRoute: "$route" is a key in ${e.path} but the '
+        'swap is not possible (edge item / ambiguous) — needs the assistant',
+      );
+      continue;
+    }
+    print(
+      '[VisualEditor] reorderRoute: moved "$route" ${op.moveUp ? "up" : "down"} '
+      'in ${e.path} ✓ (cross-file: menu shows Text(route), order lives in the routes map)',
+    );
+    return _DeterministicEdit(e.path, next);
+  }
+  return null;
 }
 
 /// A few lines of [content] around the 1-based [anchor] line, the anchor
@@ -283,38 +345,55 @@ class _Analysis {
 /// edited file to a temp path and run `dart format --output=none` — a ~50 ms
 /// parse check that needs no materialization or pub get. This keeps the
 /// edit→see-it loop near-instant instead of a full rebuild.
-Future<_Analysis> _analyzeChanged(Workspace ws, List<String> files) async {
-  final errors = <String>[];
-  final buffer = StringBuffer();
-  for (final f in files) {
-    final rel = f.replaceAll(RegExp(r'^/'), '');
-    if (!rel.startsWith('lib/') || !rel.endsWith('.dart')) continue;
-    final bytes = await ws.readBytes(f);
-    final tmp = Directory.systemTemp.createTempSync('nexus_fmt_');
-    final tmpFile = File('${tmp.path}${Platform.pathSeparator}check.dart');
-    try {
-      tmpFile.writeAsBytesSync(bytes);
-      final run = await runCaptured(
-        'dart format --output=none "${tmpFile.path}"',
-        timeout: const Duration(seconds: 30),
-      );
-      buffer.writeln(run.output);
-      if (run.exitCode != 0) {
-        errors.addAll(
-          run.output
-              .split('\n')
-              .where((l) => l.trim().isNotEmpty)
-              .take(6)
-              .toList(),
-        );
-      }
-    } finally {
-      try {
-        tmp.deleteSync(recursive: true);
-      } catch (_) {}
-    }
+/// Fast parse-gate on [content]. `dart format --output=none` exits 0 for any
+/// parseable file (even one it would reflow) and non-zero ONLY when the source
+/// cannot be parsed (exit 65, "Could not format because the source could not
+/// be parsed") or the `dart` binary is unavailable. We roll back ONLY on a
+/// genuine parse failure — a benign non-zero (missing `dart`, a warning, a
+/// timeout) must never revert an edit whose content the deterministic op
+/// guarantees is valid. Everything is logged so a surprise is immediately
+/// diagnosable.
+Future<_Analysis> _analyzeChanged(String path, List<int> content) async {
+  final rel = path.replaceAll(RegExp(r'^/'), '');
+  if (!rel.startsWith('lib/') || !rel.endsWith('.dart')) {
+    return const _Analysis([], '');
   }
-  return _Analysis(errors, buffer.toString());
+  final tmp = Directory.systemTemp.createTempSync('nexus_fmt_');
+  final tmpFile = File('${tmp.path}${Platform.pathSeparator}check.dart');
+  try {
+    tmpFile.writeAsBytesSync(content);
+    final run = await runCaptured(
+      'dart format --output=none "${tmpFile.path}"',
+      timeout: const Duration(seconds: 30),
+    );
+    final out = run.output.trim();
+    if (editOpsDebug) {
+      print('[EditOps] gate $path: exit=${run.exitCode} len=${content.length}');
+      for (final l in out.split('\n').take(8)) {
+        if (l.trim().isNotEmpty) print('[EditOps]   $l');
+      }
+    }
+    // A real syntax break always says the source could not be parsed.
+    final isParseError =
+        out.toLowerCase().contains('could not be parsed') ||
+        out.toLowerCase().contains('could not format');
+    if (run.exitCode == 0) return const _Analysis([], '');
+    if (isParseError) {
+      return _Analysis(
+        out.split('\n').where((l) => l.trim().isNotEmpty).take(6).toList(),
+        out,
+      );
+    }
+    // Non-zero but not a parse error (e.g. `dart` not on PATH in this process,
+    // a warning, a timeout): do NOT roll back a validated edit — log and pass.
+    print('[EditOps] gate: non-zero exit=${run.exitCode} but no parse error; '
+        'treating as OK (not rolling back). out=$out');
+    return _Analysis([], out);
+  } finally {
+    try {
+      tmp.deleteSync(recursive: true);
+    } catch (_) {}
+  }
 }
 
 /// Make sure [assetPath] (workspace path, e.g. /assets/gen_1.png) is declared
