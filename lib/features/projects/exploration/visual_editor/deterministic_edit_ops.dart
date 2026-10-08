@@ -14,6 +14,16 @@
 /// real generated source, and so [code_applier] can stay a thin orchestrator.
 library;
 
+/// When true, the pure edit ops print a one-line REASON whenever they decline
+/// (return null) — so the app log shows exactly why a visual edit fell back to
+/// the assistant instead of applying. Flip to false (e.g. in tests) to keep
+/// stdout quiet.
+bool editOpsDebug = true;
+
+void _dbg(String msg) {
+  if (editOpsDebug) print('[EditOps] $msg');
+}
+
 /// Build the replacement literal for a picked hex (#RRGGBB or #AARRGGBB).
 String? colorLiteralForHex(String hex) {
   final h = hex.replaceAll('#', '').trim().toUpperCase();
@@ -192,14 +202,21 @@ String? _replaceStringArg(
   String content,
   int anchor,
   RegExp openRe,
-  String newInner,
-) {
+  String newInner, {
+  String what = 'replaceStringArg',
+}) {
   final m = _nearestMatch(content, openRe, anchor, 12);
-  if (m == null) return null;
+  if (m == null) {
+    _dbg('$what: no matching call within 12 lines of anchor=$anchor');
+    return null;
+  }
   final quote = m.$1.group(1)!;
   final contentStart = m.$1.end; // just after the opening quote
   final closeIdx = content.indexOf(quote, m.$1.end);
-  if (closeIdx < 0) return null;
+  if (closeIdx < 0) {
+    _dbg('$what: found an opening quote but no closing quote');
+    return null;
+  }
   final escaped = newInner
       .replaceAll(r'\', r'\\')
       .replaceAll('\$', r'\$')
@@ -256,6 +273,7 @@ String? setTextEdit(
     anchor,
     RegExp("Text\\(\\s*(['\"])"),
     newText,
+    what: 'setText',
   );
 }
 
@@ -270,12 +288,17 @@ String? setTextColorEdit(
   required String hex,
 }) {
   final newColor = colorLiteralForHex(hex);
-  if (newColor == null) return null;
+  if (newColor == null) {
+    _dbg('setTextColor: unparsable hex "$hex"');
+    return null;
+  }
   (int, int)? best;
   var bestDist = 1 << 30;
+  var styleColourCount = 0;
   for (final m in _colorProps(content)) {
     if (!_insideStyle(content, m.start))
       continue; // must be a text-style colour
+    styleColourCount++;
     final line = _lineAt(content, m.start);
     final dist = (line - anchor).abs();
     if (dist < bestDist) {
@@ -288,9 +311,16 @@ String? setTextColorEdit(
         newColor +
         content.substring(best.$2);
   }
-  // No explicit colour yet — insert one into the nearest text style.
+  // No explicit colour within 14 lines — try inserting into the nearest style.
   final styleOpen = _nearestStyle(content, anchor, 14);
-  if (styleOpen == null) return null;
+  if (styleOpen == null) {
+    _dbg(
+      'setTextColor: MISS anchor=$anchor — '
+      '${styleColourCount == 0 ? "no text-style `color:` anywhere in file" : "nearest text-style `color:` is $bestDist lines away (>14)"}, '
+      'and no TextStyle(/copyWith( within 14 lines to insert into',
+    );
+    return null;
+  }
   final insertAt = styleOpen + 1; // just after the '('
   return content.substring(0, insertAt) +
       'color: $newColor, ' +
@@ -326,7 +356,10 @@ String? setBgColorEdit(
   required String hex,
 }) {
   final newColor = colorLiteralForHex(hex);
-  if (newColor == null) return null;
+  if (newColor == null) {
+    _dbg('setBgColor: unparsable hex "$hex"');
+    return null;
+  }
   (int, int)? best;
   var bestDist = 1 << 30;
   // `backgroundColor:` is unambiguously a background.
@@ -348,7 +381,13 @@ String? setBgColorEdit(
       best = _valueSpan(content, m.end);
     }
   }
-  if (best == null || bestDist > 40) return null;
+  if (best == null || bestDist > 40) {
+    _dbg(
+      'setBgColor: MISS anchor=$anchor — '
+      '${best == null ? "no backgroundColor:/box `color:` anywhere in file" : "nearest background colour is $bestDist lines away (>40)"}',
+    );
+    return null;
+  }
   return content.substring(0, best.$1) + newColor + content.substring(best.$2);
 }
 
@@ -362,12 +401,24 @@ String? setBackgroundEdit(
   required String hex,
 }) {
   final newColor = colorLiteralForHex(hex);
-  if (newColor == null) return null;
+  if (newColor == null) {
+    _dbg('setBackground: unparsable hex "$hex"');
+    return null;
+  }
   final scaffold = _nearestMatch(content, RegExp(r'Scaffold\('), anchor, 400);
-  if (scaffold == null) return null;
+  if (scaffold == null) {
+    _dbg(
+      'setBackground: no Scaffold( within 400 lines of anchor=$anchor '
+      '(page may not use a Scaffold)',
+    );
+    return null;
+  }
   final openParen = scaffold.$1.end - 1; // the '(' of Scaffold(
   final closeParen = _matchingParen(content, openParen);
-  if (closeParen < 0) return null;
+  if (closeParen < 0) {
+    _dbg('setBackground: Scaffold( has an unmatched paren — cannot target it');
+    return null;
+  }
   final bodyStart = openParen + 1;
   // Only a Scaffold-LEVEL backgroundColor (depth 0), never a nested widget's.
   final hit = _findPropAtDepth0(
@@ -395,12 +446,16 @@ String? replaceImageEdit(
   required String assetPath,
 }) {
   final asset = assetPath.replaceAll(RegExp(r'^/'), '');
-  if (asset.isEmpty) return null;
+  if (asset.isEmpty) {
+    _dbg('replaceImage: empty asset path');
+    return null;
+  }
   return _replaceStringArg(
     content,
     anchor,
     RegExp("Image\\.asset\\(\\s*(['\"])"),
     asset,
+    what: 'replaceImage',
   );
 }
 
@@ -439,6 +494,10 @@ String? moveEdit(
         'Offset($nx, $ny)' +
         content.substring(m.start + m.end);
   }
+  _dbg(
+    'move: no Positioned(left:, top:) or Offset(, ) within 20 lines of '
+    'anchor=$anchor',
+  );
   return null;
 }
 
@@ -459,7 +518,10 @@ String? setPaddingEdit(
     anchor,
     24,
   );
-  if (m == null) return null;
+  if (m == null) {
+    _dbg('setPadding: no EdgeInsets.* within 24 lines of anchor=$anchor');
+    return null;
+  }
   final mm = m.$1;
   return content.substring(0, mm.start) +
       'EdgeInsets.fromLTRB($l, $t, $rt, $b)' +

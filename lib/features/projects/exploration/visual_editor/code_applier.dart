@@ -164,11 +164,20 @@ Future<_DeterministicEdit?> _deterministicEditAsync({
   required Workspace ws,
   required VisualOp op,
 }) async {
-  final file = op.region.sourceFile;
-  final anchor = op.region.sourceLine;
-  if (file == null || anchor == null) return null;
+  final r = op.region;
+  final file = r.sourceFile;
+  final anchor = r.sourceLine;
+  if (file == null || anchor == null) {
+    print(
+      '[VisualEditor] ${op.kind.name}: NO SOURCE LOCATION for region '
+      '"${r.label ?? r.widgetType}" (text="${r.text ?? r.childText}") — '
+      'the locator couldn\'t map it to a file:line, so it needs the assistant',
+    );
+    return null;
+  }
   final bytes = await ws.readBytes(file);
   final content = utf8.decode(bytes, allowMalformed: true);
+  final lineCount = content.split('\n').length;
 
   final next = switch (op.kind) {
     VisualOpKind.setText => setTextEdit(
@@ -205,9 +214,31 @@ Future<_DeterministicEdit?> _deterministicEditAsync({
     ),
   };
   print(
-    '[VisualEditor] ${op.kind.name} @ ${file}:$anchor → ${next == null ? "NO deterministic match (→ agent)" : "match found"}',
+    '[VisualEditor] ${op.kind.name} @ ${file}:$anchor '
+    '(file $lineCount lines; region="${r.label ?? r.widgetType}" '
+    'text="${r.text ?? r.childText}") → '
+    '${next == null ? "NO deterministic match (→ agent; reason on the [EditOps] line above)" : "match found ✓"}\n'
+    '${_snippet(content, anchor)}',
   );
   return next == null ? null : _DeterministicEdit(file, next);
+}
+
+/// A few lines of [content] around the 1-based [anchor] line, the anchor
+/// marked with `>>` — so the log shows exactly what source the region's
+/// located position points at (the key to diagnosing a missed edit).
+String _snippet(String content, int anchor, [int ctx = 4]) {
+  final lines = content.split('\n');
+  if (lines.isEmpty) return '  (empty file)';
+  final start = anchor - ctx < 1 ? 1 : anchor - ctx;
+  var end = anchor + ctx;
+  if (end > lines.length) end = lines.length;
+  final buf = StringBuffer();
+  for (var i = start; i <= end; i++) {
+    buf.writeln(
+      '${i == anchor ? '>>' : '  '} ${i.toString().padLeft(4)}| ${lines[i - 1]}',
+    );
+  }
+  return buf.toString().trimRight();
 }
 
 /// Precise prompt for the assistant (tier 2): what, where, with context.

@@ -22,6 +22,9 @@ int _lineOf(String content, String needle) {
 }
 
 void main() {
+  // Keep test stdout quiet — the ops print a decline REASON when they miss.
+  editOpsDebug = false;
+
   group('setTextEdit', () {
     const src = '''
     Widget build(BuildContext context) {
