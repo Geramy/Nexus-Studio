@@ -55,7 +55,12 @@ class _SrcFile {
 }
 
 class SourceIndex {
-  SourceIndex._(this.files, this.classes, this.routeToPageClass);
+  SourceIndex._(
+    this.files,
+    this.classes,
+    this.routeToPageClass,
+    this.homePageClass,
+  );
 
   /// All app Dart sources, keyed by workspace path.
   final Map<String, _SrcFile> files;
@@ -65,6 +70,9 @@ class SourceIndex {
 
   /// Route key → page widget class name (from app_routes.dart).
   final Map<String, String> routeToPageClass;
+
+  /// The `home:` widget class (the root screen, which isn't in appRoutes).
+  final String? homePageClass;
 
   static Future<SourceIndex> build(Workspace ws) async {
     final files = <String, _SrcFile>{};
@@ -113,13 +121,28 @@ class SourceIndex {
         routeToPageClass.putIfAbsent(m.group(1)!, () => m.group(2)!);
       }
     }
-    return SourceIndex._(files, classes, routeToPageClass);
+    // The `home:` widget (MaterialApp home: X()) — the root screen, which
+    // isn't in appRoutes, so home regions can't resolve via the route map.
+    String? homePageClass;
+    for (final f in files.values) {
+      final hm = RegExp(
+        r'\bhome\s*:\s*(?:const\s+)?([A-Z][A-Za-z0-9_]*)\s*\(',
+      ).firstMatch(f.content);
+      if (hm != null) {
+        homePageClass = hm.group(1)!;
+        break;
+      }
+    }
+    return SourceIndex._(files, classes, routeToPageClass, homePageClass);
   }
 
   /// Resolve [region] on screen [route] to file:line (or null).
   (String, int)? locate(String route, ScreenRegion region) {
-    // The screen's page file — strongest anchor for disambiguation.
-    final pageClass = routeToPageClass[route];
+    // The screen's page file — strongest anchor for disambiguation. The home
+    // screen (route '' or '/') isn't in appRoutes; resolve it via `home:`.
+    final isHome = route.isEmpty || route == '/';
+    final pageClass =
+        routeToPageClass[route] ?? (isHome ? homePageClass : null);
     final pageFile = pageClass == null
         ? null
         : classes[pageClass]?.isNotEmpty == true
@@ -138,6 +161,7 @@ class SourceIndex {
       final hit = _findText(child, pageFile);
       if (hit != null) return hit;
     }
+    final hasText = own.length >= 4 || child.length >= 4;
 
     // 2) Solid color → exact literal search.
     final hex = (region.colorHex ?? '').replaceAll('#', '').toUpperCase();
@@ -172,6 +196,14 @@ class SourceIndex {
         }
         return candidates.first;
       }
+    }
+
+    // 2b) Data-driven text: the label isn't a source literal (a route path,
+    //     a list-item value) but the page renders it via `Text(<variable>)`.
+    //     Anchor to that Text so a colour/text edit lands on the real widget.
+    if (hasText && pageFile != null) {
+      final hit = _findVarText(pageFile);
+      if (hit != null) return hit;
     }
 
     // 3) Chain → app-defined class search.
@@ -263,6 +295,21 @@ class SourceIndex {
       }
     }
     return c.first;
+  }
+
+  /// In [pageFile], a `Text(<variable>)` — a Text whose first argument is a
+  /// bare identifier (a value, not a string literal or a widget), e.g.
+  /// `Text(route)` / `Text(item.title)`. This is where data-driven labels are
+  /// rendered, and where their (theme-inherited) style lives. Returns the
+  /// first such Text, or null.
+  (String, int)? _findVarText(String pageFile) {
+    final f = files[pageFile];
+    if (f == null) return null;
+    final re = RegExp(r'Text\s*\(\s*[A-Za-z_][A-Za-z0-9_.]*\s*[,)]');
+    final m = re.firstMatch(f.content);
+    if (m == null) return null;
+    final line = f.content.substring(0, m.start).split('\n').length;
+    return (f.path, line);
   }
 
   /// Resolve a parameterised widget `_W(param: '…')` to the `Text` inside

@@ -313,18 +313,22 @@ String? setTextColorEdit(
   }
   // No explicit colour within 14 lines — try inserting into the nearest style.
   final styleOpen = _nearestStyle(content, anchor, 14);
-  if (styleOpen == null) {
-    _dbg(
-      'setTextColor: MISS anchor=$anchor — '
-      '${styleColourCount == 0 ? "no text-style `color:` anywhere in file" : "nearest text-style `color:` is $bestDist lines away (>14)"}, '
-      'and no TextStyle(/copyWith( within 14 lines to insert into',
-    );
-    return null;
+  if (styleOpen != null) {
+    final insertAt = styleOpen + 1; // just after the '('
+    return content.substring(0, insertAt) +
+        'color: $newColor, ' +
+        content.substring(insertAt);
   }
-  final insertAt = styleOpen + 1; // just after the '('
-  return content.substring(0, insertAt) +
-      'color: $newColor, ' +
-      content.substring(insertAt);
+  // Phase 3 — the Text inherits its colour from the theme (no style at all).
+  // Add a `style: TextStyle(color: …)` to the nearest Text.
+  final styled = _addStyleToNearestText(content, anchor, newColor);
+  if (styled != null) return styled;
+  _dbg(
+    'setTextColor: MISS anchor=$anchor — '
+    '${styleColourCount == 0 ? "no text-style `color:` anywhere in file" : "nearest text-style `color:` is $bestDist lines away (>14)"}, '
+    'no TextStyle(/copyWith( within 14 lines, and no bare Text( within 6 lines to style',
+  );
+  return null;
 }
 
 /// Index of the '(' of the nearest `TextStyle(` / `.copyWith(` to [anchor],
@@ -345,6 +349,38 @@ int? _nearestStyle(String content, int anchor, int maxDist) {
   }
   if (bestOpen == null || bestDist > maxDist) return null;
   return bestOpen;
+}
+
+/// The Text inherits its colour from the theme (no explicit style). Find the
+/// nearest `Text(` to [anchor] (within 6 lines) that has no `style:` argument
+/// and add one — the minimal change that makes the colour stick. Returns the
+/// new content, or null if there's no safe target.
+String? _addStyleToNearestText(String content, int anchor, String newColor) {
+  int? bestOpen;
+  var bestDist = 1 << 30;
+  for (final m in RegExp(r'Text\s*\(').allMatches(content)) {
+    final open = m.end - 1; // the '('
+    final dist = (_lineAt(content, open) - anchor).abs();
+    if (dist < bestDist) {
+      bestDist = dist;
+      bestOpen = open;
+    }
+  }
+  if (bestOpen == null || bestDist > 6) return null;
+  final close = _matchingParen(content, bestOpen);
+  if (close < 0) return null;
+  final args = content.substring(bestOpen + 1, close);
+  if (RegExp(r'\bstyle\s*:').hasMatch(args)) {
+    _dbg(
+      'addStyle: nearest Text( already has a style: (the insert-into-'
+      'TextStyle path should have handled it)',
+    );
+    return null;
+  }
+  final prefix = args.trimRight().endsWith(',') ? ' style:' : ', style:';
+  return content.substring(0, close) +
+      '$prefix TextStyle(color: $newColor)' +
+      content.substring(close);
 }
 
 /// Repaint a BOX's background: the nearest `backgroundColor:` — or a `color:`

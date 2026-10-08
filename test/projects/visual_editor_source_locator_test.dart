@@ -128,6 +128,76 @@ class _GameTile extends StatelessWidget {
 const _pageFile = '/lib/features/lobby/casino_lobby.dart';
 const _routesFile = '/lib/app_routes.dart';
 
+/// The REAL Home page of the eBay-marketplace demo (route '' — not in the
+/// route map). Its list items are `Text(route)` — a VARIABLE, no explicit
+/// style — the data-driven case the locator + "ensure style" op must handle.
+const _homeMain = '''
+import 'package:flutter/material.dart';
+
+import 'app_routes.dart';
+
+class GeneratedApp extends StatelessWidget {
+  const GeneratedApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'WEbsite test',
+      routes: appRoutes,
+      home: const TemplateHome(),
+    );
+  }
+}
+
+class TemplateHome extends StatelessWidget {
+  const TemplateHome({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('WEbsite test')),
+      body: SingleChildScrollView(
+        child: Column(
+          children: [
+            for (final route in appRoutes.keys)
+              ListTile(
+                title: Text(route),
+                onTap: () => Navigator.of(context).pushNamed(route),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+''';
+
+const _homeRoutes = '''
+final Map<String, WidgetBuilder> appRoutes = {
+  '/task-1-ebay_style_marketplace': (_) => EBayStyleMarketplaceTask1Page(),
+  '/task-6-stripe_checkout': (_) => StripeCheckoutTask6Page(),
+  '/task-11-seed_default_categories': (_) => SeedDefaultCategoriesTask11Page(),
+};
+''';
+
+const _homeMainFile = '/lib/main.dart';
+const _homeRoutesFile = '/lib/app_routes.dart';
+
+ScreenRegion _homeRegion(String text) => ScreenRegion(
+  id: 'home',
+  widgetType: 'RenderParagraph',
+  rect: const RectBox(0, 0, 100, 20),
+  text: text,
+  colorHex: '#FEF7FF',
+  textColorHex: '#1D1B20',
+  chain: const [
+    'Text',
+    'DefaultTextStyle',
+    'AnimatedDefaultTextStyle',
+    'ListTile',
+  ],
+);
+
 ScreenRegion _region(String text, {String? route}) => ScreenRegion(
   id: 'test',
   widgetType: 'RenderParagraph',
@@ -138,10 +208,14 @@ ScreenRegion _region(String text, {String? route}) => ScreenRegion(
 
 void main() {
   late SourceIndex index;
+  late SourceIndex homeIndex;
 
   setUpAll(() async {
     index = await SourceIndex.build(
       _MemWorkspace({_routesFile: _routes, _pageFile: _lobby}),
+    );
+    homeIndex = await SourceIndex.build(
+      _MemWorkspace({_homeMainFile: _homeMain, _homeRoutesFile: _homeRoutes}),
     );
   });
 
@@ -199,6 +273,44 @@ void main() {
         expect(out, contains('Color(0xFFFF0000)'));
         expect(out, isNot(contains('Color(0xFF333333)')));
         expect(out, contains('Color(0xFF222222)'));
+      },
+    );
+  });
+
+  group('data-driven home list (Text(variable), theme-inherited colour)', () {
+    test(
+      'route path on the home screen anchors to Text(route), not the route map',
+      () {
+        final loc = homeIndex.locate(
+          '',
+          _homeRegion('/task-6-stripe_checkout'),
+        );
+        expect(loc, isNotNull);
+        expect(loc!.$1, _homeMainFile);
+        final lines = _homeMain.split('\n');
+        expect(lines[loc.$2 - 1], contains('Text(route)'));
+        // Not the AppBar title, not the route map.
+        expect(lines[loc.$2 - 1], isNot(contains('WEbsite test')));
+        expect(loc.$1, isNot(_homeRoutesFile));
+      },
+    );
+
+    test(
+      'E2E: home list item → "change to red" ADDS a style to Text(route)',
+      () {
+        final loc = homeIndex.locate(
+          '',
+          _homeRegion('/task-6-stripe_checkout'),
+        )!;
+        final out = setTextColorEdit(_homeMain, anchor: loc.$2, hex: '#FF0000');
+        expect(out, isNotNull);
+        expect(
+          out,
+          contains('Text(route, style: TextStyle(color: Color(0xFFFF0000)))'),
+        );
+        // The AppBar title is a different Text and must be untouched.
+        expect(out, contains("Text('WEbsite test')"));
+        expect(out, isNot(contains("Text('WEbsite test', style:")));
       },
     );
   });
