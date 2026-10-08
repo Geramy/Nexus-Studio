@@ -348,4 +348,111 @@ child: Column(
       expect(reorderEdit(src, anchor: anchor, up: true), isNull);
     });
   });
+
+  group('setTextColorEdit on Tab labels', () {
+    test('inserts labelColor + unselectedLabelColor when absent', () {
+      const src = '''
+TabBar(
+  tabs: const [
+    Tab(text: 'Accounts'),
+    Tab(text: 'Items'),
+  ],
+);''';
+      final anchor = _lineOf(src, "Tab(text: 'Items')");
+      final out = setTextColorEdit(src, anchor: anchor, hex: '#FF0000');
+      expect(out, isNotNull);
+      expect(out, contains('labelColor: Color(0xFFFF0000)'));
+      expect(out, contains('unselectedLabelColor: Color(0xFFFF0000)'));
+    });
+
+    test('replaces an existing labelColor / unselectedLabelColor', () {
+      const src = '''
+TabBar(
+  tabs: const [
+    Tab(text: 'A'),
+  ],
+  labelColor: Colors.indigo,
+  unselectedLabelColor: Colors.grey,
+);''';
+      final anchor = _lineOf(src, "Tab(text: 'A')");
+      final out = setTextColorEdit(src, anchor: anchor, hex: '#00FF00');
+      expect(out, isNotNull);
+      expect(out, contains('labelColor: Color(0xFF00FF00)'));
+      expect(out, contains('unselectedLabelColor: Color(0xFF00FF00)'));
+      expect(out, isNot(contains('Colors.indigo')));
+    });
+
+    test('does NOT treat a plain Text as a tab', () {
+      const src = '''
+Column(
+  children: [
+    Text('Hello'),
+  ],
+);''';
+      final anchor = _lineOf(src, "Text('Hello')");
+      final out = setTextColorEdit(src, anchor: anchor, hex: '#FF0000');
+      expect(out, isNotNull);
+      expect(out, isNot(contains('labelColor')));
+      expect(out, contains('style: TextStyle(color: Color(0xFFFF0000))'));
+    });
+  });
+
+  group('setTextColorEdit on data-driven text (Text(item.field))', () {
+    const dataLine = "title: 'A'";
+
+    test('recolours a Theme text style via !.copyWith(color:)', () {
+      const src = '''
+final items = [Item(title: 'A'), Item(title: 'B')];
+Widget b(BuildContext c, Item it) => Text(
+      it.title,
+      style: Theme.of(c).textTheme.titleSmall,
+    );''';
+      final out = setTextColorEdit(src, anchor: _lineOf(src, dataLine), hex: '#FF0000');
+      expect(out, isNotNull);
+      expect(
+        out,
+        contains('titleSmall!.copyWith(color: Color(0xFFFF0000))'),
+      );
+    });
+
+    test('adds a colour inside a plain TextStyle', () {
+      const src = '''
+final items = [Item(title: 'A'), Item(title: 'B')];
+Widget b(BuildContext c, Item it) => Text(
+      it.title,
+      style: TextStyle(fontSize: 11),
+    );''';
+      final out = setTextColorEdit(src, anchor: _lineOf(src, dataLine), hex: '#FF0000');
+      expect(out, isNotNull);
+      expect(out, contains('color: Color(0xFFFF0000)'));
+    });
+
+    test('adds a style when the render Text has none', () {
+      const src = '''
+final items = [Item(title: 'A'), Item(title: 'B')];
+Widget b(BuildContext c, Item it) => Text(it.title);''';
+      final out = setTextColorEdit(src, anchor: _lineOf(src, dataLine), hex: '#FF0000');
+      expect(out, isNotNull);
+      expect(out, contains('style: TextStyle(color: Color(0xFFFF0000))'));
+    });
+
+    test('declines when there is no Text(item.field) render site nearby', () {
+      // `name` field but the only Text is far away and uses a different field.
+      const src = '''
+final items = [Item(name: 'A'), Item(name: 'B')];
+final pad1 = 1;
+final pad2 = 2;
+final pad3 = 3;
+final pad4 = 4;
+final pad5 = 5;
+final pad6 = 6;
+final pad7 = 7;
+Widget b(BuildContext c, Item it) => Text(it.other);''';
+      final out =
+          setTextColorEdit(src, anchor: _lineOf(src, "name: 'A'"), hex: '#FF0000');
+      // No Text(...name) render site, and the only Text is >6 lines away →
+      // every phase declines.
+      expect(out, isNull);
+    });
+  });
 }

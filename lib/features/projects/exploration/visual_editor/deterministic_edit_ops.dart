@@ -292,6 +292,11 @@ String? setTextColorEdit(
     _dbg('setTextColor: unparsable hex "$hex"');
     return null;
   }
+  // Phase 0 — the label is a `Tab(text: …)`: there's no per-Tab colour, so
+  // recolor the whole TabBar via labelColor + unselectedLabelColor. This is
+  // unambiguous (the anchor line is a `Tab(`), so it takes priority.
+  final tab = _setTabLabelColor(content, anchor, newColor);
+  if (tab != null) return tab;
   (int, int)? best;
   var bestDist = 1 << 30;
   var styleColourCount = 0;
@@ -323,11 +328,161 @@ String? setTextColorEdit(
   // Add a `style: TextStyle(color: …)` to the nearest Text.
   final styled = _addStyleToNearestText(content, anchor, newColor);
   if (styled != null) return styled;
+  // Phase 4 — data-driven: the anchor is a data definition (`title: '…'`) and
+  // the visible text is rendered by a `Text(item.title)` elsewhere in the file.
+  // Recolour that render site (all items that share the widget change too).
+  final dataDriven = _recolorDataDrivenText(content, anchor, newColor);
+  if (dataDriven != null) return dataDriven;
   _dbg(
     'setTextColor: MISS anchor=$anchor — '
     '${styleColourCount == 0 ? "no text-style `color:` anywhere in file" : "nearest text-style `color:` is $bestDist lines away (>14)"}, '
     'no TextStyle(/copyWith( within 14 lines, and no bare Text( within 6 lines to style',
   );
+  return null;
+}
+
+/// The label is a `Tab(text: …)` — there is no per-Tab colour, so recolor the
+/// whole TabBar via `labelColor` + `unselectedLabelColor` (a plain `Color`).
+/// Replaces an existing value or inserts the missing prop(s) before the
+/// TabBar's closing paren. Returns the new content, or null if the anchor line
+/// isn't a `Tab(` or no enclosing TabBar is found.
+String? _setTabLabelColor(String content, int anchor, String newColor) {
+  final anchorOff = _offsetAtLine(content, anchor);
+  if (anchorOff < 0) return null;
+  final nl = content.indexOf('\n', anchorOff);
+  final line = content.substring(anchorOff, nl < 0 ? content.length : nl);
+  if (!line.contains('Tab(')) return null; // not a tab label
+  // Nearest enclosing TabBar( whose span contains the anchor line.
+  var tbOpen = -1;
+  for (final m in RegExp(r'TabBar\(').allMatches(content)) {
+    if (m.start >= anchorOff) break;
+    final e = _matchingParen(content, m.end - 1);
+    if (e < 0) continue;
+    if (e >= anchorOff) {
+      tbOpen = m.start;
+    }
+  }
+  if (tbOpen < 0) {
+    _dbg('tabLabel: no enclosing TabBar( for anchor=$anchor');
+    return null;
+  }
+  var out = content;
+  final bs = out.indexOf('(', tbOpen) + 1;
+  var closeIdx = _matchingParen(out, bs - 1);
+  if (closeIdx < 0) {
+    _dbg('tabLabel: TabBar( has an unmatched paren');
+    return null;
+  }
+  final lc = _findPropAtDepth0(out, bs, closeIdx, 'labelColor');
+  final ulc = _findPropAtDepth0(out, bs, closeIdx, 'unselectedLabelColor');
+  if (lc != null) {
+    final span = _valueSpan(out, lc.$2);
+    out = out.substring(0, span.$1) + newColor + out.substring(span.$2);
+    closeIdx = _matchingParen(out, bs - 1);
+  }
+  if (ulc != null) {
+    final ulc2 = _findPropAtDepth0(out, bs, closeIdx, 'unselectedLabelColor');
+    if (ulc2 != null) {
+      final span = _valueSpan(out, ulc2.$2);
+      out = out.substring(0, span.$1) + newColor + out.substring(span.$2);
+    }
+  } else if (lc != null) {
+    out = out.substring(0, closeIdx) +
+        'unselectedLabelColor: $newColor, ' +
+        out.substring(closeIdx);
+  } else {
+    out = out.substring(0, closeIdx) +
+        'labelColor: $newColor, unselectedLabelColor: $newColor, ' +
+        out.substring(closeIdx);
+  }
+  return out;
+}
+
+/// Data-driven label: the anchor is a data definition like `title: '…'` and
+/// the visible text is rendered by a `Text(item.title)` elsewhere in the file
+/// (a list builder). Extract the field name from the anchor line, find that
+/// render site, and recolour its style. Returns the new content, or null when
+/// there's no data-param anchor, no `Text(….<field>)` render site, or the
+/// style shape isn't one we can handle safely (→ assistant).
+String? _recolorDataDrivenText(String content, int anchor, String newColor) {
+  final anchorOff = _offsetAtLine(content, anchor);
+  if (anchorOff < 0) return null;
+  final nl = content.indexOf('\n', anchorOff);
+  final raw = content.substring(anchorOff, nl < 0 ? content.length : nl);
+  final pm = RegExp(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*:').firstMatch(raw.trim());
+  if (pm == null) return null; // not a `field: …` line
+  // It must be a STRING data value (a quoted literal on this line).
+  if (!raw.contains("'") && !raw.contains('"')) return null;
+  final field = pm.group(1)!;
+  // Find the render site: Text( <ident>.<field>  ) — the field as the first
+  // argument (the text content).
+  final re = RegExp('Text\\(\\s*[a-zA-Z_][a-zA-Z0-9_]*\\.' + field + r'\b');
+  RegExpMatch? best;
+  var bestDist = 1 << 30;
+  for (final m in re.allMatches(content)) {
+    final d = (_lineAt(content, m.start) - anchor).abs();
+    if (d < bestDist) {
+      bestDist = d;
+      best = m;
+    }
+  }
+  if (best == null) {
+    _dbg('dataDriven: no Text(….$field) render site for anchor=$anchor');
+    return null;
+  }
+  final textOpen = best.start + 4; // the '(' of `Text(`
+  final close = _matchingParen(content, textOpen);
+  if (close < 0) return null;
+  return _recolorTextStyle(content, textOpen, close, newColor);
+}
+
+/// Recolour the `style:` of a `Text(` whose open paren is [textOpen] and
+/// matching close is [close]. Handles: no style (add one), a plain
+/// `TextStyle(` / `const TextStyle(` (add/replace the colour inside), and a
+/// Theme text style like `Theme.of(context).textTheme.titleSmall` (append
+/// `!.copyWith(color: …)`). Returns the new content, or null for an
+/// unrecognised style shape.
+String? _recolorTextStyle(
+  String content,
+  int textOpen,
+  int close,
+  String newColor,
+) {
+  final hit = _findPropAtDepth0(content, textOpen + 1, close, 'style');
+  if (hit == null) {
+    final insertAt = textOpen + 1;
+    return content.substring(0, insertAt) +
+        'style: TextStyle(color: $newColor), ' +
+        content.substring(insertAt);
+  }
+  final valStart = hit.$2; // just after the colon
+  final valEnd = _valueEnd(content, valStart);
+  if (valEnd <= valStart) return null;
+  final value = content.substring(valStart, valEnd).trim();
+  if (value.startsWith('TextStyle(') || value.startsWith('const TextStyle(')) {
+    final openParen = content.indexOf('(', valStart);
+    final innerClose = _matchingParen(content, openParen);
+    if (innerClose < 0) return null;
+    final colorHit =
+        _findPropAtDepth0(content, openParen + 1, innerClose, 'color');
+    if (colorHit != null) {
+      final span = _valueSpan(content, colorHit.$2);
+      return content.substring(0, span.$1) +
+          newColor +
+          content.substring(span.$2);
+    }
+    final insertAt = openParen + 1;
+    return content.substring(0, insertAt) +
+        'color: $newColor, ' +
+        content.substring(insertAt);
+  }
+  if (value.contains('.textTheme.')) {
+    // A Theme text style is a nullable TextStyle → append !.copyWith(color:).
+    return content.substring(0, valEnd) +
+        '!.copyWith(color: $newColor)' +
+        content.substring(valEnd);
+  }
+  _dbg('dataDriven: unrecognised style value "$value" — declining to assistant');
   return null;
 }
 
