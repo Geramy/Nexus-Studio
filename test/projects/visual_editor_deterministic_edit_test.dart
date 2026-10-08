@@ -277,4 +277,75 @@ return Center(child: Text('no scaffold here'));
       expect(out, isNull);
     });
   });
+
+  group('reorderEdit', () {
+    const col = '''
+return Column(
+  children: [
+    Tab(text: 'Accounts'),
+    Tab(text: 'Items'),
+    Tab(text: 'Categories'),
+  ],
+);''';
+
+    test('moves a single-line item up', () {
+      final anchor = _lineOf(col, "Tab(text: 'Items')");
+      final out = reorderEdit(col, anchor: anchor, up: true);
+      expect(out, isNotNull);
+      expect(out!.
+          indexOf("Tab(text: 'Items')"),
+          lessThan(out.indexOf("Tab(text: 'Accounts')")));
+    });
+
+    test('moves a single-line item down', () {
+      final anchor = _lineOf(col, "Tab(text: 'Accounts')");
+      final out = reorderEdit(col, anchor: anchor, up: false);
+      expect(out, isNotNull);
+      expect(out!.
+          indexOf("Tab(text: 'Accounts')"),
+          greaterThan(out.indexOf("Tab(text: 'Items')")));
+    });
+
+    test('moves a multi-line item up, keeping it intact', () {
+      const src = '''
+return Column(
+  children: [
+    HeaderA(
+      title: "Top",
+    ),
+    BodyB(
+      text: "Middle",
+    ),
+  ],
+);''';
+      final anchor = _lineOf(src, 'BodyB(');
+      final out = reorderEdit(src, anchor: anchor, up: true);
+      expect(out, isNotNull);
+      // BodyB (with its multi-line body) now precedes HeaderA.
+      expect(out!.indexOf('BodyB('), lessThan(out.indexOf('HeaderA(')));
+      expect(out, contains('text: "Middle"'));
+    });
+
+    test('declines when the item is already at the top', () {
+      final anchor = _lineOf(col, "Tab(text: 'Accounts')");
+      expect(reorderEdit(col, anchor: anchor, up: true), isNull);
+    });
+
+    test('declines when the item is already at the bottom', () {
+      final anchor = _lineOf(col, "Tab(text: 'Categories')");
+      expect(reorderEdit(col, anchor: anchor, up: false), isNull);
+    });
+
+    test('declines on a `for`-loop list (single generated item)', () {
+      const src = '''
+child: Column(
+  children: [
+    for (final route in appRoutes.keys)
+      ListTile(title: Text(route)),
+  ],
+),''';
+      final anchor = _lineOf(src, 'ListTile');
+      expect(reorderEdit(src, anchor: anchor, up: true), isNull);
+    });
+  });
 }

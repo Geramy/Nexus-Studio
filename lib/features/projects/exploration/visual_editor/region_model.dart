@@ -223,6 +223,7 @@ enum VisualOpKind {
   move,
   setPadding,
   setBackground,
+  reorder,
 }
 
 class VisualOp {
@@ -236,6 +237,7 @@ class VisualOp {
     this.dx = 0,
     this.dy = 0,
     this.padding, // (top, right, bottom, left)
+    this.moveUp = true, // reorder: true = earlier in the list, false = later
   });
 
   final VisualOpKind kind;
@@ -246,6 +248,7 @@ class VisualOp {
   final String? assetPath;
   final double dx, dy;
   final (double, double, double, double)? padding;
+  final bool moveUp;
 
   String get summary {
     final where = region.label ?? region.widgetType;
@@ -266,6 +269,8 @@ class VisualOp {
             '(t ${p.$1.round()}, r ${p.$2.round()}, b ${p.$3.round()}, l ${p.$4.round()})';
       case VisualOpKind.setBackground:
         return 'set the screen background to $colorHex';
+      case VisualOpKind.reorder:
+        return 'move $where ${moveUp ? "up" : "down"} in its list';
     }
   }
 }

@@ -335,6 +335,7 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
       case VisualOpKind.insertImage:
       case VisualOpKind.replaceImage:
       case VisualOpKind.setBackground:
+      case VisualOpKind.reorder:
         return null;
     }
   }
@@ -490,6 +491,14 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
           value: 6,
           child: _MenuItem('Set background…', Icons.wallpaper),
         ),
+        const PopupMenuItem(
+          value: 7,
+          child: _MenuItem('Move up in list', Icons.arrow_upward),
+        ),
+        const PopupMenuItem(
+          value: 8,
+          child: _MenuItem('Move down in list', Icons.arrow_downward),
+        ),
       ],
     ).then((v) {
       if (v == null) return;
@@ -508,8 +517,23 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
           _paddingDialog(r);
         case 6:
           _backgroundDialog(r);
+        case 7:
+          _applyReorder(r, up: true);
+        case 8:
+          _applyReorder(r, up: false);
       }
     });
+  }
+
+  void _applyReorder(ScreenRegion r, {required bool up}) {
+    _applyOp(
+      VisualOp(
+        kind: VisualOpKind.reorder,
+        region: r,
+        screenRoute: _currentScreen().route,
+        moveUp: up,
+      ),
+    );
   }
 
   void _colorDialog(ScreenRegion r, {bool allScope = false}) {

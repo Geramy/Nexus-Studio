@@ -592,6 +592,155 @@ String? moveEdit(
   return null;
 }
 
+/// Offset of the START of 1-based [line], or -1 if out of range.
+int _offsetAtLine(String content, int line) {
+  if (line <= 1) return 0;
+  var n = 1;
+  for (var i = 0; i < content.length; i++) {
+    if (content[i] == '\n') {
+      n++;
+      if (n == line) return i + 1;
+    }
+  }
+  return n == line ? content.length : -1;
+}
+
+/// Index of the bracket matching the one at [openIdx] (`[`→`]`, `{`→`}`,
+/// `(`→`)`), tracking only that bracket type, or -1.
+int _matchingBracket(String content, int openIdx) {
+  final open = content[openIdx];
+  final close = open == '[' ? ']' : (open == '{' ? '}' : ')');
+  var depth = 0;
+  for (var i = openIdx; i < content.length; i++) {
+    final c = content[i];
+    if (c == open) {
+      depth++;
+    } else if (c == close) {
+      depth--;
+      if (depth == 0) return i;
+    }
+  }
+  return -1;
+}
+
+/// Split `content[start..close)` — the interior of a `[ … ]` list, where
+/// [close] is the index of the matching `]` — into top-level items. Each
+/// (start, end) span is one item's code (surrounding commas/whitespace
+/// excluded). A `for (…)` element counts as a single item.
+List<(int, int)> _splitListItems(String content, int start, int close) {
+  final items = <(int, int)>[];
+  var depth = 0;
+  var itemStart = -1;
+  for (var i = start; i < close; i++) {
+    final c = content[i];
+    if (c == '(' || c == '[' || c == '{') {
+      depth++;
+    } else if (c == ')' || c == ']' || c == '}') {
+      depth--;
+    }
+    if (depth == 0) {
+      if (c == ',') {
+        if (itemStart >= 0) {
+          var e = i;
+          while (e > itemStart && _isWs(content[e - 1])) {
+            e--;
+          }
+          items.add((itemStart, e));
+          itemStart = -1;
+        }
+      } else if (!_isWs(c) && itemStart < 0) {
+        itemStart = i;
+      }
+    }
+  }
+  if (itemStart >= 0) {
+    var e = close;
+    while (e > itemStart && _isWs(content[e - 1])) {
+      e--;
+    }
+    items.add((itemStart, e));
+  }
+  return items;
+}
+
+/// Flow-layout "move": move one CONCRETE list item UP or DOWN a single
+/// position within the innermost `[ … ]` list that contains [anchor]. This is
+/// the one reordering that is a clean, minimal edit in a Column/Row/ListView
+/// children list. Returns the new content, or null when there is nothing
+/// reorderable (a `for`-loop list, a 1-item list, the item is already at the
+/// edge, or no enclosing list) — the caller then falls back to the assistant.
+String? reorderEdit(
+  String content, {
+  required int anchor,
+  required bool up,
+}) {
+  final lineStart = _offsetAtLine(content, anchor);
+  if (lineStart < 0) {
+    _dbg('reorder: anchor line $anchor is out of range');
+    return null;
+  }
+  var lineEnd = _offsetAtLine(content, anchor + 1);
+  if (lineEnd < 0) lineEnd = content.length;
+  // Innermost `[ … ]` whose span contains the anchor line.
+  int? bestOpen;
+  int? bestClose;
+  var bestLen = 1 << 30;
+  for (final m in RegExp(r'\[').allMatches(content)) {
+    final open = m.start;
+    if (open > lineEnd) break;
+    final close = _matchingBracket(content, open);
+    if (close < 0 || close < lineStart) continue;
+    final len = close - open;
+    if (len < bestLen) {
+      bestLen = len;
+      bestOpen = open;
+      bestClose = close;
+    }
+  }
+  if (bestOpen == null || bestClose == null) {
+    _dbg('reorder: no [ … ] list containing anchor=$anchor');
+    return null;
+  }
+  final items = _splitListItems(content, bestOpen + 1, bestClose);
+  if (items.length < 2) {
+    _dbg(
+      'reorder: enclosing list has ${items.length} item(s) — nothing to '
+      'reorder (a `for`-loop list or a single child)',
+    );
+    return null;
+  }
+  // The item whose span OVERLAPS the anchor line.
+  var idx = -1;
+  for (var i = 0; i < items.length; i++) {
+    if (items[i].$1 < lineEnd && items[i].$2 > lineStart) {
+      idx = i;
+      break;
+    }
+  }
+  if (idx < 0) {
+    _dbg('reorder: anchor line is not inside any item of the list');
+    return null;
+  }
+  final j = up ? idx - 1 : idx + 1;
+  if (j < 0 || j >= items.length) {
+    _dbg('reorder: item is already at the ${up ? "top" : "bottom"} of the list');
+    return null;
+  }
+  final (si, ei) = items[idx];
+  final (sj, ej) = items[j];
+  final segI = content.substring(si, ei);
+  final segJ = content.substring(sj, ej);
+  // Replace the LATER span first so the earlier offsets stay valid.
+  if (si < sj) {
+    var out = content.substring(0, sj) + segI + content.substring(ej);
+    out = out.substring(0, si) + segJ + out.substring(ei);
+    return out;
+  }
+  var out = content.substring(0, si) + segJ + content.substring(ei);
+  out = out.substring(0, sj) + segI + out.substring(ej);
+  return out;
+}
+
 /// Padding: nearest `EdgeInsets.*` to [anchor], normalised to fromLTRB.
 /// [padding] is (top, right, bottom, left).
 String? setPaddingEdit(

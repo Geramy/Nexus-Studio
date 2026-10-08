@@ -207,6 +207,8 @@ Future<_DeterministicEdit?> _deterministicEditAsync({
       op.padding == null
           ? null
           : setPaddingEdit(content, anchor: anchor, padding: op.padding!),
+    VisualOpKind.reorder =>
+      reorderEdit(content, anchor: anchor, up: op.moveUp),
     VisualOpKind.setBackground => op.assetPath != null
       ? setBackgroundImageEdit(content, anchor: anchor, assetPath: op.assetPath!)
       : setBackgroundEdit(content, anchor: anchor, hex: op.colorHex ?? ''),
@@ -261,6 +263,8 @@ String _agentPrompt(VisualOp op) {
       'Visual edit task: move the ${r.label ?? r.widgetType} at $where (screen region $boxDesc) by (${op.dx.round()}, ${op.dy.round()}) pixels — change the surrounding padding/margin/Positioned/alignment, do NOT freeform-position the widget. Edit only the minimal lines needed; keep the file compiling.',
     VisualOpKind.setPadding =>
       'Visual edit task: set the padding of the ${r.label ?? r.widgetType} at $where (screen region $boxDesc) to top ${op.padding!.$1.round()}, right ${op.padding!.$2.round()}, bottom ${op.padding!.$3.round()}, left ${op.padding!.$4.round()} — adjust the nearest EdgeInsets/padding/margin, keep the layout sane. Edit only the minimal lines needed; keep the file compiling.',
+    VisualOpKind.reorder =>
+      'Visual edit task: move the ${r.label ?? r.widgetType} at $where (screen region $boxDesc) ${op.moveUp ? "UP" : "DOWN"} one position within its parent list — reorder that child inside the enclosing Column/Row/ListView children list, keeping the layout sane. Edit only the minimal lines needed; keep the file compiling.',
     VisualOpKind.setBackground => op.assetPath != null
       ? 'Visual edit task: set this screen\'s BACKGROUND to the image asset "${op.assetPath}" (already in the app\'s assets/ and registered in pubspec). Wrap the page Scaffold\'s `body:` in a Stack with `Positioned.fill(child: Image.asset("${op.assetPath}", fit: BoxFit.cover))` as the first child, keeping ALL existing UI on top. Page file: $where. Keep the file compiling.'
       : 'Visual edit task: change this screen\'s BACKGROUND colour to ${op.colorHex} at $where. Set the page Scaffold\'s `backgroundColor:` (or the top-level background) — do not restyle individual widgets. Edit only the minimal lines needed; keep the file compiling.',
