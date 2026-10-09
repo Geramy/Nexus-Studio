@@ -184,12 +184,14 @@ Future<_DeterministicEdit?> _deterministicEditAsync({
     );
     return null;
   }
-  // "Move up/down" on a home-menu item is a CROSS-FILE reorder: the menu
-  // renders Text(route), but the order lives in the routes map (a different
-  // file). Try that first; if the region isn't a route, fall through to the
-  // same-file deterministic ops below.
-  if (op.kind == VisualOpKind.reorder) {
-    final routeResult = await _routeReorderEdit(ws: ws, op: op);
+  // "Move" on a home-menu item is a CROSS-FILE reorder: the menu renders
+  // Text(route), but the order lives in the routes map (a different file).
+  // Try that first for BOTH an explicit reorder and a drag-to-move; if the
+  // region isn't a route, fall through to the same-file deterministic ops.
+  if (op.kind == VisualOpKind.reorder || op.kind == VisualOpKind.move) {
+    final dirUp =
+        op.kind == VisualOpKind.move ? _dragUp(op.dx, op.dy) : op.moveUp;
+    final routeResult = await _routeReorderEdit(ws: ws, op: op, up: dirUp);
     if (routeResult != null) return routeResult;
   }
   final bytes = await ws.readBytes(file);
@@ -219,7 +221,11 @@ Future<_DeterministicEdit?> _deterministicEditAsync({
       anchor: anchor,
       dx: op.dx,
       dy: op.dy,
-    ),
+    ) ??
+      // Flow layout (Column/Row/ListView): a freeform pixel shift isn't a
+      // thing, so map the drag to a one-step reorder in its dominant direction
+      // (the only deterministic "move" that makes sense there).
+      reorderEdit(content, anchor: anchor, up: _dragUp(op.dx, op.dy)),
     VisualOpKind.setPadding =>
       op.padding == null
           ? null
@@ -249,6 +255,7 @@ Future<_DeterministicEdit?> _deterministicEditAsync({
 Future<_DeterministicEdit?> _routeReorderEdit({
   required Workspace ws,
   required VisualOp op,
+  required bool up,
 }) async {
   final route = op.region.text?.trim() ?? '';
   if (!route.startsWith('/')) return null; // not a route label
@@ -268,7 +275,7 @@ Future<_DeterministicEdit?> _routeReorderEdit({
     }
     if (!content.contains(route)) continue; // cheap pre-filter
     if (!keyRe.hasMatch(content)) continue;
-    final next = reorderRouteEdit(content, route, op.moveUp);
+    final next = reorderRouteEdit(content, route, up);
     if (next == null) {
       print(
         '[VisualEditor] reorderRoute: "$route" is a key in ${e.path} but the '
@@ -277,13 +284,17 @@ Future<_DeterministicEdit?> _routeReorderEdit({
       continue;
     }
     print(
-      '[VisualEditor] reorderRoute: moved "$route" ${op.moveUp ? "up" : "down"} '
+      '[VisualEditor] reorderRoute: moved "$route" ${up ? "up" : "down"} '
       'in ${e.path} ✓ (cross-file: menu shows Text(route), order lives in the routes map)',
     );
     return _DeterministicEdit(e.path, next);
   }
   return null;
 }
+
+/// Map a 2-D drag to a one-step list direction: the dominant axis decides
+/// vertical (up/down) vs horizontal (left/right); "earlier in the list" is up.
+bool _dragUp(double dx, double dy) => dy.abs() >= dx.abs() ? dy < 0 : dx < 0;
 
 /// A few lines of [content] around the 1-based [anchor] line, the anchor
 /// marked with `>>` — so the log shows exactly what source the region's

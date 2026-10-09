@@ -293,40 +293,34 @@ Future<ScreenMap> recaptureOneScreen({
       }
     }
 
-    // Seed the other screens from the latest prior capture (different HEAD),
-    // replacing [route] in place to preserve ordering.
+    // Seed the other screens from the most COMPLETE prior capture (not just
+    // the most recent — a prior single-screen pass may have produced only one
+    // screen), replacing [route] in place to preserve ordering. Decoding is
+    // per-screen and lenient so a single malformed screen can never wipe the
+    // rest (the old behaviour that dropped every other screen on update).
     final merged = <CapturedScreen>[];
     var replaced = false;
-    final seedDir = await _latestPriorCacheDir(projectId, head);
-    if (seedDir != null) {
-      final seedFile = File(
-        '${seedDir.path}${Platform.pathSeparator}screens_map.json',
-      );
-      if (await seedFile.exists()) {
-        try {
-          final seed = ScreenMap.fromJson(await seedFile.readAsString());
-          for (final s in seed.screens) {
-            if (s.route == route) {
-              merged.add(fresh);
-              replaced = true;
-              continue;
-            }
-            if (s.pngFile.isNotEmpty) {
-              final sp = File(
-                '${seedDir.path}${Platform.pathSeparator}${s.pngFile}',
-              );
-              final tp = File(
-                '${target.path}${Platform.pathSeparator}${s.pngFile}',
-              );
-              if (await sp.exists() && !await tp.exists()) {
-                await sp.copy(tp.path);
-              }
-            }
-            merged.add(s);
-          }
-        } catch (_) {
-          merged.clear();
+    final seed = await _bestSeed(projectId, head);
+    if (seed != null) {
+      final seedDir = seed.$1;
+      for (final s in seed.$2) {
+        if (s.route == route) {
+          merged.add(fresh);
+          replaced = true;
+          continue;
         }
+        if (s.pngFile.isNotEmpty) {
+          final sp = File(
+            '${seedDir.path}${Platform.pathSeparator}${s.pngFile}',
+          );
+          final tp = File(
+            '${target.path}${Platform.pathSeparator}${s.pngFile}',
+          );
+          if (await sp.exists() && !await tp.exists()) {
+            await sp.copy(tp.path);
+          }
+        }
+        merged.add(s);
       }
     }
     if (!replaced) merged.add(fresh);
@@ -347,15 +341,20 @@ Future<ScreenMap> recaptureOneScreen({
   }
 }
 
-/// The most recently modified screen-map cache dir for [projectId] whose HEAD
-/// is not [excludeHead] — used to seed a single-screen re-capture.
-Future<Directory?> _latestPriorCacheDir(
+/// The prior screen-map cache (a different HEAD) with the MOST screens — the
+/// most complete capture to seed a single-screen re-capture from. Picking the
+/// most-recent-by-mtime dir would cascade failures when the immediately
+/// previous pass itself only produced a single screen; picking the
+/// most-complete one keeps the map whole. Ties break by recency.
+Future<(Directory, List<CapturedScreen>)?> _bestSeed(
   int projectId,
   String excludeHead,
 ) async {
   final root = await _cacheRoot();
   final prefix = 'p${projectId}_';
-  Directory? best;
+  Directory? bestDir;
+  List<CapturedScreen> bestScreens = const [];
+  var bestCount = 0;
   var bestTime = DateTime.fromMillisecondsSinceEpoch(0);
   try {
     for (final e in root.listSync()) {
@@ -363,14 +362,45 @@ Future<Directory?> _latestPriorCacheDir(
       final name = e.uri.pathSegments.last;
       if (!name.startsWith(prefix)) continue;
       if (name.substring(prefix.length) == excludeHead) continue;
+      final jsonFile = File(
+        '${e.path}${Platform.pathSeparator}screens_map.json',
+      );
+      if (!await jsonFile.exists()) continue;
+      final screens = _parseScreensLenient(await jsonFile.readAsString());
       final mt = e.statSync().modified;
-      if (mt.isAfter(bestTime)) {
+      if (screens.length > bestCount ||
+          (screens.length == bestCount &&
+              bestCount > 0 &&
+              mt.isAfter(bestTime))) {
+        bestCount = screens.length;
+        bestDir = e;
+        bestScreens = screens;
         bestTime = mt;
-        best = e;
       }
     }
   } catch (_) {}
-  return best;
+  if (bestDir == null || bestCount == 0) return null;
+  return (bestDir, bestScreens);
+}
+
+/// Decode the screen list from a cached map, tolerating a malformed screen or
+/// region (skipped) so one bad entry can't blank out the whole seed.
+List<CapturedScreen> _parseScreensLenient(String src) {
+  try {
+    final j = jsonDecode(src) as Map<String, dynamic>;
+    final list = (j['screens'] as List?) ?? const [];
+    final out = <CapturedScreen>[];
+    for (final s in list) {
+      try {
+        out.add(CapturedScreen.fromJson(s as Map<String, dynamic>));
+      } catch (_) {
+        // skip a screen that fails to decode
+      }
+    }
+    return out;
+  } catch (_) {
+    return const [];
+  }
 }
 
 String _labelForRoute(String route) {
