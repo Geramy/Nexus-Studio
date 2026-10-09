@@ -678,29 +678,44 @@ String? setBackgroundImageEdit(
     _dbg('setBackgroundImage: Scaffold body: value is empty');
     return null;
   }
-  // If the body is ALREADY a Stack with a `Positioned.fill` background image,
-  // just swap that image's path — do NOT wrap in another Stack (which is how
-  // repeated applies used to nest Stack-over-Stack-over-Stack). We replace the
-  // INNERMOST one (the last child = the one actually visible on top); for a
-  // fresh single-Stack body there's exactly one, so this is identical.
-  final bgMatches = RegExp(
-    "(Positioned\\.fill\\(\\s*child:\\s*Image\\.asset\\(\\s*['\"])[^'\"]+(')",
-  ).allMatches(bodyExpr).toList();
-  if (bgMatches.isNotEmpty) {
-    final existingBg = bgMatches.last;
-    final newBody =
-        bodyExpr.substring(0, existingBg.start) +
-        existingBg.group(1)! +
-        asset +
-        existingBg.group(2)! +
-        bodyExpr.substring(existingBg.end);
-    return content.substring(0, s) + newBody + content.substring(e);
-  }
+  // Collapse any background-image Stack layer(s) that this op (in earlier
+  // builds) wrapped around the body down to the REAL content, then rebuild ONE
+  // clean Stack with the new image behind it. Removing the prior image(s) is
+  // what stops a non-opaque image from showing the previous one through. The
+  // Scaffold's `backgroundColor` is left untouched, so a colour + non-opaque
+  // image can still layer (the colour shows through the image's gaps).
+  final realContent = _unwrapBackgroundStacks(bodyExpr);
   final wrapped = 'Stack(children: [\n'
       "        Positioned.fill(child: Image.asset('$asset', fit: BoxFit.cover)),\n"
-      '        $bodyExpr,\n'
+      '        $realContent,\n'
       '      ])';
   return content.substring(0, s) + wrapped + content.substring(e);
+}
+
+/// Unwrap the background-image `Stack` layers that `setBackgroundImageEdit`
+/// wraps the body in — each layer is
+/// `Stack(children: [ Positioned.fill(child: Image.asset(…)), <rest> ])`.
+/// Repeatedly peels a layer off (taking `<rest>`) until [expr] is no longer
+/// such a wrap, returning the innermost real content. Returns [expr] unchanged
+/// when it is not one of our background wraps.
+String _unwrapBackgroundStacks(String expr) {
+  var cur = expr;
+  for (var i = 0; i < 20; i++) {
+    final m = RegExp(r'^\s*Stack\(\s*children:\s*\[').firstMatch(cur);
+    if (m == null) break;
+    final open = cur.indexOf('[', m.start);
+    final close = _matchingBracket(cur, open);
+    if (close < 0) break;
+    final items = _splitListItems(cur, open + 1, close);
+    if (items.length != 2) break;
+    final first = cur.substring(items[0].$1, items[0].$2).trim();
+    if (!RegExp(r'^Positioned\.fill\(\s*child:\s*Image\.asset\(')
+        .hasMatch(first)) {
+      break;
+    }
+    cur = cur.substring(items[1].$1, items[1].$2);
+  }
+  return cur.trim();
 }
 
 /// Replace an `Image.asset` path near [anchor].

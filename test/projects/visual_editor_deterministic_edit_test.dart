@@ -300,9 +300,9 @@ return Scaffold(
       expect(bgCount, 1);
     });
 
-    test('on an already-nested body, replaces the innermost (visible) image', () {
+    test('on an already-nested body, collapses to ONE clean image (no bleed-through)', () {
       const src = '''
-return Scaffold(
+return Scaffold(backgroundColor: Color(0xFF3B82F6),
   body: Stack(children: [
     Positioned.fill(child: Image.asset('assets/outer.png', fit: BoxFit.cover)),
     Stack(children: [
@@ -318,10 +318,18 @@ return Scaffold(
         assetPath: '/assets/new.png',
       );
       expect(out, isNotNull);
-      // The innermost (visible) image is the one swapped; the outer stays.
-      expect(out, contains("Image.asset('assets/outer.png'"));
+      // Exactly ONE background image remains — the old ones are removed so a
+      // non-opaque image can't show a previous image through it.
+      final bgCount =
+          RegExp(r'Positioned\.fill\(child: Image\.asset').allMatches(out!).length;
+      expect(bgCount, 1);
       expect(out, contains("Image.asset('assets/new.png'"));
+      expect(out, isNot(contains('assets/outer.png')));
       expect(out, isNot(contains('assets/inner.png')));
+      // The real content is preserved…
+      expect(out, contains("const Text('content')"));
+      // …and the Scaffold colour stays, so a non-opaque image can layer over it.
+      expect(out, contains('backgroundColor: Color(0xFF3B82F6)'));
     });
   });
 
