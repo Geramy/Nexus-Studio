@@ -276,6 +276,53 @@ return Center(child: Text('no scaffold here'));
       );
       expect(out, isNull);
     });
+
+    test('replaces an existing background image instead of nesting another Stack', () {
+      const src = '''
+return Scaffold(
+  body: Stack(children: [
+    Positioned.fill(child: Image.asset('assets/old.png', fit: BoxFit.cover)),
+    const Text('content'),
+  ]),
+);''';
+      final anchor = _lineOf(src, 'Scaffold');
+      final out = setBackgroundImageEdit(
+        src,
+        anchor: anchor,
+        assetPath: '/assets/new.png',
+      );
+      expect(out, isNotNull);
+      expect(out, contains("Image.asset('assets/new.png'"));
+      expect(out, isNot(contains('assets/old.png')));
+      // Exactly ONE background image remains — no nested Stack was added.
+      final bgCount =
+          RegExp(r'Positioned\.fill\(child: Image\.asset').allMatches(out!).length;
+      expect(bgCount, 1);
+    });
+
+    test('on an already-nested body, replaces the innermost (visible) image', () {
+      const src = '''
+return Scaffold(
+  body: Stack(children: [
+    Positioned.fill(child: Image.asset('assets/outer.png', fit: BoxFit.cover)),
+    Stack(children: [
+      Positioned.fill(child: Image.asset('assets/inner.png', fit: BoxFit.cover)),
+      const Text('content'),
+    ]),
+  ]),
+);''';
+      final anchor = _lineOf(src, 'Scaffold');
+      final out = setBackgroundImageEdit(
+        src,
+        anchor: anchor,
+        assetPath: '/assets/new.png',
+      );
+      expect(out, isNotNull);
+      // The innermost (visible) image is the one swapped; the outer stays.
+      expect(out, contains("Image.asset('assets/outer.png'"));
+      expect(out, contains("Image.asset('assets/new.png'"));
+      expect(out, isNot(contains('assets/inner.png')));
+    });
   });
 
   group('insertImageEdit', () {

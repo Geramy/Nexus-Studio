@@ -108,6 +108,18 @@ Future<void> main() async {
           final ex = tester.takeException();
           if (ex != null) exception = ex.toString().split('\\n').first;
         }
+        // Let async `Image.asset` / `Image.network` finish loading AND decoding.
+        // The pumps above run in the fake-async test zone, which never completes
+        // the real image codec — so without this real-async wait every asset
+        // image paints as a blank (the "set background image → null" bug). Give
+        // the codec real time, then pump so the decoded image actually paints.
+        await tester.runAsync(() async {
+          await Future<void>.delayed(const Duration(milliseconds: 1200));
+        });
+        for (var i = 0; i < 12; i++) {
+          await tester.pump(const Duration(milliseconds: 80));
+          tester.takeException();
+        }
         // Rasterization is real async — it must run in a real-async zone or
         // the fake-async test zone deadlocks (the classic golden-test hang).
         final img = await tester.runAsync(() async {

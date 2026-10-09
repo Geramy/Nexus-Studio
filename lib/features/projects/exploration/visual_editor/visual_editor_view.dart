@@ -294,6 +294,16 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
   /// (a list / for-loop), a one-line edit changes ALL of them — tell the user
   /// so "I recoloured one but they all changed" isn't a surprise.
   String? _repeatNote(VisualOp op) {
+    // Move / reorder / image ops change ONE target (the item the user
+    // pointed at), even when that item's source line is shared by many widgets
+    // (e.g. a `for`-loop menu) — so "applies to all of them" would be a lie.
+    // Only the style/text ops genuinely broadcast to every shared instance.
+    if (op.kind == VisualOpKind.move ||
+        op.kind == VisualOpKind.reorder ||
+        op.kind == VisualOpKind.insertImage ||
+        op.kind == VisualOpKind.replaceImage) {
+      return null;
+    }
     final f = op.region.sourceFile;
     final l = op.region.sourceLine;
     if (f == null || l == null) return null;
