@@ -369,6 +369,10 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
         },
       );
       ScreenMap map;
+      // SAFETY NET: a single-screen recapture must never REDUCE the number of
+      // screens we're showing (a lost seed would collapse the whole map to one
+      // screen — the "only 1 page open" bug). If it does, do a full capture.
+      final prevCount = _map?.screens.length ?? 0;
       if (route != null) {
         try {
           map = await recaptureOneScreen(
@@ -380,6 +384,14 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
               if (mounted && _map != null) setState(() {});
             },
           );
+          if (map.screens.length < prevCount) {
+            print(
+              '[ScreenMap] recapture produced ${map.screens.length} screens, '
+              'fewer than the current $prevCount — falling back to a full '
+              'capture so we never lose the other screens.',
+            );
+            map = await full();
+          }
         } catch (_) {
           map = await full(); // fall back to a full re-capture
         }
@@ -1813,11 +1825,13 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
   void _shiftDragEnd() {
     final r = _dragRegion;
     final delta = _dragDelta;
-    setState(() {
-      _dragRegion = null;
-      _dragOrigin = null;
-      _dragDelta = Offset.zero;
-    });
+    // Reset SYNCHRONOUSLY (not in the deferred setState) so a duplicate
+    // pointerUp + pointerCancel — both of which call this — can't double-apply
+    // the move (the item jumping by two / looking like it "applied to all").
+    _dragRegion = null;
+    _dragOrigin = null;
+    _dragDelta = Offset.zero;
+    if (mounted) setState(() {});
     if (r == null || delta.distance < 8) return;
     _applyOp(
       VisualOp(

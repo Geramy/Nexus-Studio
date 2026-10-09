@@ -896,6 +896,89 @@ String? reorderEdit(
   return out;
 }
 
+/// Deterministic "insert image": place an `Image.asset(...)` as a NEW child in
+/// the innermost `children: [ … ]` list that contains [anchor], immediately
+/// before the item the anchor sits on (so the picture appears right where the
+/// user pointed). Returns the new content, or null when the anchor is not
+/// inside a plain (non-`const`) `children:` list — the caller then falls back
+/// to the assistant (which already has the asset in-workspace).
+String? insertImageEdit(
+  String content, {
+  required int anchor,
+  required String assetPath,
+}) {
+  final asset = assetPath.replaceAll(RegExp(r'^/'), '');
+  if (asset.isEmpty) {
+    _dbg('insertImage: empty asset path');
+    return null;
+  }
+  final lineStart = _offsetAtLine(content, anchor);
+  if (lineStart < 0) {
+    _dbg('insertImage: anchor line $anchor is out of range');
+    return null;
+  }
+  var lineEnd = _offsetAtLine(content, anchor + 1);
+  if (lineEnd < 0) lineEnd = content.length;
+  // Innermost [ … ] whose span contains the anchor line (same search reorder
+  // uses, so an insert lands exactly where a move/reorder would).
+  int? bestOpen;
+  int? bestClose;
+  var bestLen = 1 << 30;
+  for (final m in RegExp(r'\[').allMatches(content)) {
+    final open = m.start;
+    if (open > lineEnd) break;
+    final close = _matchingBracket(content, open);
+    if (close < 0 || close < lineStart) continue;
+    final len = close - open;
+    if (len < bestLen) {
+      bestLen = len;
+      bestOpen = open;
+      bestClose = close;
+    }
+  }
+  if (bestOpen == null || bestClose == null) {
+    _dbg('insertImage: no [ … ] list containing anchor=$anchor');
+    return null;
+  }
+  // SAFETY: only insert into a plain widget `children:` list — never a data
+  // list (List<String> etc.) or a `const` list (a non-const Image.asset would
+  // invalidate it). Anything else declines to the assistant.
+  final before =
+      content.substring((bestOpen - 40).clamp(0, bestOpen), bestOpen);
+  if (RegExp(r'children\s*:\s*const\s*$').hasMatch(before)) {
+    _dbg('insertImage: enclosing list is a `const` children list — declining');
+    return null;
+  }
+  if (!RegExp(r'(children\s*:?|List)\s*$').hasMatch(before)) {
+    _dbg('insertImage: enclosing list is not a `children:` widget list');
+    return null;
+  }
+  final items = _splitListItems(content, bestOpen + 1, bestClose);
+  if (items.isEmpty) {
+    _dbg('insertImage: enclosing children list is empty');
+    return null;
+  }
+  // Item whose span overlaps the anchor line (where the user pointed);
+  // default to the last item if the anchor falls between items.
+  var idx = items.length - 1;
+  for (var i = 0; i < items.length; i++) {
+    if (items[i].$1 < lineEnd && items[i].$2 > lineStart) {
+      idx = i;
+      break;
+    }
+  }
+  // Indent the new child like the item being inserted before it.
+  final lineBegin = content.substring(0, items[idx].$1).lastIndexOf('\n') + 1;
+  final indent =
+      RegExp(r'^\s*')
+          .firstMatch(content.substring(lineBegin, items[idx].$1))!
+          .group(0) ??
+      '';
+  final insertAt = items[idx].$1;
+  final newElem = "${indent}Image.asset('$asset', fit: BoxFit.contain),\n";
+  return content.substring(0, insertAt) + newElem + content.substring(insertAt);
+}
+
 /// Reorder a route entry inside the app's routes map (e.g. the `appRoutes`
 /// `Map<String, WidgetBuilder>`). [routePath] is the exact route shown on the
 /// home menu (e.g. '/task-2-admin_moderation'); each entry is one

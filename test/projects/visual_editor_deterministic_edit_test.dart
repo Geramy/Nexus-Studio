@@ -278,6 +278,91 @@ return Center(child: Text('no scaffold here'));
     });
   });
 
+  group('insertImageEdit', () {
+    const col = '''
+return Column(
+  children: [
+    const Text('first'),
+    const Text('second'),
+    const Text('third'),
+  ],
+);''';
+
+    test('inserts an Image.asset before the anchored item', () {
+      final anchor = _lineOf(col, "'second'");
+      final out = insertImageEdit(
+        col,
+        anchor: anchor,
+        assetPath: '/assets/visual_9.png',
+      );
+      expect(out, isNotNull);
+      expect(out, contains("Image.asset('assets/visual_9.png', fit: BoxFit.contain)"));
+      // The new image sits BEFORE 'second' and AFTER 'first'.
+      expect(
+        out!.indexOf("Image.asset('assets/visual_9.png"),
+        lessThan(out.indexOf("'second'")),
+      );
+      expect(
+        out.indexOf("Image.asset('assets/visual_9.png"),
+        greaterThan(out.indexOf("'first'")),
+      );
+      // Still parses (balanced), all originals retained.
+      expect(out, contains("'first'"));
+      expect(out, contains("'third'"));
+    });
+
+    test('matches the surrounding indentation', () {
+      final anchor = _lineOf(col, "'third'");
+      final out = insertImageEdit(
+        col,
+        anchor: anchor,
+        assetPath: '/assets/a.png',
+      );
+      expect(out, isNotNull);
+      expect(out, contains("    Image.asset('assets/a.png', fit: BoxFit.contain),"));
+    });
+
+    test('declines on a const children list (non-const image would invalidate it)', () {
+      const csrc = '''
+Column(
+  children: const [
+    Text('a'),
+    Text('b'),
+  ],
+)''';
+      final anchor = _lineOf(csrc, "Text('b')");
+      expect(
+        insertImageEdit(csrc, anchor: anchor, assetPath: '/assets/a.png'),
+        isNull,
+      );
+    });
+
+    test('declines when the anchor is not in a children list', () {
+      const leaf = '''
+Widget build(BuildContext context) {
+  return const Text('only one');
+}''';
+      final anchor = _lineOf(leaf, 'Text');
+      expect(
+        insertImageEdit(leaf, anchor: anchor, assetPath: '/assets/a.png'),
+        isNull,
+      );
+    });
+
+    test('declines on a data list (not a widget children list)', () {
+      const dat = '''
+final titles = <String>[
+  'one',
+  'two',
+];''';
+      final anchor = _lineOf(dat, "'two'");
+      expect(
+        insertImageEdit(dat, anchor: anchor, assetPath: '/assets/a.png'),
+        isNull,
+      );
+    });
+  });
+
   group('reorderEdit', () {
     const col = '''
 return Column(

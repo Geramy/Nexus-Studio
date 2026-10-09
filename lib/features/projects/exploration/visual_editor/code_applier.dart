@@ -210,7 +210,11 @@ Future<_DeterministicEdit?> _deterministicEditAsync({
               op.region.text != null)
           ? setTextColorEdit(content, anchor: anchor, hex: op.colorHex ?? '')
           : setBgColorEdit(content, anchor: anchor, hex: op.colorHex ?? ''),
-    VisualOpKind.insertImage => null,
+    VisualOpKind.insertImage => insertImageEdit(
+      content,
+      anchor: anchor,
+      assetPath: op.assetPath ?? '',
+    ),
     VisualOpKind.replaceImage => replaceImageEdit(
       content,
       anchor: anchor,

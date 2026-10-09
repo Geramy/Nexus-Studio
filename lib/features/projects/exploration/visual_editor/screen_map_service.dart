@@ -301,6 +301,10 @@ Future<ScreenMap> recaptureOneScreen({
     final merged = <CapturedScreen>[];
     var replaced = false;
     final seed = await _bestSeed(projectId, head);
+    print(
+      '[ScreenMap] recaptureOneScreen: head=$head route=$route '
+      'seed=${seed == null ? "NONE" : "${seed.$2.length} screens"}',
+    );
     if (seed != null) {
       final seedDir = seed.$1;
       for (final s in seed.$2) {
@@ -324,6 +328,10 @@ Future<ScreenMap> recaptureOneScreen({
       }
     }
     if (!replaced) merged.add(fresh);
+    print(
+      '[ScreenMap] recaptureOneScreen: merged=${merged.length} screens '
+      '(fresh route=$route, replaced=$replaced)',
+    );
 
     final map = ScreenMap(
       projectId: projectId,
@@ -379,6 +387,8 @@ Future<(Directory, List<CapturedScreen>)?> _bestSeed(
       }
     }
   } catch (_) {}
+  final picked = bestDir?.uri.pathSegments.last ?? 'NONE';
+  print('[ScreenMap] bestSeed(exclude=$excludeHead): picked=$picked count=$bestCount');
   if (bestDir == null || bestCount == 0) return null;
   return (bestDir, bestScreens);
 }
