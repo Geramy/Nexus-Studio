@@ -83,8 +83,9 @@ Future<ApplierOutcome> applyVisualOp({
   final original = await ws.readBytes(edit.filePath);
   final touched = {edit.filePath: original.length};
 
-  // Apply + commit.
-  await ws.writeBytes(edit.filePath, edit.newContent.codeUnits);
+  // Apply + commit. (Write valid UTF-8 — `codeUnits` are UTF-16 and would
+  // corrupt any non-ASCII character in the saved file.)
+  await ws.writeBytes(edit.filePath, utf8.encode(edit.newContent));
   final commitMessage = 'Visual edit: ${op.summary}';
   var headAfter = headBefore;
   try {
@@ -109,7 +110,7 @@ Future<ApplierOutcome> applyVisualOp({
 
   // Analyze gate: a fast parse-check on the EXACT bytes we just wrote (not a
   // re-read from the workspace, so no write/read ordering can bite us).
-  final analysis = await _analyzeChanged(edit.filePath, edit.newContent.codeUnits);
+  final analysis = await _analyzeChanged(edit.filePath, utf8.encode(edit.newContent));
   if (analysis.errors.isEmpty) {
     return ApplierOutcome(
       status: OpStatus.applied,
@@ -468,5 +469,5 @@ Future<void> ensureAssetInPubspec(Workspace ws, String assetPath) async {
           raw.substring(assetNext);
     }
   }
-  await ws.writeBytes(pubspecPath, next.codeUnits);
+  await ws.writeBytes(pubspecPath, utf8.encode(next));
 }

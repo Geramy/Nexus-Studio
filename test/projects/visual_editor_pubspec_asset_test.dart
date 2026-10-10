@@ -132,4 +132,21 @@ flutter:
     await ensureAssetInPubspec(ws, '/assets/visual_1.png');
     expect(await ws.readString('/pubspec.yaml'), once);
   });
+
+  test('round-trips a non-ASCII file (regression: save used raw codeUnits)',
+      () async {
+    // The save path once wrote `content.codeUnits` (UTF-16 units) as raw
+    // bytes, which corrupted every non-ASCII character (a `–`, `é`, `…`) into
+    // a lone high byte → an invalid-UTF-8 file that no longer compiled (it
+    // silently hit task pages in a real project). The write must use
+    // `utf8.encode`. `_MemWs.writeBytes` decodes strictly, so a regression to
+    // `codeUnits` makes the decode throw and this test fail.
+    final ws = _MemWs(
+      {'/pubspec.yaml': base.replaceFirst('Scaffold.', 'Scaffold — é')},
+    );
+    await ensureAssetInPubspec(ws, '/assets/visual_9.png');
+    final out = await ws.readString('/pubspec.yaml');
+    expect(out, contains('Scaffold — é'), reason: out);
+    expect(out, contains('  assets:\n    - assets/visual_9.png\n'));
+  });
 }
