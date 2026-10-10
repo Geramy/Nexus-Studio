@@ -333,6 +333,78 @@ return Scaffold(backgroundColor: Color(0xFF3B82F6),
     });
   });
 
+  group('clearBackgroundImageEdit', () {
+    test('removes a background image but keeps the colour + content', () {
+      const src = '''
+return Scaffold(backgroundColor: Color(0xFF3B82F6),
+  body: Stack(children: [
+    Positioned.fill(child: Image.asset('assets/bg.png', fit: BoxFit.cover)),
+    const Text('content'),
+  ]),
+);''';
+      final anchor = _lineOf(src, 'Scaffold');
+      final out = clearBackgroundImageEdit(src, anchor: anchor);
+      expect(out, isNotNull);
+      expect(out, isNot(contains('assets/bg.png')));
+      expect(out, isNot(contains('Positioned.fill')));
+      expect(out, contains("const Text('content')"));
+      expect(out, contains('backgroundColor: Color(0xFF3B82F6)'));
+    });
+
+    test('collapses a nested 3-deep background down to the content', () {
+      const src = '''
+return Scaffold(backgroundColor: Color(0xFF112233),
+  body: Stack(children: [
+    Positioned.fill(child: Image.asset('assets/a.png', fit: BoxFit.cover)),
+    Stack(children: [
+      Positioned.fill(child: Image.asset('assets/b.png', fit: BoxFit.cover)),
+      Stack(children: [
+        Positioned.fill(child: Image.asset('assets/c.png', fit: BoxFit.cover)),
+        const Text('content'),
+      ]),
+    ]),
+  ]),
+);''';
+      final anchor = _lineOf(src, 'Scaffold');
+      final out = clearBackgroundImageEdit(src, anchor: anchor);
+      expect(out, isNotNull);
+      for (final p in ['a.png', 'b.png', 'c.png']) {
+        expect(out, isNot(contains(p)));
+      }
+      final bgCount =
+          RegExp(r'Positioned\.fill\(child: Image\.asset').allMatches(out!).length;
+      expect(bgCount, 0);
+      expect(out, contains("const Text('content')"));
+      expect(out, contains('backgroundColor: Color(0xFF112233)'));
+    });
+
+    test('declines when there is no background image (nothing changed)', () {
+      const src = '''
+return Scaffold(backgroundColor: Color(0xFF3B82F6),
+  body: const Text('content'),
+);''';
+      final anchor = _lineOf(src, 'Scaffold');
+      final out = clearBackgroundImageEdit(src, anchor: anchor);
+      expect(out, isNull);
+    });
+  });
+
+  group('colorLiteralForHex', () {
+    test('6-digit → opaque', () {
+      expect(colorLiteralForHex('#3B82F6'), 'Color(0xFF3B82F6)');
+    });
+    test('8-digit → keeps the alpha channel', () {
+      expect(colorLiteralForHex('#803B82F6'), 'Color(0x803B82F6)');
+    });
+    test('00-alpha (no fill) → a real transparent colour, not null', () {
+      expect(colorLiteralForHex('#00000000'), 'Color(0x00000000)');
+    });
+    test('invalid → null', () {
+      expect(colorLiteralForHex('#12345'), isNull);
+      expect(colorLiteralForHex('not a hex'), isNull);
+    });
+  });
+
   group('insertImageEdit', () {
     const col = '''
 return Column(

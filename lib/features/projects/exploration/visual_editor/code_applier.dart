@@ -239,6 +239,8 @@ Future<_DeterministicEdit?> _deterministicEditAsync({
     VisualOpKind.setBackground => op.assetPath != null
       ? setBackgroundImageEdit(content, anchor: anchor, assetPath: op.assetPath!)
       : setBackgroundEdit(content, anchor: anchor, hex: op.colorHex ?? ''),
+    VisualOpKind.clearBackground =>
+      clearBackgroundImageEdit(content, anchor: anchor),
   };
   print(
     '[VisualEditor] ${op.kind.name} @ ${file}:$anchor '
@@ -345,6 +347,8 @@ String _agentPrompt(VisualOp op) {
     VisualOpKind.setBackground => op.assetPath != null
       ? 'Visual edit task: set this screen\'s BACKGROUND to the image asset "${op.assetPath}" (already in the app\'s assets/ and registered in pubspec). Wrap the page Scaffold\'s `body:` in a Stack with `Positioned.fill(child: Image.asset("${op.assetPath}", fit: BoxFit.cover))` as the first child, keeping ALL existing UI on top. Page file: $where. Keep the file compiling.'
       : 'Visual edit task: change this screen\'s BACKGROUND colour to ${op.colorHex} at $where. Set the page Scaffold\'s `backgroundColor:` (or the top-level background) — do not restyle individual widgets. Edit only the minimal lines needed; keep the file compiling.',
+    VisualOpKind.clearBackground =>
+      'Visual edit task: REMOVE this screen\'s BACKGROUND image (the Image used as the Scaffold body backdrop, e.g. a Positioned.fill(child: Image.asset(…))) but KEEP its background colour and all foreground UI, at $where. Edit only the minimal lines needed; keep the file compiling.',
   };
 }
 

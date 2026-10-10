@@ -350,6 +350,7 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
       case VisualOpKind.insertImage:
       case VisualOpKind.replaceImage:
       case VisualOpKind.setBackground:
+      case VisualOpKind.clearBackground:
       case VisualOpKind.reorder:
         return null;
     }
@@ -650,7 +651,40 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
               ],
             ),
           ),
+          SimpleDialogOption(
+            onPressed: () {
+              Navigator.of(ctx).pop();
+              _clearBackgroundImage(r, pageFile);
+            },
+            child: const Row(
+              children: [
+                Icon(Icons.image_not_supported_outlined),
+                SizedBox(width: 10),
+                Text('Clear background image'),
+              ],
+            ),
+          ),
         ],
+      ),
+    );
+  }
+
+  /// Remove this screen's background image (keeps its colour). Deterministic
+  /// when the body is one of our `Stack`-wrapped image backgrounds.
+  void _clearBackgroundImage(ScreenRegion r, String pageFile) {
+    final bg = ScreenRegion(
+      id: 'bglr_${_screenIdx}',
+      widgetType: 'Scaffold',
+      rect: const RectBox(0, 0, 0, 0),
+      label: 'Screen background',
+      sourceFile: pageFile,
+      sourceLine: 1,
+    );
+    _applyOp(
+      VisualOp(
+        kind: VisualOpKind.clearBackground,
+        region: bg,
+        screenRoute: _currentScreen().route,
       ),
     );
   }
@@ -2152,8 +2186,9 @@ class _MenuItem extends StatelessWidget {
   }
 }
 
-class _ColorDialog extends StatelessWidget {
+class _ColorDialog extends StatefulWidget {
   const _ColorDialog({
+    super.key,
     required this.current,
     required this.onPick,
     this.title = 'Change color',
@@ -2192,15 +2227,111 @@ class _ColorDialog extends StatelessWidget {
   ];
 
   @override
+  State<_ColorDialog> createState() => _ColorDialogState();
+}
+
+class _ColorDialogState extends State<_ColorDialog> {
+  int _rgb = 0x3B82F6; // RRGGBB
+  double _alpha = 1.0; // 0..1
+  bool _noFill = false;
+  late final TextEditingController _hexCtrl;
+
+  @override
+  void initState() {
+    super.initState();
+    final c = widget.current;
+    if (c != null) {
+      final h = c.replaceAll('#', '').toUpperCase();
+      if (h.length == 8) {
+        final a = int.tryParse(h.substring(0, 2), radix: 16) ?? 255;
+        _alpha = a / 255;
+        _rgb = int.tryParse(h.substring(2), radix: 16) ?? _rgb;
+      } else if (h.length == 6) {
+        _alpha = 1.0;
+        _rgb = int.tryParse(h, radix: 16) ?? _rgb;
+      }
+    }
+    _noFill = _alpha <= 0;
+    _hexCtrl = TextEditingController(text: widget.current ?? '');
+  }
+
+  @override
+  void dispose() {
+    _hexCtrl.dispose();
+    super.dispose();
+  }
+
+  String get _rgbHex => _rgb.toRadixString(16).padLeft(6, '0').toUpperCase();
+
+  String _buildHex() {
+    if (_noFill || _alpha <= 0) return '#00000000';
+    if (_alpha >= 1) return '#$_rgbHex';
+    final a = (_alpha * 255).round().toRadixString(16).padLeft(2, '0');
+    return '#$a$_rgbHex';
+  }
+
+  /// Parse hex typed by the user (#RRGGBB or #AARRGGBB) into rgb + alpha.
+  void _applyHexText(String raw) {
+    final h = raw.trim().replaceAll('#', '').toUpperCase();
+    if (h.isEmpty) return;
+    final rgbPart =
+        h.length >= 6 ? h.substring(h.length - 6) : h.padLeft(6, '0');
+    final rgbVal = int.tryParse(rgbPart, radix: 16);
+    if (rgbVal == null) return;
+    setState(() {
+      _rgb = rgbVal;
+      if (h.length == 8) {
+        final a = int.tryParse(h.substring(0, 2), radix: 16);
+        _alpha = (a ?? 255) / 255;
+      } else {
+        _alpha = 1.0;
+      }
+      _noFill = _alpha <= 0;
+    });
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final controller = TextEditingController(text: current ?? '');
+    final ui.Color preview =
+        _noFill ? Colors.transparent : Color(0xFF000000 | _rgb)
+            .withValues(alpha: _alpha.clamp(0.0, 1.0));
     return AlertDialog(
-      title: Text(title),
+      title: Text(widget.title),
       content: SizedBox(
-        width: 320,
+        width: 340,
         child: Column(
           mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            // Live preview over a checkerboard so transparency is visible.
+            Container(
+              height: 48,
+              margin: const EdgeInsets.only(bottom: 12),
+              decoration: BoxDecoration(
+                border: Border.all(color: Colors.grey.shade400),
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(6),
+                child: Column(
+                  children: [
+                    Expanded(
+                      child: CustomPaint(
+                        painter: const _Checkerboard(),
+                        child: ColoredBox(color: preview),
+                      ),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 3),
+                      child: Text(
+                        _noFill ? 'no fill' : _buildHex(),
+                        style: const TextStyle(fontSize: 11),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
             GridView.count(
               crossAxisCount: 8,
               shrinkWrap: true,
@@ -2209,11 +2340,12 @@ class _ColorDialog extends StatelessWidget {
               childAspectRatio: 1,
               physics: const NeverScrollableScrollPhysics(),
               children: [
-                for (final hex in _swatches)
+                for (final hex in _ColorDialog._swatches)
                   GestureDetector(
+                    // Swatches are opaque presets — a one-tap quick-apply.
                     onTap: () {
                       Navigator.pop(context);
-                      onPick(hex);
+                      widget.onPick(hex);
                     },
                     child: MouseRegion(
                       cursor: SystemMouseCursors.click,
@@ -2221,9 +2353,7 @@ class _ColorDialog extends StatelessWidget {
                         decoration: BoxDecoration(
                           color: VisualEditorHelpers.parse(hex),
                           border: Border.all(
-                            color:
-                                (current ?? '').toUpperCase() ==
-                                    hex.toUpperCase()
+                            color: hex.toUpperCase() == '#$_rgbHex'
                                 ? Colors.blue
                                 : Colors.grey.shade400,
                             width: 2,
@@ -2235,19 +2365,50 @@ class _ColorDialog extends StatelessWidget {
                   ),
               ],
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: 8),
             Row(
               children: [
+                const Icon(Icons.opacity, size: 18, color: Colors.grey),
+                const SizedBox(width: 6),
                 Expanded(
-                  child: TextField(
-                    controller: controller,
-                    decoration: const InputDecoration(
-                      labelText: 'or type a hex (#RRGGBB)',
-                      isDense: true,
-                    ),
+                  child: Slider(
+                    value: _noFill ? 0 : _alpha,
+                    min: 0,
+                    max: 1,
+                    onChanged: (v) =>
+                        setState(() {
+                          _alpha = v;
+                          _noFill = v <= 0;
+                        }),
+                  ),
+                ),
+                SizedBox(
+                  width: 42,
+                  child: Text(
+                    '${(_alpha * 100).round()}%',
+                    style: const TextStyle(fontSize: 12),
                   ),
                 ),
               ],
+            ),
+            CheckboxListTile(
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              title: const Text(
+                'No fill (fully transparent)',
+                style: TextStyle(fontSize: 13),
+              ),
+              value: _noFill,
+              onChanged: (v) => setState(() => _noFill = v ?? false),
+            ),
+            const SizedBox(height: 4),
+            TextField(
+              controller: _hexCtrl,
+              onChanged: _applyHexText,
+              decoration: const InputDecoration(
+                labelText: 'hex (#RRGGBB or #AARRGGBB)',
+                isDense: true,
+              ),
             ),
           ],
         ),
@@ -2259,18 +2420,41 @@ class _ColorDialog extends StatelessWidget {
         ),
         FilledButton(
           onPressed: () {
-            final v = controller.text.trim();
-            final hex = v.startsWith('#') ? v : '#$v';
-            if (VisualEditorHelpers.validHex(hex)) {
-              Navigator.pop(context);
-              onPick(hex.toUpperCase());
+            if (_hexCtrl.text.trim().isNotEmpty) {
+              _applyHexText(_hexCtrl.text);
             }
+            Navigator.pop(context);
+            widget.onPick(_buildHex());
           },
           child: const Text('Apply'),
         ),
       ],
     );
   }
+}
+
+/// A small white/grey checkerboard, used behind the colour preview so a
+/// transparent fill is visible against both light and dark content.
+class _Checkerboard extends CustomPainter {
+  const _Checkerboard();
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    const n = 12.0;
+    final white = Paint()..color = const Color(0xFFFFFFFF);
+    final grey = Paint()..color = const Color(0xFFCCCCCC);
+    canvas.drawRect(Offset.zero & size, white);
+    for (double y = 0; y < size.height; y += n) {
+      for (double x = 0; x < size.width; x += n) {
+        if ((((x / n).floor() + (y / n).floor()) & 1) == 0) {
+          canvas.drawRect(Rect.fromLTWH(x, y, n, n), grey);
+        }
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter old) => false;
 }
 
 class VisualEditorHelpers {

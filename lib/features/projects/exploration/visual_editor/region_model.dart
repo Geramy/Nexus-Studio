@@ -223,6 +223,7 @@ enum VisualOpKind {
   move,
   setPadding,
   setBackground,
+  clearBackground,
   reorder,
 }
 
@@ -269,6 +270,8 @@ class VisualOp {
             '(t ${p.$1.round()}, r ${p.$2.round()}, b ${p.$3.round()}, l ${p.$4.round()})';
       case VisualOpKind.setBackground:
         return 'set the screen background to $colorHex';
+      case VisualOpKind.clearBackground:
+        return 'clear the background image on $where';
       case VisualOpKind.reorder:
         return 'move $where ${moveUp ? "up" : "down"} in its list';
     }

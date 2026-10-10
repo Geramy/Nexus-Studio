@@ -25,11 +25,13 @@ void _dbg(String msg) {
 }
 
 /// Build the replacement literal for a picked hex (#RRGGBB or #AARRGGBB).
+/// A fully-transparent colour (#00000000 / any #00RRGGBB) is a REAL
+/// transparent literal, not a decline — that's what makes "no fill" work (a
+/// list tile / background becomes see-through).
 String? colorLiteralForHex(String hex) {
   final h = hex.replaceAll('#', '').trim().toUpperCase();
   if (h.length == 8) {
     final a = h.substring(0, 2);
-    if (a == '00') return null;
     return 'Color(0x$a${h.substring(2)})';
   }
   if (h.length == 6) return 'Color(0xFF$h)';
@@ -716,6 +718,45 @@ String _unwrapBackgroundStacks(String expr) {
     cur = cur.substring(items[1].$1, items[1].$2);
   }
   return cur.trim();
+}
+
+/// Remove a SCREEN's background image — the `Positioned.fill(Image.asset)`
+/// layer that `setBackgroundImageEdit` wrapped around the body — collapsing
+/// the Stack back down to the plain content. The Scaffold's `backgroundColor`
+/// is left untouched, so a colour layer stays. Returns null when the body has
+/// no background image to clear (nothing changed).
+String? clearBackgroundImageEdit(String content, {required int anchor}) {
+  final scaffold = _nearestMatch(content, RegExp(r'Scaffold\('), anchor, 400);
+  if (scaffold == null) {
+    _dbg('clearBackgroundImage: no Scaffold( within 400 lines of anchor=$anchor');
+    return null;
+  }
+  final openParen = scaffold.$1.end - 1;
+  final closeParen = _matchingParen(content, openParen);
+  if (closeParen < 0) {
+    _dbg('clearBackgroundImage: Scaffold( has an unmatched paren');
+    return null;
+  }
+  final hit = _findPropAtDepth0(content, openParen + 1, closeParen, 'body');
+  if (hit == null) {
+    _dbg('clearBackgroundImage: Scaffold has no depth-0 body: argument');
+    return null;
+  }
+  var s = hit.$2;
+  while (s < content.length && _isWs(content[s])) {
+    s++;
+  }
+  var e = _valueEnd(content, s);
+  while (e > s && _isWs(content[e - 1])) {
+    e--;
+  }
+  final bodyExpr = content.substring(s, e);
+  final realContent = _unwrapBackgroundStacks(bodyExpr);
+  if (realContent.trim() == bodyExpr.trim()) {
+    _dbg('clearBackgroundImage: body has no background image to clear');
+    return null;
+  }
+  return content.substring(0, s) + realContent + content.substring(e);
 }
 
 /// Replace an `Image.asset` path near [anchor].
