@@ -327,3 +327,29 @@ Each phase is shippable on its own; Phase 0+1 delivers the product promise.
 Phase 0 is the big chunk (harness + shell); Phase 1 is the product; Phases 2–3
 are incremental. Suggest committing to **Phase 0+1 as a program of 2–3 focused
 iterations**, then reviewing against real usage before Phase 2.
+
+## 10. Bugs found & fixed during live testing (log)
+
+- **Non-ASCII file corruption on save (serious, fixed f2c7d83).** The
+deterministic-edit save path wrote `content.codeUnits` (UTF-16 code units) as
+raw bytes, corrupting every non-ASCII char (`–`, `×`, `·`, `…`, `é`) into a lone
+high byte → an **invalid-UTF-8 file that no longer compiled**. Each subsequent
+edit re-decoded the broken bytes to U+FFFD (→ byte `0xfd`) and re-corrupted
+further, so the damage cascaded across saves. Fix: write valid UTF-8
+(`utf8.encode`) in the file save, the parse-gate, and the pubspec save.
+  - Guard: `visual_editor_pubspec_asset_test.dart` → "round-trips a non-ASCII
+    file" (the in-memory WS decodes strictly, so a regression to `codeUnits`
+    throws → the test fails).
+  - Recovery note: this had silently corrupted 2 live-project pages (task_13,
+    ebay). Because the cascade is lossy (chars → U+FFFD), the only reliable
+    repair is the **clean git blob** in `git_objects` (pick the largest
+    valid-UTF-8 blob that parses). After direct DB repair you MUST also update
+    `nodes.size` (the cached length) or git `status()` throws a `RangeError`.
+    The VHD working tree is the `blocks` table; `readString` uses
+    `decodeUtf8Lossy` (the cascade amplifier).
+- **"Clear background image" on an image-less screen (fixed 204951c).**
+  When a page's Scaffold body has no background image, the op correctly had
+  nothing to remove but fell through to the assistant (confusing). Now
+  `_clearBackgroundImage` pre-checks and shows a "no background image to clear"
+  toast instead. (Clearing still goes to the assistant only for backgrounds set
+  in a non-Stack form, e.g. by the assistant itself.)
