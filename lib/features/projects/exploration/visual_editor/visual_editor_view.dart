@@ -11,6 +11,7 @@
 library;
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
@@ -25,6 +26,7 @@ import '../../../../infrastructure/workspace/git/git_engine_provider.dart';
 import '../../../../infrastructure/workspace/workspace_provider.dart';
 import '../draggable_divider.dart';
 import 'code_applier.dart';
+import 'deterministic_edit_ops.dart';
 import 'live_preview_service.dart';
 import 'region_model.dart';
 import 'screen_map_service.dart';
@@ -670,8 +672,18 @@ class _VisualEditorViewState extends ConsumerState<VisualEditorView> {
   }
 
   /// Remove this screen's background image (keeps its colour). Deterministic
-  /// when the body is one of our `Stack`-wrapped image backgrounds.
-  void _clearBackgroundImage(ScreenRegion r, String pageFile) {
+  /// when the body is one of our `Stack`-wrapped image backgrounds. When the
+  /// page has no background image at all, this is a benign no-op — we tell the
+  /// user instead of (pointlessly) sending it to the assistant.
+  Future<void> _clearBackgroundImage(ScreenRegion r, String pageFile) async {
+    final projectId = widget.projectId;
+    final ws = await ref.read(workspaceFsProvider(projectId).future);
+    final bytes = await ws.readBytes(pageFile);
+    final content = utf8.decode(bytes, allowMalformed: true);
+    if (clearBackgroundImageEdit(content, anchor: 1) == null) {
+      _toast('This screen has no background image to clear.');
+      return;
+    }
     final bg = ScreenRegion(
       id: 'bglr_${_screenIdx}',
       widgetType: 'Scaffold',
