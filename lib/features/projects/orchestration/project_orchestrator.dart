@@ -53,6 +53,7 @@ import 'package:nexus_projects_client/features/projects/coordinator_session.dart
 import 'package:nexus_projects_client/features/projects/orchestration/orchestrator_prompts.dart';
 import 'package:nexus_projects_client/features/projects/orchestration/milestone_planner.dart';
 import 'package:nexus_projects_client/features/projects/orchestration/finalize_progress.dart';
+import 'package:nexus_projects_client/features/projects/orchestration/scaffold_validation.dart';
 import 'package:nexus_projects_client/features/projects/project_baseline.dart'
     show buildProjectBaseline;
 import 'package:nexus_projects_client/features/projects/project_working_hours.dart';
@@ -3661,43 +3662,8 @@ commits the scaffold after all required artifacts exist.''';
     bool hasName(String name) =>
         lower.any((p) => p == name || p.endsWith('/$name'));
 
-    final hasManifest = lower.any((p) {
-      final name = p.split('/').last;
-      return const {
-            'pubspec.yaml',
-            'package.json',
-            'pyproject.toml',
-            'requirements.txt',
-            'cargo.toml',
-            'go.mod',
-            'cmakelists.txt',
-            'pom.xml',
-            'build.gradle',
-            'build.gradle.kts',
-            'package.swift',
-            'gemfile',
-            'composer.json',
-          }.contains(name) ||
-          name.endsWith('.csproj');
-    });
-    final hasEntryPoint = lower.any((p) {
-      final name = p.split('/').last;
-      return const {
-        'main.dart',
-        'main.py',
-        'main.go',
-        'main.rs',
-        'main.c',
-        'main.cpp',
-        'main.ts',
-        'main.js',
-        'main.java',
-        'index.ts',
-        'index.js',
-        'app.py',
-        'program.cs',
-      }.contains(name);
-    });
+    final hasManifest = scaffoldHasManifest(lower);
+    final hasEntryPoint = scaffoldHasEntryPoint(lower);
 
     String workTemplate = '';
     final workTemplateIndex = lower.indexWhere(
