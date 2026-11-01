@@ -4115,7 +4115,13 @@ commits the scaffold after all required artifacts exist.''';
             '      - run: ${pfx}dotnet build --no-restore\n'
             '      - run: ${pfx}dotnet test --no-build',
       'node' =>
-        '      - run: ${pfx}npm ci\n'
+        // npm install (NOT npm ci): agent-scaffolded projects ship a
+        // package.json but no package-lock.json (the agent can't run npm to
+        // generate one), and `npm ci` hard-fails without a lock file — which
+        // strands the whole gate in a non-converging CI-fix loop. `npm install`
+        // works with or without a lock file, so it's the robust choice for a
+        // generated CI gate.
+        '      - run: ${pfx}npm install\n'
             '      - run: ${pfx}npm run build --if-present\n'
             '      - run: ${pfx}npm test --if-present',
       'python' =>
