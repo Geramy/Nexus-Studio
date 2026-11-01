@@ -54,6 +54,7 @@ import 'package:nexus_projects_client/features/projects/orchestration/orchestrat
 import 'package:nexus_projects_client/features/projects/orchestration/milestone_planner.dart';
 import 'package:nexus_projects_client/features/projects/orchestration/finalize_progress.dart';
 import 'package:nexus_projects_client/features/projects/orchestration/scaffold_validation.dart';
+import 'package:nexus_projects_client/features/projects/orchestration/scaffold_compatibility.dart';
 import 'package:nexus_projects_client/features/projects/project_baseline.dart'
     show buildProjectBaseline;
 import 'package:nexus_projects_client/features/projects/project_working_hours.dart';
@@ -2875,6 +2876,9 @@ Paths from any other repository, operating system, task, or prior conversation a
         );
         return;
       }
+      // Deterministic scaffold-compat fix (Next.js: keep test files/config out
+      // of the `next build` type-check) — must run before the first CI.
+      await _normalizeScaffoldTestCompat(project);
       // Guarantee a deterministic CI gate exists so per-task review and the
       // end-of-project scan always have a fast, no-LLM build to run.
       await _ensureDefaultCiWorkflow(project);
@@ -3732,6 +3736,22 @@ commits the scaffold after all required artifacts exist.''';
           'builds on one consistent data model. Keep it minimal but coherent.',
         );
       }
+      // Next.js: keep tests out of `next build` so the CI type-check doesn't
+      // choke on a Vitest/Vite config (a duplicate-`vite` conflict the
+      // code-fixer can't repair; the deterministic compat pass enforces it too).
+      final isNext = tags.any(
+        (t) => t.status != 'rejected' &&
+            t.value.toLowerCase().replaceAll('.', ' ').contains('next'),
+      );
+      if (isNext) {
+        if (buf.isNotEmpty) buf.writeln();
+        buf.writeln(
+          'NEXT.JS: keep TESTS OUT of `next build` — add test files and test '
+          'config (test/**, *.test.tsx, vitest.config.ts, ...) to the tsconfig '
+          '"exclude", and never add a Vite plugin (e.g. @vitejs/plugin-react) '
+          'to a Vitest config; a second vite copy makes `next build` fail.',
+        );
+      }
     } catch (e) {
       debugPrint(
         '[Orchestrator p$projectId] templater base-spec build failed: $e',
@@ -3878,6 +3898,51 @@ commits the scaffold after all required artifacts exist.''';
   /// no-LLM gate to run. Idempotent (no-op if the Templater already wrote one).
   /// Written + committed deterministically — no agent — so it can't be skipped or
   /// hallucinated.
+  /// Deterministic scaffold-compatibility fix. A Next.js project that also
+  /// ships test tooling (a Vitest/Vite config) can fail `next build`: it runs
+  /// `tsc` over the tsconfig's `include` set, and a `vitest.config.ts` that
+  /// imports `@vitejs/plugin-react` (a second, incompatible `vite`) is an
+  /// unresolvable type conflict the CI code-fixer can't repair (it only edits
+  /// app source) — so the project never converges to green. Excluding the test
+  /// files + test config from the build tsconfig fixes it. Runs once after the
+  /// scaffold lands; idempotent (no commit when nothing changed). Best-effort —
+  /// a compat fix never gates the build.
+  Future<void> _normalizeScaffoldTestCompat(Project project) async {
+    try {
+      final handles = await _resolveWorkspaceHandles();
+      final ws = handles.ws;
+      final git = handles.git;
+      if (ws == null || git == null) return;
+      if (!await ws.exists('/package.json')) return;
+      final pkg = await ws.readString('/package.json');
+      if (!isNextJsPackage(pkg)) return;
+      if (!await ws.exists('/tsconfig.json')) return;
+      final tsconfig = await ws.readString('/tsconfig.json');
+      final fixed = excludeTestFilesFromNextBuild(tsconfig);
+      if (fixed == null) return; // already excludes everything / unparseable.
+      final lane = ref.read(gitLaneProvider(projectId));
+      await lane.run(() async {
+        try {
+          await git.checkoutBranch('main');
+        } catch (_) {}
+        await ws.writeString('/tsconfig.json', fixed);
+        await git.commitAll(
+          message:
+              'chore: keep test files/config out of the Next.js build type-check',
+        );
+      }, timeout: _laneOpTimeout);
+      ref.read(workspaceRevisionProvider(projectId).notifier).state++;
+      debugPrint(
+        '[Orchestrator p$projectId] scaffold compat: excluded test '
+        'files/config from the Next.js build tsconfig.',
+      );
+    } catch (e, st) {
+      debugPrint(
+        '[Orchestrator p$projectId] scaffold compat normalize failed: $e\n$st',
+      );
+    }
+  }
+
   Future<void> _ensureDefaultCiWorkflow(Project project) async {
     try {
       final handles = await _resolveWorkspaceHandles();
