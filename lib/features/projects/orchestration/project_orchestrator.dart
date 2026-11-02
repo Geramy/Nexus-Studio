@@ -55,6 +55,7 @@ import 'package:nexus_projects_client/features/projects/orchestration/milestone_
 import 'package:nexus_projects_client/features/projects/orchestration/finalize_progress.dart';
 import 'package:nexus_projects_client/features/projects/orchestration/scaffold_validation.dart';
 import 'package:nexus_projects_client/features/projects/orchestration/scaffold_compatibility.dart';
+import 'package:nexus_projects_client/features/projects/orchestration/js_syntax_repair.dart';
 import 'package:nexus_projects_client/features/projects/project_baseline.dart'
     show buildProjectBaseline;
 import 'package:nexus_projects_client/features/projects/project_working_hours.dart';
@@ -3943,6 +3944,83 @@ commits the scaffold after all required artifacts exist.''';
     }
   }
 
+  /// Deterministic repair for the JS/TS *syntax* errors the LLM fixer keeps
+  /// failing at by re-writing whole files (observed: an unescaped apostrophe in a
+  /// single-quoted string — `description: 'Changes don't break.'` — re-emitted
+  /// every fix round, so CI never converged and the project was left for manual
+  /// review). Walks the workspace's JS/TS source and, where
+  /// [repairJsStringQuoting] fixes an unescaped apostrophe, commits the result.
+  ///
+  /// Self-gating + idempotent: it changes files ONLY when a real unescaped-
+  /// apostrophe bug is present (which is always invalid JS), so it never
+  /// corrupts clean code and never burns an LLM turn for a fix it can make
+  /// itself. Returns true when it committed a repair (the caller re-runs CI
+  /// without the LLM), false otherwise (the caller falls through to the LLM).
+  Future<bool> _deterministicSyntaxRepair(Project project) async {
+    try {
+      final handles = await _resolveWorkspaceHandles();
+      final ws = handles.ws;
+      final git = handles.git;
+      if (ws == null || git == null) return false;
+
+      // Collect the JS/TS source files (skip node_modules + type declarations).
+      final jsFiles = <String>[];
+      for (final f in await ws.walk()) {
+        if (f.isDirectory) continue;
+        final p = f.path;
+        if (p.contains('/node_modules/')) continue;
+        if (p.endsWith('.d.ts')) continue;
+        final lower = p.toLowerCase();
+        if (lower.endsWith('.ts') ||
+            lower.endsWith('.tsx') ||
+            lower.endsWith('.js') ||
+            lower.endsWith('.jsx')) {
+          jsFiles.add(p);
+        }
+      }
+      if (jsFiles.isEmpty) return false; // not a JS/TS project.
+
+      // Repair in-memory first; only touch the workspace if something changed.
+      final fixes = <String, String>{};
+      for (final p in jsFiles) {
+        String content;
+        try {
+          content = await ws.readString(p);
+        } catch (_) {
+          continue;
+        }
+        final fixed = repairJsStringQuoting(content);
+        if (fixed != null) fixes[p] = fixed;
+      }
+      if (fixes.isEmpty) return false; // nothing to repair.
+
+      final lane = ref.read(gitLaneProvider(projectId));
+      await lane.run(() async {
+        try {
+          await git.checkoutBranch('main');
+        } catch (_) {}
+        for (final e in fixes.entries) {
+          await ws.writeString(e.key, e.value);
+        }
+        await git.commitAll(
+          message: 'fix: escape unescaped apostrophes in JS/TS string literals',
+        );
+      }, timeout: _laneOpTimeout);
+      ref.read(workspaceRevisionProvider(projectId).notifier).state++;
+      debugPrint(
+        '[Orchestrator p$projectId] CI: deterministically escaped unescaped '
+        'apostrophe(s) in ${fixes.length} file(s) '
+        '(${fixes.keys.join(', ')}) — re-running CI without the LLM.',
+      );
+      return true;
+    } catch (e, st) {
+      debugPrint(
+        '[Orchestrator p$projectId] deterministic syntax repair failed: $e\n$st',
+      );
+      return false;
+    }
+  }
+
   Future<void> _ensureDefaultCiWorkflow(Project project) async {
     try {
       final handles = await _resolveWorkspaceHandles();
@@ -4699,6 +4777,14 @@ commits the scaffold after all required artifacts exist.''';
         '${prevCount != null ? ' (was $prevCount)' : ''}.',
       );
 
+      // DETERMINISTIC SYNTAX REPAIR (before spending an LLM turn). Self-gating:
+      // it commits only when a real unescaped-apostrophe bug is present. If it
+      // fired, re-run CI next round WITHOUT the LLM — the fix is mechanical and
+      // the model just re-broke it a moment ago.
+      final deterministicRepaired = diag.count > 0
+          ? await _deterministicSyntaxRepair(project)
+          : false;
+
       // PROGRESS GATE: keep going while the failure count is dropping; only a
       // NON-improving run counts toward the stagnation budget (lets it grind a
       // big backlog 100 → 60 → 25 → 0 while still bailing if truly stuck).
@@ -4717,6 +4803,13 @@ commits the scaffold after all required artifacts exist.''';
         stagnant = 0; // made progress this round
       }
       prevCount = diag.count;
+
+      // A mechanical repair was committed — re-run CI (next iteration) instead
+      // of handing the LLM a bug it demonstrably can't fix by re-writing.
+      if (deterministicRepaired) {
+        prevNoCommit = false; // we did commit this round
+        continue;
+      }
 
       _setTesting(
         true,
