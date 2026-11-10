@@ -224,6 +224,10 @@ class _LaunchProjectDialogState extends ConsumerState<LaunchProjectDialog> {
     final cport = _containerPort.text.trim().isEmpty
         ? '80'
         : _containerPort.text.trim();
+    debugPrint(
+      '[Launch p${widget.projectPk}] launch docker: tag="${_tag.text.trim()}" '
+      'kind=$_kind container="$containerName" cport=$cport',
+    );
     if (containerName.isNotEmpty) {
       try {
         final client = ref.read(dockerEngineClientProvider);
@@ -242,10 +246,28 @@ class _LaunchProjectDialogState extends ConsumerState<LaunchProjectDialog> {
             widget.projectPk,
           );
           final ciTime = ciRun?.completedAt ?? ciRun?.createdAt;
-          final upToDate =
+          var upToDate =
               existing.created != null &&
               ciTime != null &&
               existing.created!.isAfter(ciTime);
+          // A container that has EXITED with a non-zero code crashed (e.g. a
+          // broken image: Next.js started without `next build` dies in a second).
+          // Re-starting it just crashes it again — rebuild instead so the user
+          // isn't pointed at a dead port with no explanation.
+          if (upToDate && !existing.isRunning) {
+            try {
+              final st = await client.containerState(existing.id);
+              if (!st.running && (st.exitCode ?? 0) != 0) {
+                upToDate = false;
+                _append(
+                  DockerBuildEvent(
+                    '"$containerName" has exited (crashed, code ${st.exitCode}) '
+                    '— rebuilding rather than re-starting a broken container.',
+                  ),
+                );
+              }
+            } catch (_) {}
+          }
           if (upToDate) {
             _append(
               DockerBuildEvent(
@@ -367,6 +389,12 @@ class _LaunchProjectDialogState extends ConsumerState<LaunchProjectDialog> {
       // after start), then open it in the browser.
       final hostPort = (await _hostPortWithRetry(id, cport)) ?? requestedHost;
       final shortId = id.length > 12 ? id.substring(0, 12) : id;
+      final launchUrl = hostPort.isNotEmpty ? 'http://localhost:$hostPort' : '';
+      debugPrint(
+        '[Launch p${widget.projectPk}] container started: id=$shortId '
+        'name="${_containerName.text.trim()}" image=$tag '
+        'url=${launchUrl.isEmpty ? '(no host port)' : launchUrl}',
+      );
       if (hostPort.isNotEmpty) {
         final url = 'http://localhost:$hostPort';
         _openUrl = url;
@@ -377,11 +405,58 @@ class _LaunchProjectDialogState extends ConsumerState<LaunchProjectDialog> {
           DockerBuildEvent('Container started (id $shortId).'),
         );
       }
+      // A broken image (e.g. a Next.js app launched without `next build`) starts
+      // and crashes within a second, so the browser opens on a dead port with
+      // nothing to explain why. Verify the container actually stayed up; if it
+      // exited, surface the last lines of its log.
+      unawaited(_verifyContainerUp(id));
       if (mounted) setState(() => _phase = _Phase.done);
     } catch (e) {
       _append(DockerBuildEvent('Could not start container: $e', isError: true));
       if (mounted) setState(() => _phase = _Phase.error);
     }
+  }
+
+  /// Verify a just-started launch container stayed up. A broken image (e.g. a
+  /// Next.js app started without `next build`) crashes within a second, leaving
+  /// the browser on a dead port with no explanation. Poll once after a short
+  /// grace period; if it exited, tail its log so the real error is visible in
+  /// both the dialog and the console.
+  Future<void> _verifyContainerUp(String id) async {
+    await Future<void>.delayed(const Duration(seconds: 3));
+    try {
+      final client = ref.read(dockerEngineClientProvider);
+      final st = await client.containerState(id);
+      if (st.running) {
+        debugPrint(
+          '[Launch p${widget.projectPk}] container $id still up after 3s ✓',
+        );
+        return;
+      }
+      final logs = await client.containerLogs(id, tail: 50);
+      final tail = _tailLines(logs, 14);
+      _append(
+        DockerBuildEvent(
+          'Container exited (code ${st.exitCode}) shortly after start — the '
+          'site may not work. Last log lines:\n$tail',
+          isError: true,
+        ),
+      );
+      debugPrint(
+        '[Launch p${widget.projectPk}] container $id EXITED (code '
+        '${st.exitCode}, status ${st.status}). Last log lines:\n$tail',
+      );
+    } catch (e) {
+      debugPrint('[Launch p${widget.projectPk}] post-launch check failed: $e');
+    }
+  }
+
+  /// The last [n] non-empty lines of [s] (compact error tailing).
+  String _tailLines(String s, int n) {
+    final lines =
+        s.split('\n').where((l) => l.trim().isNotEmpty).toList(growable: false);
+    if (lines.length <= n) return lines.join('\n');
+    return lines.sublist(lines.length - n).join('\n');
   }
 
   // ── Windows → native .exe ───────────────────────────────────────────────

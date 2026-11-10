@@ -144,6 +144,60 @@ class DockerEngineClient {
     return null;
   }
 
+  /// The container's current lifecycle state — `running`, `exited`, etc. plus
+  /// the exit code. Used to verify a just-launched container actually stayed up
+  /// (a broken image — e.g. a Next.js app started without `next build` — crashes
+  /// within a second and would otherwise be invisible).
+  Future<({bool running, String status, int? exitCode})> containerState(
+    String id,
+  ) async {
+    final json = await _getJson('/containers/${Uri.encodeComponent(id)}/json');
+    if (json is! Map) {
+      return (running: false, status: 'unknown', exitCode: null);
+    }
+    final raw = json['State'];
+    final s = raw is Map ? raw.cast<String, dynamic>() : const {};
+    return (
+      running: s['Running'] == true,
+      status: '${s['Status'] ?? 'unknown'}',
+      exitCode: s['ExitCode'] is int ? s['ExitCode'] as int : null,
+    );
+  }
+
+  /// The last [tail] lines of a container's stdout+stderr. Best-effort: returns
+  /// an empty string if the logs can't be read. Strips the 8-byte per-frame
+  /// headers Docker adds when the stream is not a TTY.
+  Future<String> containerLogs(String id, {int tail = 60}) async {
+    try {
+      final bytes = await _getBytes(
+        '/containers/${Uri.encodeComponent(id)}/logs',
+        {'stdout': '1', 'stderr': '1', 'tail': '$tail'},
+      );
+      var data = bytes;
+      // Non-TTY streams are multiplexed: each frame is an 8-byte header (1 byte
+      // stream id, 3 bytes pad, 4-byte big-endian length) followed by its payload.
+      if (data.length >= 8 && (data[0] == 1 || data[0] == 2)) {
+        final out = BytesBuilder();
+        var i = 0;
+        while (i + 8 <= data.length) {
+          final len = (data[i + 4] << 24) |
+              (data[i + 5] << 16) |
+              (data[i + 6] << 8) |
+              data[i + 7];
+          final start = i + 8;
+          final end = start + len;
+          if (len < 0 || end > data.length) break;
+          out.add(data.sublist(start, end));
+          i = end;
+        }
+        data = out.takeBytes();
+      }
+      return utf8.decode(data, allowMalformed: true);
+    } catch (_) {
+      return '';
+    }
+  }
+
   Future<void> removeImage(String idOrTag, {bool force = false}) async {
     await _delete('/images/${Uri.encodeComponent(idOrTag)}', {
       'force': force ? '1' : '0',
@@ -297,6 +351,19 @@ class DockerEngineClient {
   }
 
   // ── Internals ─────────────────────────────────────────────────────────────
+
+  Future<Uint8List> _getBytes(String path, [Map<String, String>? query]) async {
+    final req = await _http.getUrl(_uri(path, query));
+    final resp = await req.close();
+    final bb = BytesBuilder();
+    await for (final chunk in resp) {
+      bb.add(chunk);
+    }
+    if (resp.statusCode >= 400) {
+      throw DockerEngineException('GET $path → ${resp.statusCode}');
+    }
+    return bb.toBytes();
+  }
 
   Future<dynamic> _getJson(String path, [Map<String, String>? query]) async {
     final req = await _http.getUrl(_uri(path, query));

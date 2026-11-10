@@ -125,6 +125,29 @@ Future<DockerProjectInfo> detectDockerProject(Workspace ws) async {
         kind = 'flutter';
       }
     } catch (_) {}
+  } else if (kind == 'node') {
+    // A Next.js app is served with `next start`, which only works if a prior
+    // `next build` produced the `.next` production output. Detect it so the
+    // Dockerfile runs that build step — otherwise the container starts, can't
+    // find `.next`, and exits within a second (the "site doesn't work at all"
+    // launch: a dead localhost port with nothing behind it).
+    var isNext = false;
+    try {
+      final pkg = await ws.readString('/$bestRel');
+      if (RegExp(r'"next"\s*:').hasMatch(pkg)) isNext = true;
+    } catch (_) {}
+    if (!isNext) {
+      final dir = dirOf(bestRel);
+      for (final rel in paths) {
+        if (dirOf(rel) != dir) continue;
+        if (RegExp(r'^next\.config\.(js|ts|mjs|cjs|json)$')
+            .hasMatch(rel.split('/').last)) {
+          isNext = true;
+          break;
+        }
+      }
+    }
+    if (isNext) kind = 'next';
   }
   return DockerProjectInfo(
     kind: kind,
@@ -200,6 +223,31 @@ COPY --from=build /runtime/ /
 COPY --from=build $app/bin/server /app/bin/server
 EXPOSE 8080
 CMD ["/app/bin/server"]
+''',
+      );
+    case 'next':
+      // Next.js: `next start` (the default `npm start`) serves a COMPILED
+      // production build, so the image must run `next build` first to produce
+      // `.next`. A full `npm install` is required — dev deps (typescript,
+      // tailwind, postcss, ...) are needed to build. Single-stage for
+      // simplicity; swap for multi-stage to slim the image if desired.
+      final app = hasSub ? '/app/$sub' : '/app';
+      return DockerLaunchTemplate(
+        kind: 'next',
+        containerPort: 3000,
+        hostPort: 3000,
+        dockerfile:
+            '''
+FROM node:20-alpine
+WORKDIR /app
+COPY . .
+WORKDIR $app
+# Install every dependency — dev deps (typescript, tailwind, ...) build the app.
+RUN npm install
+# Produce the production build that `next start` serves (the .next directory).
+RUN npm run build
+EXPOSE 3000
+CMD ["npm", "start"]
 ''',
       );
     case 'node':
