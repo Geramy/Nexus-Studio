@@ -149,6 +149,93 @@ bool taskCanRecoverCommittedSubmission({
       !detail.contains(NexusDatabase.buildFailureMarker);
 }
 
+/// Owned file paths for [taskPk] parsed from a markdown WORK_TEMPLATE.md, in
+/// the table formats used by templated web projects (Next.js etc.), which
+/// describe task ownership in tables rather than the "### Task #N / - Owns:"
+/// bullets the deterministic Flutter writer emits. Reads the "Task Registry"
+/// table's "Primary Files (task-owned)" column and, failing that, the explicit
+/// "Task-Owned Files" mapping (| `file` | #N |). Returns an empty set when no
+/// recognized table format is present. Pure + unit-testable.
+@visibleForTesting
+Set<String> templateTableOwnedFiles(String template, int taskPk) {
+  final owned = <String>{};
+  String normalized(String raw) {
+    var path = raw.trim().replaceAll('\\', '/');
+    if (path.isEmpty) return '';
+    if (!path.startsWith('/')) path = '/$path';
+    while (path.contains('//')) {
+      path = path.replaceAll('//', '/');
+    }
+    if (path.length > 1 && path.endsWith('/')) {
+      path = path.substring(0, path.length - 1);
+    }
+    return path;
+  }
+
+  final lines = template.split('\n');
+  List<String> cells(String line) {
+    var t = line.trim();
+    if (t.startsWith('|')) t = t.substring(1);
+    if (t.endsWith('|')) t = t.substring(0, t.length - 1);
+    return t.split('|').map((e) => e.trim()).toList();
+  }
+
+  bool isRow(String line) => line.trim().startsWith('|');
+  final idRe = RegExp('#\\s*$taskPk\\b');
+  final pathRe = RegExp(r'`([^`]+)`');
+
+  // (1) Task Registry: | #id | ... | Primary Files (task-owned) | ... |
+  int? idCol;
+  int? filesCol;
+  for (final line in lines) {
+    if (!isRow(line)) continue;
+    final cs = cells(line);
+    for (var i = 0; i < cs.length; i++) {
+      final c = cs[i].toLowerCase();
+      if (idCol == null &&
+          (c == '#id' || c == 'id' || c.contains('task id'))) {
+        idCol = i;
+      }
+      if (filesCol == null &&
+          (c.contains('primary file') ||
+              c.contains('task-owned') ||
+              c.contains('owned file'))) {
+        filesCol = i;
+      }
+    }
+    if (idCol != null && filesCol != null) break;
+  }
+  if (idCol != null && filesCol != null && filesCol != idCol) {
+    for (final line in lines) {
+      if (!isRow(line)) continue;
+      final cs = cells(line);
+      if (idCol >= cs.length || filesCol >= cs.length) continue;
+      if (!idRe.hasMatch(cs[idCol])) continue;
+      for (final m in pathRe.allMatches(cs[filesCol])) {
+        final p = normalized(m.group(1)!);
+        if (p.isNotEmpty) owned.add(p);
+      }
+    }
+  }
+
+  // (2) "Task-Owned Files" section: | `file` | #N |
+  if (owned.isEmpty) {
+    for (final line in lines) {
+      if (!isRow(line)) continue;
+      final cs = cells(line).where((c) => c.isNotEmpty).toList();
+      if (cs.length < 2) continue;
+      final fm = RegExp(r'^`([^`]+)`$').firstMatch(cs.first);
+      if (fm == null) continue;
+      if (idRe.hasMatch(cs.sublist(1).join(' '))) {
+        final p = normalized(fm.group(1)!);
+        if (p.isNotEmpty) owned.add(p);
+      }
+    }
+  }
+
+  return owned;
+}
+
 /// Live driver for a project's autonomous task pipeline.
 ///
 /// It watches the project's `orchestrationState` (Start/Pause/Stop) and the
@@ -1699,6 +1786,25 @@ Paths from any other repository, operating system, task, or prior conversation a
         }
       }
     } catch (_) {}
+
+    // Templated web projects (Next.js etc.) describe task ownership in a
+    // markdown table rather than the bullets above. Recover the owned files so
+    // web workers get the same file-scope steering the bullet format provides;
+    // otherwise their scope is empty and they drift to scratch locations
+    // (e.g. /tmp) instead of the files they own.
+    if (roots.isEmpty || required.isEmpty) {
+      String? templateText;
+      try {
+        templateText = await tree.readString('/WORK_TEMPLATE.md');
+      } catch (_) {}
+      if (templateText != null) {
+        final owned = templateTableOwnedFiles(templateText, task.task_pk);
+        if (owned.isNotEmpty) {
+          roots.addAll(owned);
+          required.addAll(owned);
+        }
+      }
+    }
 
     // Deterministic Flutter templates encode task ownership in the directory
     // name. Recover it from the real tree if a hand-edited template omitted the
