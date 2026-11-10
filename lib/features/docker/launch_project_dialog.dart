@@ -398,8 +398,28 @@ class _LaunchProjectDialogState extends ConsumerState<LaunchProjectDialog> {
       if (hostPort.isNotEmpty) {
         final url = 'http://localhost:$hostPort';
         _openUrl = url;
-        _append(DockerBuildEvent('Container started — opening $url'));
-        unawaited(openUrl(url));
+        // `next start` (and most web servers) bind a moment AFTER the container
+        // starts. Opening the browser immediately makes it hit the port before
+        // the server is listening → "This site can't be reached" — even though
+        // the site comes up a fraction of a second later and works fine. Wait
+        // for a real HTTP answer first, then open the browser.
+        _append(DockerBuildEvent('Container started — waiting for $url…'));
+        final ready = await _waitForHttp(url, timeoutMs: 25000);
+        if (ready) {
+          _append(DockerBuildEvent('Site is up — opening $url'));
+          unawaited(openUrl(url));
+        } else {
+          _append(
+            DockerBuildEvent(
+              'Container is up but the site did not answer HTTP within 25s. '
+              'It may still be starting — open $url in a browser in a moment.',
+              isError: true,
+            ),
+          );
+          debugPrint(
+            '[Launch p${widget.projectPk}] $url not answering HTTP after 25s',
+          );
+        }
       } else {
         _append(
           DockerBuildEvent('Container started (id $shortId).'),
@@ -457,6 +477,32 @@ class _LaunchProjectDialogState extends ConsumerState<LaunchProjectDialog> {
         s.split('\n').where((l) => l.trim().isNotEmpty).toList(growable: false);
     if (lines.length <= n) return lines.join('\n');
     return lines.sublist(lines.length - n).join('\n');
+  }
+
+  /// Poll [url] until it answers HTTP (2xx–4xx) or [timeoutMs] elapses. A web
+  /// server inside a fresh container (e.g. `next start`) binds a moment after
+  /// the container starts, so we wait for a real answer before opening the
+  /// browser — otherwise it hits the port first and shows "can't be reached".
+  Future<bool> _waitForHttp(String url, {int timeoutMs = 25000}) async {
+    final deadline = DateTime.now().add(Duration(milliseconds: timeoutMs));
+    final http = HttpClient();
+    http.connectionTimeout = const Duration(seconds: 2);
+    try {
+      while (DateTime.now().isBefore(deadline)) {
+        try {
+          final req = await http.getUrl(Uri.parse(url));
+          final resp = await req.close();
+          await resp.drain();
+          if (resp.statusCode >= 200 && resp.statusCode < 500) return true;
+        } catch (_) {
+          // Connection refused / not listening yet — retry.
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+      }
+    } finally {
+      http.close(force: true);
+    }
+    return false;
   }
 
   // ── Windows → native .exe ───────────────────────────────────────────────
