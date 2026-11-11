@@ -94,8 +94,6 @@ class _LaunchProjectDialogState extends ConsumerState<LaunchProjectDialog> {
 
   // Nextify (cloud hosting) launch state.
   final _nextifyKey = TextEditingController();
-  final _nextifyRepo = TextEditingController();
-  final _nextifyBranch = TextEditingController();
   final _nextifyName = TextEditingController();
   List<NextifyMachine> _nextifyMachines = _defaultNextifyMachines;
   String _nextifyMachine = 'sm1.s1-2';
@@ -125,8 +123,6 @@ class _LaunchProjectDialogState extends ConsumerState<LaunchProjectDialog> {
     _saveName.dispose();
     _saveLocation.dispose();
     _nextifyKey.dispose();
-    _nextifyRepo.dispose();
-    _nextifyBranch.dispose();
     _nextifyName.dispose();
     _scroll.dispose();
     super.dispose();
@@ -691,14 +687,8 @@ class _LaunchProjectDialogState extends ConsumerState<LaunchProjectDialog> {
   // ── Web → Nextify cloud host (API key) ────────────────────────────
   Future<void> _launchNextify() async {
     final key = _nextifyKey.text.trim();
-    final repo = _nextifyRepo.text.trim();
     if (key.isEmpty) {
       _append(const DockerBuildEvent('Enter your Nextify API key first.', isError: true));
-      if (mounted) setState(() => _phase = _Phase.error);
-      return;
-    }
-    if (repo.isEmpty) {
-      _append(const DockerBuildEvent('Enter the public Git repo URL to deploy.', isError: true));
       if (mounted) setState(() => _phase = _Phase.error);
       return;
     }
@@ -707,7 +697,6 @@ class _LaunchProjectDialogState extends ConsumerState<LaunchProjectDialog> {
     final deployer = NextifyDeployer(client);
     final rawName = _nextifyName.text.trim().isEmpty ? 'app' : _nextifyName.text.trim();
     final name = rawName.length > 64 ? rawName.substring(0, 64) : rawName;
-    final branch = _nextifyBranch.text.trim();
 
     // Reuse a live instance with the same name (names are unique among live
     // resources, so a same-named create would 409).
@@ -729,51 +718,64 @@ class _LaunchProjectDialogState extends ConsumerState<LaunchProjectDialog> {
       return;
     }
 
-    _append(DockerBuildEvent('Creating Nextify instance "$name" ($_nextifyMachine, '
-        '$_nextifyRegion)…'));
-    _append(DockerBuildEvent('Deploys by cloning $repo, building it, and serving '
-        'on port 80.'));
-    NextifyDeployResult res;
+    // Materialize the current project to a temp dir, then push it over SSH.
+    _append(const DockerBuildEvent('Packaging the project (working tree) for upload…'));
+    MaterializedWorkspace? mat;
     try {
-      res = await deployer.launch(
-        repoUrl: repo,
-        branch: branch.isEmpty ? null : branch,
+      final ws = await ref.read(workspaceFsProvider(widget.projectPk).future);
+      mat = await WorkspaceMaterializer().materialize(
+        ws,
+        from: _subdir.isEmpty ? '/' : '/$_subdir',
+        tag: 'nextify',
+      );
+
+      _append(DockerBuildEvent('Creating Nextify instance "$name" ($_nextifyMachine, '
+          '$_nextifyRegion) and pushing the files over SSH (no Git needed)…'));
+      final res = await deployer.launchLocal(
+        localDir: mat.dir.path,
         instanceName: name,
         machineType: _nextifyMachine,
         region: _nextifyRegion,
         onProgress: (j) => _append(DockerBuildEvent('Provisioning: ${j.status} '
             '${j.progress?.percent ?? 0}% ${j.progress?.stage ?? ''}')),
       );
+
+      _append(DockerBuildEvent('Instance ${res.instance.id} up (status ${res.instance.status}, '
+          'ip ${res.instance.publicIp ?? '…'}).'));
+      if (res.url == null) {
+        _append(const DockerBuildEvent('Instance is up but no public IP is available yet — '
+            'check the Nextify portal.', isError: true));
+        if (mounted) setState(() => _phase = _Phase.error);
+        return;
+      }
+      _append(DockerBuildEvent('Building on the VM + waiting for the site at ${res.url}… '
+          '(a Next.js build takes a few minutes.)'));
+      final ok = await deployer.waitForHttp(res.url!, timeout: const Duration(minutes: 8));
+      _openUrl = res.url;
+      if (ok) {
+        _append(DockerBuildEvent('Site is live — ${res.url}'));
+        unawaited(openUrl(res.url!));
+      } else {
+        _append(DockerBuildEvent('Instance is up but the site has not answered HTTP yet.', isError: true));
+        _append(const DockerBuildEvent('Fetching the build log to diagnose…'));
+        try {
+          final log = await deployer.fetchDeployLog(res.instance.publicIp!);
+          _append(DockerBuildEvent(log.isEmpty ? '(log was empty)' : log,
+              isError: true));
+        } catch (e) {
+          _append(DockerBuildEvent('Could not fetch the build log: $e', isError: true));
+        }
+      }
+      if (mounted) setState(() => _phase = _Phase.done);
     } on NextifyApiException catch (e) {
       _append(DockerBuildEvent('Nextify error: $e', isError: true));
       if (mounted) setState(() => _phase = _Phase.error);
-      return;
     } catch (e) {
       _append(DockerBuildEvent('Launch failed: $e', isError: true));
       if (mounted) setState(() => _phase = _Phase.error);
-      return;
+    } finally {
+      await mat?.dispose();
     }
-
-    _append(DockerBuildEvent('Instance ${res.instance.id} up (status ${res.instance.status}, '
-        'ip ${res.instance.publicIp ?? '…'}).'));
-    if (res.url == null) {
-      _append(const DockerBuildEvent('Instance is up but no public IP is available yet — '
-          'check the Nextify portal.', isError: true));
-      if (mounted) setState(() => _phase = _Phase.error);
-      return;
-    }
-    _append(DockerBuildEvent('Waiting for the site to answer at ${res.url}…'));
-    final ok = await deployer.waitForHttp(res.url!, timeout: const Duration(minutes: 8));
-    _openUrl = res.url;
-    if (ok) {
-      _append(DockerBuildEvent('Site is live — ${res.url}'));
-      unawaited(openUrl(res.url!));
-    } else {
-      _append(DockerBuildEvent('Instance is up but the site has not answered HTTP yet. '
-          'Open ${res.url} in a moment; if it stays down, check the setup log in the '
-          'Nextify portal. (A Next.js build can take a few minutes.)', isError: true));
-    }
-    if (mounted) setState(() => _phase = _Phase.done);
   }
 
   Future<void> _testNextify() async {
@@ -1107,9 +1109,9 @@ class _LaunchProjectDialogState extends ConsumerState<LaunchProjectDialog> {
       Padding(
         padding: const EdgeInsets.only(bottom: 8),
         child: Text(
-          'Hosts this project on Nextify (cloud). Provisions an Ubuntu VM that '
-          'clones the Git repo below, builds it, and serves it on port 80. For '
-          'now the repo must be PUBLIC.',
+          'Hosts this project on Nextify (cloud). Provisions a fresh Ubuntu VM, '
+          'pushes this project\u2019s files to it over SSH (no Git repo needed), builds it '
+          'there, and serves it on port 80. You pay Nextify only while the VM runs.',
           style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
         ),
       ),
@@ -1137,44 +1139,13 @@ class _LaunchProjectDialogState extends ConsumerState<LaunchProjectDialog> {
       ),
       const SizedBox(height: 10),
       TextField(
-        controller: _nextifyRepo,
+        controller: _nextifyName,
         enabled: !_busy,
         decoration: const InputDecoration(
-          labelText: 'Public Git repo URL',
-          hintText: 'https://github.com/<you>/<repo>.git',
+          labelText: 'Instance name',
           isDense: true,
           border: OutlineInputBorder(),
         ),
-      ),
-      const SizedBox(height: 10),
-      Row(
-        children: [
-          Expanded(
-            flex: 2,
-            child: TextField(
-              controller: _nextifyBranch,
-              enabled: !_busy,
-              decoration: const InputDecoration(
-                labelText: 'Branch (blank = default)',
-                isDense: true,
-                border: OutlineInputBorder(),
-              ),
-            ),
-          ),
-          const SizedBox(width: 8),
-          Expanded(
-            flex: 3,
-            child: TextField(
-              controller: _nextifyName,
-              enabled: !_busy,
-              decoration: const InputDecoration(
-                labelText: 'Instance name',
-                isDense: true,
-                border: OutlineInputBorder(),
-              ),
-            ),
-          ),
-        ],
       ),
       const SizedBox(height: 10),
       DropdownButtonFormField<String>(

@@ -119,6 +119,7 @@ class NextifyInstance {
   final String? image;
   final String? error;
   final String? powerError;
+  final List<String> securityGroupIds;
   final Map<String, String> labels;
 
   const NextifyInstance({
@@ -132,6 +133,7 @@ class NextifyInstance {
     this.image,
     this.error,
     this.powerError,
+    this.securityGroupIds = const [],
     this.labels = const {},
   });
 
@@ -144,6 +146,15 @@ class NextifyInstance {
             (k, v) => MapEntry(k.toString(), v.toString()),
           )
         : const <String, String>{};
+    final sgs = (j['security_group_ids'] is List)
+        ? (j['security_group_ids'] as List).map((e) => e.toString()).toList()
+        : const <String>[];
+    // `image` is a plain string in the list response but a nested object in the
+    // single-instance response — accept both (take the slug from the object).
+    final rawImage = j['image'];
+    final image = rawImage is String
+        ? rawImage
+        : (rawImage is Map ? rawImage['slug']?.toString() : null);
     return NextifyInstance(
       id: (j['id'] as String?) ?? '',
       name: (j['name'] as String?) ?? '',
@@ -152,9 +163,10 @@ class NextifyInstance {
       publicIp: j['public_ip'] as String?,
       machineType: j['machine_type'] as String?,
       region: j['region'] as String?,
-      image: j['image'] as String?,
+      image: image,
       error: j['error'] as String?,
       powerError: j['power_error'] as String?,
+      securityGroupIds: sgs,
       labels: labels,
     );
   }
@@ -196,6 +208,45 @@ class NextifyMachine {
         vcpu: (j['vcpu'] as num?)?.toInt() ?? 1,
         ramGb: (j['ram_gb'] as num?)?.toInt() ?? 1,
         priceMonthCents: (j['price_month_cents'] as num?)?.toDouble() ?? 0,
+      );
+}
+
+/// A registered SSH public key (`GET /v1/ssh-keys`).
+class NextifySshKey {
+  final String id;
+  final String name;
+  final String publicKey;
+  const NextifySshKey({
+    required this.id,
+    required this.name,
+    required this.publicKey,
+  });
+
+  factory NextifySshKey.fromJson(Map<String, dynamic> j) => NextifySshKey(
+        id: (j['id'] as String?) ?? '',
+        name: (j['name'] as String?) ?? '',
+        publicKey: (j['public_key'] as String?) ?? '',
+      );
+}
+
+/// A security group from `GET /v1/security-groups`. Blank instances inherit
+/// the account's [isDefault] group (their own `security_group_ids` stays empty),
+/// so the Option-B deploy opens ports on that group.
+class NextifySecurityGroup {
+  final String id;
+  final String name;
+  final bool isDefault;
+  const NextifySecurityGroup({
+    required this.id,
+    required this.name,
+    this.isDefault = false,
+  });
+
+  factory NextifySecurityGroup.fromJson(Map<String, dynamic> j) =>
+      NextifySecurityGroup(
+        id: (j['id'] as String?) ?? '',
+        name: (j['name'] as String?) ?? '',
+        isDefault: (j['is_default'] as bool?) ?? false,
       );
 }
 

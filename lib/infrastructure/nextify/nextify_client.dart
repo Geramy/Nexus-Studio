@@ -213,6 +213,108 @@ class NextifyClient {
     return '';
   }
 
+  // ── SSH keys + security groups (for the direct-push / Option-B deploy) ──
+  /// `GET /security-groups` — the account's security groups. Blank instances
+  /// inherit the default one, so [defaultSecurityGroup] finds it.
+  Future<List<NextifySecurityGroup>> listSecurityGroups() async {
+    final res = await _http.get(_uri('/security-groups'), headers: _headers);
+    final j = await _decode(res);
+    final items = (j['items'] is List) ? (j['items'] as List) : const [];
+    return items
+        .whereType<Map>()
+        .map((e) => NextifySecurityGroup.fromJson(e.cast<String, dynamic>()))
+        .toList();
+  }
+
+  /// The account's default security group (the one blank instances inherit), or
+  /// null if there are none.
+  Future<NextifySecurityGroup?> defaultSecurityGroup() async {
+    final groups = await listSecurityGroups();
+    for (final g in groups) {
+      if (g.isDefault) return g;
+    }
+    for (final g in groups) {
+      if (g.name == 'default') return g;
+    }
+    return groups.isEmpty ? null : groups.first;
+  }
+
+  /// `POST /ssh-keys` — register a public key so we can SSH into instances we
+  /// create. Returns the key id to pass as `ssh_key_ids` on create.
+  Future<String> addSshKey({required String name, required String publicKey}) async {
+    final res = await _http.post(
+      _uri('/ssh-keys'),
+      headers: _headers,
+      body: jsonEncode({'name': name, 'public_key': publicKey}),
+    );
+    final j = await _decode(res);
+    return (j['id'] as String?) ?? '';
+  }
+
+  /// `GET /ssh-keys` — the account's registered public keys.
+  Future<List<NextifySshKey>> listSshKeys() async {
+    final res = await _http.get(_uri('/ssh-keys'), headers: _headers);
+    final j = await _decode(res);
+    final items = (j['items'] is List) ? (j['items'] as List) : const [];
+    return items
+        .whereType<Map>()
+        .map((e) => NextifySshKey.fromJson(e.cast<String, dynamic>()))
+        .toList();
+  }
+
+  /// Find-or-create an SSH key by [publicKey]; returns the key id. The API keys
+  /// by public key (a duplicate 409s), so we look for an existing match first —
+  /// comparing the key material (the first two space-delimited tokens) so a
+  /// differing trailing comment still matches.
+  Future<String> ensureSshKey({
+    required String publicKey,
+    required String name,
+  }) async {
+    String keyPart(String k) =>
+        k.trim().split(RegExp(r'\s+')).take(2).join(' ');
+    final want = keyPart(publicKey);
+    try {
+      for (final k in await listSshKeys()) {
+        if (keyPart(k.publicKey) == want) return k.id;
+      }
+    } catch (_) {}
+    return addSshKey(name: name, publicKey: publicKey);
+  }
+
+  /// `POST /security-groups/{id}/rules` — open an inbound port. Returns true
+  /// when added, false when it already existed (409). The default group only
+  /// allows intra-group inbound, so a blank VM needs explicit rules for the
+  /// app port (and, briefly, 22 for the file push).
+  Future<bool> addSecurityGroupRule({
+    required String groupId,
+    required String protocol,
+    required int portFrom,
+    int? portTo,
+    required String cidr,
+    String? description,
+  }) async {
+    final body = <String, dynamic>{
+      'direction': 'in',
+      'protocol': protocol,
+      'port_from': portFrom,
+      'port_to': portTo ?? portFrom,
+      'cidr': cidr,
+      if (description != null) 'description': description,
+    };
+    try {
+      final res = await _http.post(
+        _uri('/security-groups/$groupId/rules'),
+        headers: _headers,
+        body: jsonEncode(body),
+      );
+      await _decode(res);
+      return true;
+    } on NextifyApiException catch (e) {
+      if (e.status == 409) return false; // already present
+      rethrow;
+    }
+  }
+
   // ── Jobs ────────────────────────────────────────────────────────────────
   Future<NextifyJob> job(String jobId) async {
     final res = await _http.get(_uri('/jobs/$jobId'), headers: _headers);

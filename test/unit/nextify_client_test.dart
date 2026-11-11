@@ -14,6 +14,7 @@ import 'package:nexus_projects_client/infrastructure/nextify/nextify_models.dart
 class Recorder {
   Uri? lastUrl;
   String? lastMethod;
+  String? lastBody;
   late final http.Client client;
 
   Recorder({
@@ -24,6 +25,7 @@ class Recorder {
     client = MockClient((req) async {
       lastUrl = req.url;
       lastMethod = req.method;
+      lastBody = req.body;
       return http.Response(
         responder != null ? responder(req.url) : body,
         status,
@@ -121,6 +123,138 @@ void main() {
       expect(c.instance.status, 'creating');
       expect(c.jobId, '777');
       expect(r.lastMethod, 'POST');
+    });
+
+    test('parses security_group_ids on an instance', () async {
+      final r = Recorder(
+        body: '{"items": [{"id":"a1","name":"web-1","status":"running",'
+            '"security_group_ids":["sg-1","sg-2"]}]}',
+      );
+      final client = NextifyClient('t', httpClient: r.client);
+      final inst = (await client.listInstances()).first;
+      expect(inst.securityGroupIds, ['sg-1', 'sg-2']);
+    });
+  });
+
+  group('NextifyClient SSH + security rules', () {
+    test('addSshKey POSTs name + public_key and returns the id', () async {
+      final r = Recorder(body: '{"id":"key-1","name":"nexus"}');
+      final client = NextifyClient('t', httpClient: r.client);
+      final id =
+          await client.addSshKey(name: 'nexus', publicKey: 'ssh-ed25519 AAAA');
+      expect(r.lastMethod, 'POST');
+      expect(r.lastUrl.toString(), 'https://api.nextifynow.com/v1/ssh-keys');
+      expect(id, 'key-1');
+      expect(r.lastBody, contains('ssh-ed25519 AAAA'));
+    });
+
+    test('addSecurityGroupRule returns true on 201', () async {
+      final r = Recorder(body: '{"id":"rule-1"}', status: 201);
+      final client = NextifyClient('t', httpClient: r.client);
+      final added = await client.addSecurityGroupRule(
+        groupId: 'sg-1',
+        protocol: 'tcp',
+        portFrom: 80,
+        cidr: '0.0.0.0/0',
+      );
+      expect(added, isTrue);
+      expect(r.lastUrl.toString(),
+          'https://api.nextifynow.com/v1/security-groups/sg-1/rules');
+    });
+
+    test('addSecurityGroupRule returns false on 409 (already present)', () async {
+      final r = Recorder(
+        body: '{"error":{"code":"duplicate_rule","message":"exists"}}',
+        status: 409,
+      );
+      final client = NextifyClient('t', httpClient: r.client);
+      final added = await client.addSecurityGroupRule(
+        groupId: 'sg-1',
+        protocol: 'tcp',
+        portFrom: 80,
+        cidr: '0.0.0.0/0',
+      );
+      expect(added, isFalse);
+    });
+
+    test('addSecurityGroupRule rethrows non-409 errors', () async {
+      final r = Recorder(
+        body: '{"error":{"code":"not_found","message":"no such group"}}',
+        status: 404,
+      );
+      final client = NextifyClient('t', httpClient: r.client);
+      await expectLater(
+        client.addSecurityGroupRule(
+            groupId: 'nope', protocol: 'tcp', portFrom: 80, cidr: '0.0.0.0/0'),
+        throwsA(isA<NextifyApiException>().having((e) => e.status, 's', 404)),
+      );
+    });
+
+    test('defaultSecurityGroup picks the is_default group', () async {
+      final r = Recorder(
+        body: '{"items":[{"id":"g1","name":"custom","is_default":false},{"id":"g2","name":"default","is_default":true}]}',
+      );
+      final client = NextifyClient('t', httpClient: r.client);
+      final g = await client.defaultSecurityGroup();
+      expect(g?.id, 'g2');
+      expect(g?.isDefault, isTrue);
+    });
+
+    test('an instance whose `image` is a nested object still parses (single shape)',
+        () {
+      final inst = NextifyInstance.fromJson({
+        'id': 'i1',
+        'name': 'x',
+        'status': 'running',
+        'public_ip': '1.2.3.4',
+        'image': {'slug': 'ubuntu-24.04', 'display_name': 'Ubuntu 24.04 LTS'},
+        'security_group_ids': [],
+      });
+      expect(inst.image, 'ubuntu-24.04');
+      expect(inst.securityGroupIds, isEmpty);
+    });
+
+    test('an instance whose `image` is a plain string still parses (list shape)',
+        () {
+      final inst = NextifyInstance.fromJson({
+        'id': 'i1',
+        'name': 'x',
+        'status': 'running',
+        'image': 'ubuntu-24.04',
+      });
+      expect(inst.image, 'ubuntu-24.04');
+    });
+
+    test('ensureSshKey reuses an existing key that matches by key material', () async {
+      // GET /ssh-keys returns a key whose material matches (comment may differ).
+      final r = Recorder(
+        body: '{"items":[{"id":"existing-1","name":"old",'
+            '"public_key":"ssh-ed25519 AAAAB3NzaC1lZDI1NTE5AAAAIKILLcNHBv hebbi@x"}]}',
+      );
+      final client = NextifyClient('t', httpClient: r.client);
+      final id = await client.ensureSshKey(
+        name: 'nexus-studio-deploy',
+        publicKey: 'ssh-ed25519 AAAAB3NzaC1lZDI1NTE5AAAAIKILLcNHBv someone@else',
+      );
+      expect(id, 'existing-1');
+      expect(r.lastMethod, 'GET'); // no POST when found
+    });
+
+    test('ensureSshKey creates when no key matches', () async {
+      final mock = MockClient((req) async {
+        if (req.method == 'GET') {
+          return http.Response('{"items":[]}', 200,
+              headers: {'content-type': 'application/json'});
+        }
+        return http.Response('{"id":"created-9"}', 201,
+            headers: {'content-type': 'application/json'});
+      });
+      final client = NextifyClient('t', httpClient: mock);
+      final id = await client.ensureSshKey(
+        name: 'nexus-studio-deploy',
+        publicKey: 'ssh-ed25519 AAAA-new-key material',
+      );
+      expect(id, 'created-9');
     });
   });
 

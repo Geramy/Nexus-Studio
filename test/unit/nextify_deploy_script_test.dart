@@ -57,5 +57,23 @@ void main() {
       expect(s, contains('systemctl enable nexus-app.service'));
       expect(s, contains('listen 80 default_server'));
     });
+
+    test('local mode omits the git clone + REPO/BRANCH but keeps the build', () {
+      final s = nextifyNodeDeployScript(local: true, appPort: 3000);
+      // No git source at all.
+      expect(s, isNot(contains('git clone')));
+      expect(s, isNot(contains('REPO=')));
+      expect(s, isNot(contains('BRANCH=')));
+      // Still installs node, builds, runs systemd + nginx.
+      expect(s, contains('setup_20.x'));
+      expect(s, contains('npm run build'));
+      expect(s, contains('nexus-app.service'));
+      expect(s, contains('listen 80 default_server'));
+      expect(s, contains('PORT=3000'));
+      // No leftover placeholders.
+      expect(s, isNot(contains('__VAR_HEAD__')));
+      expect(s, isNot(contains('__CLONE__')));
+      expect(s, isNot(contains('__PORT__')));
+    });
   });
 }
