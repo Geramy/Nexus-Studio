@@ -16,6 +16,10 @@ import 'package:nexus_projects_client/infrastructure/docker/docker_context_tar.d
 import 'package:nexus_projects_client/infrastructure/docker/docker_models.dart';
 import 'package:nexus_projects_client/infrastructure/docker/docker_providers.dart';
 import 'package:nexus_projects_client/infrastructure/exec/captured_run.dart';
+import 'package:nexus_projects_client/infrastructure/nextify/nextify_client.dart';
+import 'package:nexus_projects_client/infrastructure/nextify/nextify_deploy.dart';
+import 'package:nexus_projects_client/infrastructure/nextify/nextify_key_store.dart';
+import 'package:nexus_projects_client/infrastructure/nextify/nextify_models.dart';
 import 'package:nexus_projects_client/infrastructure/workspace/workspace_provider.dart';
 
 import 'dockerfile_templates.dart';
@@ -51,12 +55,21 @@ class LaunchProjectDialog extends ConsumerStatefulWidget {
       _LaunchProjectDialogState();
 }
 
-enum _Target { dockerWeb, windowsExe }
+enum _Target { dockerWeb, nextify, windowsExe }
 
 String _targetLabel(_Target t) => switch (t) {
   _Target.dockerWeb => 'Web — Docker container',
+  _Target.nextify => 'Nextify — cloud host (API key)',
   _Target.windowsExe => 'Windows app — .exe',
 };
+
+/// Fallback machine list when the catalog can't be fetched (no key / offline).
+const _defaultNextifyMachines = [
+  NextifyMachine(code: 'sm1.s1-1', vcpu: 1, ramGb: 1, priceMonthCents: 630),
+  NextifyMachine(code: 'sm1.s1-2', vcpu: 1, ramGb: 2, priceMonthCents: 1260),
+  NextifyMachine(code: 'sm1.s2-2', vcpu: 2, ramGb: 2, priceMonthCents: 1890),
+  NextifyMachine(code: 'sm1.s2-4', vcpu: 2, ramGb: 4, priceMonthCents: 2520),
+];
 
 enum _Phase { preparing, ready, working, done, error }
 
@@ -78,6 +91,15 @@ class _LaunchProjectDialogState extends ConsumerState<LaunchProjectDialog> {
   String _subdir = ''; // project folder holding the manifest ('' = repo root)
   List<_Target> _targets = const [_Target.dockerWeb];
   _Target _target = _Target.dockerWeb;
+
+  // Nextify (cloud hosting) launch state.
+  final _nextifyKey = TextEditingController();
+  final _nextifyRepo = TextEditingController();
+  final _nextifyBranch = TextEditingController();
+  final _nextifyName = TextEditingController();
+  List<NextifyMachine> _nextifyMachines = _defaultNextifyMachines;
+  String _nextifyMachine = 'sm1.s1-2';
+  final String _nextifyRegion = 'us-west-1';
 
   // Post-launch actions.
   String? _openUrl; // web container → open in browser
@@ -102,6 +124,10 @@ class _LaunchProjectDialogState extends ConsumerState<LaunchProjectDialog> {
     _hostPort.dispose();
     _saveName.dispose();
     _saveLocation.dispose();
+    _nextifyKey.dispose();
+    _nextifyRepo.dispose();
+    _nextifyBranch.dispose();
+    _nextifyName.dispose();
     _scroll.dispose();
     super.dispose();
   }
@@ -153,6 +179,7 @@ class _LaunchProjectDialogState extends ConsumerState<LaunchProjectDialog> {
       final targets = <_Target>[];
       if (Platform.isWindows && hasWindows) targets.add(_Target.windowsExe);
       if (hasWeb || targets.isEmpty) targets.add(_Target.dockerWeb);
+      if (hasWeb) targets.add(_Target.nextify);
       _targets = targets;
       _target = targets.first;
 
@@ -169,6 +196,21 @@ class _LaunchProjectDialogState extends ConsumerState<LaunchProjectDialog> {
       _subdir = info.subdir;
       _containerPort.text = '${tpl.containerPort}';
       _dockerfile.text = tpl.dockerfile.trim();
+
+      // Nextify: prefill the stored key + default instance name + machine list.
+      _nextifyName.text = base;
+      _nextifyKey.text = (await ref.read(nextifyKeyStoreProvider).read()) ?? '';
+      if (_nextifyKey.text.trim().isNotEmpty) {
+        try {
+          final m = await NextifyClient(_nextifyKey.text.trim())
+              .machines(region: _nextifyRegion);
+          if (m.isNotEmpty) _nextifyMachines = m;
+        } catch (_) {}
+      }
+      if (!_nextifyMachines.any((m) => m.code == _nextifyMachine)) {
+        _nextifyMachine = _nextifyMachines.first.code;
+      }
+      if (!mounted) return;
 
       if (mounted) setState(() => _phase = _Phase.ready);
     } catch (e) {
@@ -197,6 +239,8 @@ class _LaunchProjectDialogState extends ConsumerState<LaunchProjectDialog> {
     switch (_target) {
       case _Target.dockerWeb:
         await _launchDocker();
+      case _Target.nextify:
+        await _launchNextify();
       case _Target.windowsExe:
         await _launchWindows();
     }
@@ -644,10 +688,118 @@ class _LaunchProjectDialogState extends ConsumerState<LaunchProjectDialog> {
     return candidate;
   }
 
+  // ── Web → Nextify cloud host (API key) ────────────────────────────
+  Future<void> _launchNextify() async {
+    final key = _nextifyKey.text.trim();
+    final repo = _nextifyRepo.text.trim();
+    if (key.isEmpty) {
+      _append(const DockerBuildEvent('Enter your Nextify API key first.', isError: true));
+      if (mounted) setState(() => _phase = _Phase.error);
+      return;
+    }
+    if (repo.isEmpty) {
+      _append(const DockerBuildEvent('Enter the public Git repo URL to deploy.', isError: true));
+      if (mounted) setState(() => _phase = _Phase.error);
+      return;
+    }
+    await ref.read(nextifyKeyStoreProvider).write(key);
+    final client = NextifyClient(key);
+    final deployer = NextifyDeployer(client);
+    final rawName = _nextifyName.text.trim().isEmpty ? 'app' : _nextifyName.text.trim();
+    final name = rawName.length > 64 ? rawName.substring(0, 64) : rawName;
+    final branch = _nextifyBranch.text.trim();
+
+    // Reuse a live instance with the same name (names are unique among live
+    // resources, so a same-named create would 409).
+    NextifyInstance? existing;
+    try {
+      existing = await deployer.findByName(name);
+    } catch (_) {}
+    if (existing != null) {
+      _append(DockerBuildEvent('Found existing instance "${existing.name}" '
+          '(status ${existing.status}, ip ${existing.publicIp ?? '…'}). Reusing it — '
+          'delete it first to redeploy fresh code.'));
+      if (existing.publicIp != null && existing.publicIp!.isNotEmpty) {
+        final url = 'http://${existing.publicIp}/';
+        _openUrl = url;
+        _append(DockerBuildEvent('Opening $url'));
+        unawaited(openUrl(url));
+      }
+      if (mounted) setState(() => _phase = _Phase.done);
+      return;
+    }
+
+    _append(DockerBuildEvent('Creating Nextify instance "$name" ($_nextifyMachine, '
+        '$_nextifyRegion)…'));
+    _append(DockerBuildEvent('Deploys by cloning $repo, building it, and serving '
+        'on port 80.'));
+    NextifyDeployResult res;
+    try {
+      res = await deployer.launch(
+        repoUrl: repo,
+        branch: branch.isEmpty ? null : branch,
+        instanceName: name,
+        machineType: _nextifyMachine,
+        region: _nextifyRegion,
+        onProgress: (j) => _append(DockerBuildEvent('Provisioning: ${j.status} '
+            '${j.progress?.percent ?? 0}% ${j.progress?.stage ?? ''}')),
+      );
+    } on NextifyApiException catch (e) {
+      _append(DockerBuildEvent('Nextify error: $e', isError: true));
+      if (mounted) setState(() => _phase = _Phase.error);
+      return;
+    } catch (e) {
+      _append(DockerBuildEvent('Launch failed: $e', isError: true));
+      if (mounted) setState(() => _phase = _Phase.error);
+      return;
+    }
+
+    _append(DockerBuildEvent('Instance ${res.instance.id} up (status ${res.instance.status}, '
+        'ip ${res.instance.publicIp ?? '…'}).'));
+    if (res.url == null) {
+      _append(const DockerBuildEvent('Instance is up but no public IP is available yet — '
+          'check the Nextify portal.', isError: true));
+      if (mounted) setState(() => _phase = _Phase.error);
+      return;
+    }
+    _append(DockerBuildEvent('Waiting for the site to answer at ${res.url}…'));
+    final ok = await deployer.waitForHttp(res.url!, timeout: const Duration(minutes: 8));
+    _openUrl = res.url;
+    if (ok) {
+      _append(DockerBuildEvent('Site is live — ${res.url}'));
+      unawaited(openUrl(res.url!));
+    } else {
+      _append(DockerBuildEvent('Instance is up but the site has not answered HTTP yet. '
+          'Open ${res.url} in a moment; if it stays down, check the setup log in the '
+          'Nextify portal. (A Next.js build can take a few minutes.)', isError: true));
+    }
+    if (mounted) setState(() => _phase = _Phase.done);
+  }
+
+  Future<void> _testNextify() async {
+    final key = _nextifyKey.text.trim();
+    if (key.isEmpty) {
+      _append(const DockerBuildEvent('Enter your key, then test the connection.', isError: true));
+      return;
+    }
+    _append(const DockerBuildEvent('Testing Nextify connection…'));
+    try {
+      final client = NextifyClient(key);
+      final acct = await client.me();
+      final limits = await client.limitsSummary();
+      _append(DockerBuildEvent('Connected as ${acct.accountName} (plan ${acct.plan}) — $limits'));
+    } on NextifyApiException catch (e) {
+      _append(DockerBuildEvent('Connection failed: $e', isError: true));
+    } catch (e) {
+      _append(DockerBuildEvent('Connection failed: $e', isError: true));
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final preparing = _phase == _Phase.preparing;
     final isDocker = _target == _Target.dockerWeb;
+    final isNextify = _target == _Target.nextify;
     return AlertDialog(
       title: const Text('Launch'),
       content: SizedBox(
@@ -689,7 +841,9 @@ class _LaunchProjectDialogState extends ConsumerState<LaunchProjectDialog> {
                       ],
                     ),
                     const SizedBox(height: 8),
-                    if (isDocker) ..._dockerFields() else ..._windowsFields(),
+                    if (isDocker) ..._dockerFields()
+                    else if (isNextify) ..._nextifyFields()
+                    else ..._windowsFields(),
                     if (_log.isNotEmpty) ...[
                       const SizedBox(height: 12),
                       Container(
@@ -761,7 +915,7 @@ class _LaunchProjectDialogState extends ConsumerState<LaunchProjectDialog> {
               _Phase.working => 'Working…',
               _Phase.done => isDocker ? 'Launched' : 'Saved',
               _Phase.error => 'Retry',
-              _ => isDocker ? 'Launch' : 'Build & save',
+              _ => (isDocker || isNextify) ? 'Launch' : 'Build & save',
             },
           ),
         ),
@@ -943,6 +1097,104 @@ class _LaunchProjectDialogState extends ConsumerState<LaunchProjectDialog> {
                   },
             child: const Text('Desktop'),
           ),
+        ],
+      ),
+    ];
+  }
+
+  List<Widget> _nextifyFields() {
+    return [
+      Padding(
+        padding: const EdgeInsets.only(bottom: 8),
+        child: Text(
+          'Hosts this project on Nextify (cloud). Provisions an Ubuntu VM that '
+          'clones the Git repo below, builds it, and serves it on port 80. For '
+          'now the repo must be PUBLIC.',
+          style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+        ),
+      ),
+      Row(
+        children: [
+          Expanded(
+            child: TextField(
+              controller: _nextifyKey,
+              enabled: !_busy,
+              obscureText: true,
+              decoration: const InputDecoration(
+                labelText: 'Nextify API key',
+                hintText: 'nxt_…',
+                isDense: true,
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          OutlinedButton(
+            onPressed: _busy ? null : _testNextify,
+            child: const Text('Test'),
+          ),
+        ],
+      ),
+      const SizedBox(height: 10),
+      TextField(
+        controller: _nextifyRepo,
+        enabled: !_busy,
+        decoration: const InputDecoration(
+          labelText: 'Public Git repo URL',
+          hintText: 'https://github.com/<you>/<repo>.git',
+          isDense: true,
+          border: OutlineInputBorder(),
+        ),
+      ),
+      const SizedBox(height: 10),
+      Row(
+        children: [
+          Expanded(
+            flex: 2,
+            child: TextField(
+              controller: _nextifyBranch,
+              enabled: !_busy,
+              decoration: const InputDecoration(
+                labelText: 'Branch (blank = default)',
+                isDense: true,
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            flex: 3,
+            child: TextField(
+              controller: _nextifyName,
+              enabled: !_busy,
+              decoration: const InputDecoration(
+                labelText: 'Instance name',
+                isDense: true,
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ),
+        ],
+      ),
+      const SizedBox(height: 10),
+      DropdownButtonFormField<String>(
+        initialValue: _nextifyMachine,
+        isDense: true,
+        decoration: const InputDecoration(
+          labelText: 'Machine',
+          border: OutlineInputBorder(),
+        ),
+        onChanged: _busy
+            ? null
+            : (v) => setState(() {
+                if (v != null) _nextifyMachine = v;
+              }),
+        items: [
+          for (final m in _nextifyMachines)
+            DropdownMenuItem(
+              value: m.code,
+              child: Text('${m.code} — ${m.vcpu} vCPU / ${m.ramGb} GB · ${m.priceLabel}'),
+            ),
         ],
       ),
     ];
