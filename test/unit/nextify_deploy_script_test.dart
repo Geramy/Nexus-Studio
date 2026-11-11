@@ -70,6 +70,16 @@ void main() {
       expect(s, contains('nexus-app.service'));
       expect(s, contains('listen 80 default_server'));
       expect(s, contains('PORT=3000'));
+      // The serve script bakes in the literal port: `process.env.PORT` is not
+      // exported, so reading it at generation time yields `undefined` and the
+      // app would run `next start -p undefined` (exit 1).
+      expect(s, contains('"next start -p 3000"'));
+      expect(s, isNot(contains('process.env.PORT')));
+      // The nginx variables are backslash-escaped so the unquoted heredoc passes
+      // them through literally; an unescaped `$http_upgrade` dies under `set -u`
+      // before the reverse-proxy config is applied (=> default nginx page).
+      expect(s, contains(r'proxy_set_header Upgrade \$http_upgrade;'));
+      expect(s, contains(r'proxy_set_header Host \$host;'));
       // No leftover placeholders.
       expect(s, isNot(contains('__VAR_HEAD__')));
       expect(s, isNot(contains('__CLONE__')));

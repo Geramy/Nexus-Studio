@@ -86,7 +86,7 @@ node -e '
   const deps = Object.assign({}, p.dependencies || {}, p.devDependencies || {});
   const isNext = Object.keys(deps).includes("next");
   p.scripts.serve = isNext
-    ? "next start -p " + process.env.PORT
+    ? "next start -p __PORT__"
     : (p.scripts.start || "npm start");
   fs.writeFileSync("./package.json", JSON.stringify(p, null, 2));
 '
@@ -118,9 +118,9 @@ server {
   location / {
     proxy_pass http://127.0.0.1:$PORT;
     proxy_http_version 1.1;
-    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Upgrade \$http_upgrade;
     proxy_set_header Connection "upgrade";
-    proxy_set_header Host $host;
+    proxy_set_header Host \$host;
   }
 }
 EOF
